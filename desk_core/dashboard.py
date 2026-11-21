@@ -124,7 +124,7 @@ async def api_frame(camera: str) -> Response:
                 py = int(round(_last_detection["pixel"][1]))
                 cv2.rectangle(bgr, p1, p2, (0, 230, 118), 2)
                 cv2.circle(bgr, (px, py), 6, (0, 230, 118), -1)
-                lbl = f"{_last_detection['label']} ({_last_detection['world']['x']:.2f}, {_last_detection['world']['y']:.2f}m)"
+                lbl = f"{_last_detection['label']} [{_last_detection.get('backend', '?')}] ({_last_detection['world']['x']:.2f}, {_last_detection['world']['y']:.2f}m)"
                 cv2.putText(bgr, lbl, (p1[0], max(20, p1[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 118), 2)
 
             if srv._robo_jev.watch is not None:
@@ -302,7 +302,8 @@ DASHBOARD_HTML = """<!doctype html>
     <div style="display:flex;align-items:center;gap:12px;">
       <div class="title">DESK-CORE MISSION CONTROL</div>
       <span id="link-badge" class="badge">CONNECTING...</span>
-      <span id="jev-latency" class="badge">ROBO-JEV: 0 ms</span>
+      <span id="det-badge" class="badge">DETECTOR: none</span>
+      <span id="jev-latency" class="badge">ROBO-JEV: CPU CV (0 ms)</span>
     </div>
     <div style="display:flex;gap:10px;align-items:center;">
       <button class="first-light" onclick="runFirstLight()">Run 07:30 First-Light Routine</button>
@@ -378,8 +379,13 @@ DASHBOARD_HTML = """<!doctype html>
         const [tel, logs] = await Promise.all([fetch('/api/telemetry').then(r => r.json()), fetch('/api/logs').then(r => r.json())]);
         const link = tel.link || {};
         document.getElementById('link-badge').textContent = `${(link.bridge || 'offline').toUpperCase()} | TORQUE: ${tel.torque_enabled ? 'ON' : 'OFF'}`;
+        const det = tel.last_detection || null;
+        if (det) {
+          const fb = det.fallback_reason ? ` (${det.fallback_reason})` : '';
+          document.getElementById('det-badge').textContent = `DETECTOR: ${det.backend}${fb}`;
+        }
         const rj = tel.robo_jev || {};
-        document.getElementById('jev-latency').textContent = `ROBO-JEV: ${rj.latency_ms ?? 0} ms`;
+        document.getElementById('jev-latency').textContent = `ROBO-JEV (CPU CV): ${rj.latency_ms ?? 0} ms`;
         document.getElementById('jev-reason').textContent = `Status: ${rj.reason || 'nominal'} | Shifted: ${rj.target_shifted} (${rj.shift_mm || 0} mm)`;
         const p = Math.round((rj.path_clear ?? 1) * 100), g = Math.round((rj.grasp_secure ?? 1) * 100), tip = Math.round((rj.will_tip ?? 0) * 100);
         document.getElementById('m-path').textContent = p + '%'; document.getElementById('b-path').style.width = p + '%';
