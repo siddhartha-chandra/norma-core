@@ -1,0 +1,94 @@
+{
+  "wrist": {
+    "camera": "cam1",
+    "device": "/dev/video0",
+    "image_size": [
+      1280,
+      720
+    ],
+    "board": {
+      "inner_columns": 10,
+      "inner_rows": 7,
+      "square_mm": 15
+    },
+    "camera_matrix": [
+      [
+        457.19578533657443,
+        0.0,
+        649.7712991663576
+      ],
+      [
+        0.0,
+        456.36625810090686,
+        368.51345085403744
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "distortion_coefficients": [
+      0.0820237406740874,
+      -0.09382759081922319,
+      0.0005223878516953125,
+      -0.00021989110890920552,
+      0.026574969352019775
+    ],
+    "views": 25,
+    "reprojection_rmse_px": 0.18102658071270997,
+    "worst_view_rmse_px": 0.24254840638357822,
+    "edge_coverage": {
+      "left": true,
+      "right": true,
+      "top": true,
+      "bottom": false
+    }
+  },
+  "scene": {
+    "camera": "cam2",
+    "device": "/dev/video4",
+    "image_size": [
+      1280,
+      720
+    ],
+    "board": {
+      "inner_columns": 10,
+      "inner_rows": 7,
+      "square_mm": 15
+    },
+    "camera_matrix": [
+      [
+        458.7078934364252,
+        0.0,
+        651.9752567958166
+      ],
+      [
+        0.0,
+        457.7852701942983,
+        375.3103686344486
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "distortion_coefficients": [
+      0.08625411759068476,
+      -0.11469292430064719,
+      -0.0001378869418934036,
+      -0.0001899670827261229,
+      0.03942616413790853
+    ],
+    "views": 25,
+    "reprojection_rmse_px": 0.2400795575816897,
+    "worst_view_rmse_px": 0.4252997913855455,
+    "edge_coverage": {
+      "left": false,
+      "right": false,
+      "top": true,
+      "bottom": false
+    }
+  }
+}
