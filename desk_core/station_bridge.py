@@ -45,6 +45,7 @@ RAM_ACC = 0x29
 RAM_GOAL_POSITION = 0x2A
 RAM_GOAL_SPEED = 0x2E
 RAM_PRESENT_POSITION = 0x38
+RAM_PRESENT_VOLTAGE = 0x3E
 RAM_STATUS = 0x40
 RAM_PRESENT_CURRENT = 0x45
 
@@ -257,6 +258,7 @@ class LiveStationBridge:
         self._drivers = None
         self._send_commands = None
         self._motor_state: dict[str, dict[int, MotorState]] = {}
+        self._bus_voltage: dict[str, float] = {}
         self._torque_started: set[int] = set()
         self._frames: dict[str, bytes] = {}
         self._frame_buf: dict[str, deque[bytes]] = {}
@@ -486,10 +488,13 @@ class LiveStationBridge:
                     if not serial:
                         continue
                     slot = self._motor_state.setdefault(serial, {})
+                    volts: list[float] = []
                     for m in bus.get_motors():
                         sb = bytes(m.get_state())
                         if len(sb) < FULL_STATE_LEN:
                             continue
+                        if sb[RAM_PRESENT_VOLTAGE] > 0:
+                            volts.append(sb[RAM_PRESENT_VOLTAGE] / 10.0)
                         mid = m.get_id()
                         if mid in slot:
                             slot[mid].range_min = m.get_range_min()
@@ -503,6 +508,8 @@ class LiveStationBridge:
                                 m.get_range_max(),
                                 sb[RAM_STATUS],
                             )
+                    if volts:
+                        self._bus_voltage[serial] = sum(volts) / len(volts)
             except Exception as exc:
                 log.debug("inference parse skip: %s", exc)
 
@@ -583,8 +590,11 @@ class LiveStationBridge:
             raise RuntimeError("No ST3215 motor state received from Station yet.")
 
         def score(item: tuple[str, dict[int, MotorState]]):
-            _, ms = item
-            return (sum(1 for m in ms.values() if m.range_max > m.range_min), len(ms))
+            serial, ms = item
+            # Prefer 12V-powered follower buses (>=10V) over 7.6V/unpowered leader buses when unpinned
+            v = self._bus_voltage.get(serial, 0.0)
+            powered = 1 if v >= 10.0 else 0
+            return (powered, sum(1 for m in ms.values() if m.range_max > m.range_min), len(ms), v)
 
         return max(self._motor_state.items(), key=score)[0]
 

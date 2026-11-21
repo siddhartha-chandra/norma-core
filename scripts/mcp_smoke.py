@@ -99,11 +99,18 @@ async def run_sequence(session: ClientSession, live: bool) -> None:
     check("observe returns camera frames", n_img >= (1 if live else 2), f"{n_img} images")
 
     j1 = int(joints[0]["pos"])
-    target = j1 + 200
+    r_lo, r_hi = joints[0].get("range", [0, 4095])
+    delta = 200 if (r_hi <= r_lo or j1 + 200 <= r_hi - 25) else -200
+    target = j1 + delta
     data, ms = await call(session, "move_joints", {"targets": {"1": target}, "max_step": 250, "wait": True})
     applied = {str(k): v for k, v in data.get("applied", {}).items()}
     check("move_joints applies creep-clamped target", applied.get("1") == target,
           f"{j1} -> {applied.get('1')} ({ms*1000:.0f} ms)")
+    if live:
+        st_after, _ = await call(session, "get_state", {})
+        pos_after = next((m["position"] for m in st_after["joints"] if m["id"] == 1), j1)
+        check("live motor 1 physically moved toward target", abs(pos_after - j1) >= 40,
+              f"{j1} -> {pos_after} (target={target}, settled={data.get('settled')})")
 
     data, ms = await call(session, "grasp", {})
     check("grasp verifies jaw contact", data.get("ok") is True and "gripper_id" in data,
@@ -114,6 +121,8 @@ async def run_sequence(session: ClientSession, live: bool) -> None:
 
     data, ms = await call(session, "go_home", {})
     check("go_home targets joint midpoints", bool(data.get("home")), f"{len(data.get('home', {}))} joints ({ms*1000:.0f} ms)")
+    if live:
+        check("go_home settled within tolerance", data.get("settled") is True, str(data))
 
     data, ms = await call(session, "estop", {})
     check("estop freezes arm", data.get("aborted") is True, f"{ms*1000:.0f} ms")
