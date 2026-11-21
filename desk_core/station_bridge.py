@@ -260,6 +260,8 @@ class LiveStationBridge:
         self._motor_state: dict[str, dict[int, MotorState]] = {}
         self._bus_voltage: dict[str, float] = {}
         self._torque_started: set[int] = set()
+        self.rx_received_at: dict[tuple[str, int], float] = {}
+        self.frame_received_at: dict[str, float] = {}
         self._frames: dict[str, bytes] = {}
         self._frame_buf: dict[str, deque[bytes]] = {}
         self._frame_order: list[str] = []
@@ -589,6 +591,7 @@ class LiveStationBridge:
                     continue
                 slot = self._motor_state.setdefault(serial, {})
                 pos = _norm_pos(_u16(sb, RAM_PRESENT_POSITION))
+                self.rx_received_at[serial, mid] = time.monotonic()
                 cur = _u16(sb, RAM_PRESENT_CURRENT)
                 err = sb[RAM_STATUS]
                 if mid in slot:
@@ -645,6 +648,7 @@ class LiveStationBridge:
                 return
             key, jpeg = items[-1]
             self._key_to_qid[key] = qid
+            self.frame_received_at[key] = time.monotonic()
             self._frames[key] = jpeg
             self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
             if key not in self._frame_order:
@@ -665,6 +669,7 @@ class LiveStationBridge:
                 if parsed is None:
                     continue
                 key, jpeg = parsed
+                self.frame_received_at[key] = time.monotonic()
                 self._frames[key] = jpeg
                 self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
                 if key not in self._frame_order:
@@ -745,6 +750,7 @@ class LiveStationBridge:
                 items = await self._fetch_tail_frames(qid, count=4 if denoise else 1, timeout_s=3.0)
                 jpegs = [jb for _k, jb in items]
                 if jpegs:
+                    self.frame_received_at[key] = time.monotonic()
                     self._frames[key] = jpegs[-1]
                     buf = self._frame_buf.setdefault(key, deque(maxlen=7))
                     buf.extend(jpegs)

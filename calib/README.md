@@ -25,3 +25,5 @@ uv run --offline --managed-python python scripts/verify_calib.py
 uv run --offline --managed-python python scripts/verify_calib.py --live --save-overlay
 ```
 After updating `calib/rig_calib.json`, call MCP tool `reload_config()` (or `get_calib_status()`) without restarting the MCP server.
+
+For the current capture procedure, dataset inventory, offline hand-eye solve and validation status, see the [DESK-CORE hackathon handoff](../docs/desk-core-handoff.md).
