@@ -31,7 +31,7 @@ from pydantic import BaseModel
 
 from . import mcp_server as srv
 from .robo_jev import check_reflex_and_abort, guarded_recover
-from .vision_3d import DEFAULT_PROVIDER_MODELS, _get_api_key, _load_keystore, localize_object_3d
+from .vision_3d import DEFAULT_PROVIDER_MODELS, MODEL_RATINGS, VISION_MODELS_BY_PROVIDER, _get_api_key, _load_keystore, localize_object_3d
 
 app = FastAPI(title="DESK-CORE Mission Control")
 
@@ -412,6 +412,54 @@ async def api_unset_key(req: KeySetReq) -> dict[str, Any]:
     return {"ok": True, "provider": prov, "providers": _keys_status()}
 
 
+@app.post("/api/vision/verify")
+async def api_verify_vision(req: LocalizeReq) -> dict[str, Any]:
+    """Run live localization against known mock_frames/top.jpg ground truth to verify efficacy."""
+    gt_path = Path(__file__).resolve().parent.parent / "mock_frames" / "top.jpg"
+    if not gt_path.exists():
+        return {"ok": False, "error": "mock_frames/top.jpg not found"}
+    jpeg = gt_path.read_bytes()
+    # Ground-truth centers (x, y) in 1280x720 mock_frames/top.jpg
+    gt = {
+        "keys": (357.0, 437.0),
+        "coffee mug": (630.0, 310.0),
+    }
+    errors: list[float] = []
+    latencies: list[float] = []
+    backends: list[str] = []
+    for q, (gx, gy) in gt.items():
+        t0 = time.perf_counter()
+        det = await localize_object_3d(
+            jpeg_bytes=jpeg,
+            query=q,
+            calib=srv._calib,
+            camera="top",
+            use_gemini=req.use_gemini,
+            model=req.model,
+            provider=req.provider,
+        )
+        latencies.append((time.perf_counter() - t0) * 1000.0)
+        backends.append(det["backend"])
+        if det.get("found"):
+            px, py = det["pixel"]
+            errors.append(float(np.hypot(px - gx, py - gy)))
+        else:
+            errors.append(999.0)
+    mean_err = round(sum(errors) / len(errors), 1)
+    mean_ms = round(sum(latencies) / len(latencies), 1)
+    color = "green" if mean_err <= 65.0 else ("amber" if mean_err <= 140.0 else "red")
+    verdict = "VERIFIED PASS" if mean_err <= 65.0 else ("FAIR" if mean_err <= 140.0 else "POOR / FALLBACK")
+    _log_event("VERIFY", f"{backends[0]}: {verdict} (err={mean_err}px, {mean_ms}ms)", ok=(mean_err <= 65.0))
+    return {
+        "ok": True,
+        "backend": backends[0],
+        "mean_err_px": mean_err,
+        "mean_latency_ms": mean_ms,
+        "color": color,
+        "verdict": verdict,
+    }
+
+
 @app.post("/api/tts")
 async def api_tts(req: TTSReq) -> dict[str, Any]:
     queued = srv._tts.speak(req.text)
@@ -547,8 +595,9 @@ DASHBOARD_HTML = """<!doctype html>
           <option value="opencv">OpenCV Only</option>
         </select>
         <select id="loc-model" onchange="updateModelRating()" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;"></select>
-        <span id="model-rating" class="badge">RATING: --</span>
+        <span id="model-rating" class="badge">TIER: --</span>
         <button class="act" onclick="runLocalize()">Localize 3D</button>
+        <button class="act" style="background:#0f766e;color:#fff;" onclick="verifyVisionModel()">Verify Model</button>
         <button class="act" onclick="armWatch()">Arm Watch</button>
         <button class="act" onclick="checkReflex()">Check Reflex</button>
         <button class="act" onclick="guardedRecover()">Guarded Recover</button>
@@ -598,56 +647,72 @@ DASHBOARD_HTML = """<!doctype html>
     }
     async function triggerEstop() { await postJSON('/api/estop'); refresh(); }
     const VISION_MODELS = {
-      auto: [['', 'Default Vision Model', 98, 'S-Tier', 'green', 'Auto-picks configured provider']],
+      auto: [['', 'Default Vision Model', 'Auto Tier', 'green', 'Auto-picks configured provider']],
       gemini: [
-        ['gemini-4-hydrogen', 'gemini-4-hydrogen', 98, 'S-Tier', 'green', 'Native robotics pointing'],
-        ['gemini-3.8-pro', 'gemini-3.8-pro', 94, 'A+', 'green', 'High-accuracy multimodal'],
-        ['gemini-3.8-flash', 'gemini-3.8-flash', 88, 'A', 'amber', 'Fast low-latency vision'],
-        ['gemini-2.5-pro', 'gemini-2.5-pro', 90, 'A+', 'green', 'Strong spatial grounding'],
-        ['gemini-2.5-flash', 'gemini-2.5-flash', 84, 'A', 'amber', 'Fast general vision']
+        ['gemini-4-hydrogen', 'gemini-4-hydrogen', 'Robotics Pointing', 'green', 'Gemini 4 frontier vision'],
+        ['gemini-4-argon', 'gemini-4-argon', 'Frontier Vision', 'green', 'Gemini 4 Argon multimodal'],
+        ['gemini-robotics-er-2-preview', 'gemini-robotics-er-2-preview', 'Robotics Pointing', 'green', 'Embodied [y,x] pointing'],
+        ['gemini-3.8-pro', 'gemini-3.8-pro', 'Frontier Vision', 'green', 'High-accuracy multimodal'],
+        ['gemini-3.8-flash', 'gemini-3.8-flash', 'Fast Vision', 'amber', 'Low-latency multimodal']
       ],
       anthropic: [
-        ['claude-opus-4-6', 'claude-opus-4-6', 93, 'A+', 'green', 'Top-tier visual reasoning'],
-        ['claude-sonnet-4-6', 'claude-sonnet-4-6', 91, 'A+', 'green', 'Balanced high-precision vision'],
-        ['claude-haiku-4-5', 'claude-haiku-4-5', 82, 'B+', 'amber', 'Fast lightweight Claude vision']
+        ['claude-fable-5-2', 'claude-fable-5-2', 'Frontier Vision', 'green', 'Flagship agentic vision'],
+        ['claude-opus-5-5', 'claude-opus-5-5', 'Frontier Vision', 'green', 'Strongest Claude 5.5'],
+        ['claude-sonnet-5-5', 'claude-sonnet-5-5', 'Balanced Vision', 'green', 'Speed + accuracy (5.5)'],
+        ['claude-haiku-5-5', 'claude-haiku-5-5', 'Fast Vision', 'amber', 'Low-latency (5.5)'],
+        ['claude-opus-4-6', 'claude-opus-4-6', 'Legacy Vision', 'amber', 'Legacy 4.6 series'],
+        ['claude-sonnet-4-6', 'claude-sonnet-4-6', 'Legacy Vision', 'amber', 'Legacy 4.6 series']
       ],
       openai: [
-        ['gpt-5', 'gpt-5', 94, 'A+', 'green', 'Flagship OpenAI multimodal'],
-        ['gpt-5-mini', 'gpt-5-mini', 87, 'A', 'amber', 'Fast OpenAI mini vision'],
-        ['o3', 'o3', 92, 'A+', 'green', 'Reasoning + visual grounding'],
-        ['gpt-4.1', 'gpt-4.1', 90, 'A+', 'green', 'Reliable structured JSON vision'],
-        ['gpt-4.1-mini', 'gpt-4.1-mini', 84, 'A', 'amber', 'Fast low-cost vision'],
-        ['gpt-4o', 'gpt-4o', 85, 'A', 'amber', 'General multimodal'],
-        ['o4-mini', 'o4-mini', 83, 'B+', 'amber', 'Fast reasoning vision']
+        ['gpt-6.2-astra', 'gpt-6.2-astra', 'Frontier Vision', 'green', 'Flagship reasoning + vision'],
+        ['gpt-6.2-sol', 'gpt-6.2-sol', 'Balanced Vision', 'green', 'High efficiency (6.2)'],
+        ['gpt-6.1-terra', 'gpt-6.1-terra', 'Visual Grounding', 'green', 'Computer-use & visual reasoning'],
+        ['gpt-6-luna', 'gpt-6-luna', 'Fast Vision', 'amber', 'High-volume fast vision'],
+        ['gpt-5', 'gpt-5', 'Legacy Vision', 'amber', 'Retiring Dec 2026'],
+        ['gpt-4.1', 'gpt-4.1', 'Legacy Vision', 'amber', 'Deprecated 4.1 series']
       ],
       qwen: [
-        ['qwen3-vl-plus', 'qwen3-vl-plus', 91, 'A+', 'green', 'Latest Qwen3 VL spatial grounding'],
-        ['qwen-vl-max', 'qwen-vl-max', 89, 'A', 'amber', 'High-res Qwen vision'],
-        ['qwen2.5-vl-72b-instruct', 'qwen2.5-vl-72b-instruct', 88, 'A', 'amber', 'Strong open-weight VL grounding'],
-        ['qwen-vl-plus', 'qwen-vl-plus', 81, 'B+', 'amber', 'Lightweight Qwen VL']
+        ['qwen3.8-max', 'qwen3.8-max', 'Frontier Vision', 'green', 'Top ERQA Qwen3.8 VL'],
+        ['qwen3-vl-plus', 'qwen3-vl-plus', 'Balanced Vision', 'green', 'Qwen3 VL spatial grounding'],
+        ['qwen-vl-max', 'qwen-vl-max', 'Balanced Vision', 'amber', 'High-res Qwen VL'],
+        ['qwen2.5-vl-72b-instruct', 'qwen2.5-vl-72b-instruct', 'Open-Weight VL', 'amber', 'Qwen 2.5 VL 72B']
       ],
       deepseek: [
-        ['deepseek-vl2', 'deepseek-vl2', 78, 'B', 'amber', 'Requires VL2-compatible endpoint'],
-        ['deepseek-vl2-small', 'deepseek-vl2-small', 72, 'B-', 'amber', 'Compact DeepSeek VL2']
+        ['deepseek-vl2', 'deepseek-vl2', 'VL2 Endpoint', 'amber', 'Requires VL2-compatible host'],
+        ['deepseek-vl2-small', 'deepseek-vl2-small', 'Compact VL2', 'amber', 'Requires VL2-compatible host']
       ],
-      opencv: [['', 'opencv-fallback', 45, 'Fallback', 'red', 'Offline HSV/contour heuristic only']]
+      opencv: [['', 'opencv-fallback', 'Offline Heuristic', 'red', 'No semantic understanding']]
     };
+    const RATING_STYLES = {
+      green: { bg: '#064e3b', fg: '#34d399', bd: '#10b981' },
+      amber: { bg: '#78350f', fg: '#fbbf24', bd: '#f59e0b' },
+      red: { bg: '#7f1d1d', fg: '#fca5a5', bd: '#ef4444' }
+    };
+    function applyRatingStyle(badge, col, text) {
+      const s = RATING_STYLES[col] || { bg: '#1e293b', fg: '#94a3b8', bd: '#334155' };
+      badge.textContent = text;
+      badge.style.background = s.bg;
+      badge.style.color = s.fg;
+      badge.style.borderColor = s.bd;
+    }
     function updateModelRating() {
       const prov = document.getElementById('loc-provider').value || 'auto';
       const sel = document.getElementById('loc-model');
       const opts = VISION_MODELS[prov] || VISION_MODELS.auto;
       const picked = opts.find(o => o[0] === sel.value) || opts[0];
+      const [, , tier, col, note] = picked;
+      applyRatingStyle(document.getElementById('model-rating'), col, `${tier} · ${note}`);
+    }
+    async function verifyVisionModel() {
+      const prov = document.getElementById('loc-provider').value || 'auto';
+      const model = document.getElementById('loc-model').value || null;
       const badge = document.getElementById('model-rating');
-      const [, , score, tier, col, note] = picked;
-      const styles = {
-        green: { bg: '#064e3b', fg: '#34d399', bd: '#10b981' },
-        amber: { bg: '#78350f', fg: '#fbbf24', bd: '#f59e0b' },
-        red: { bg: '#7f1d1d', fg: '#fca5a5', bd: '#ef4444' }
-      }[col] || { bg: '#1e293b', fg: '#94a3b8', bd: '#334155' };
-      badge.textContent = `${tier} (${score}/100) · ${note}`;
-      badge.style.background = styles.bg;
-      badge.style.color = styles.fg;
-      badge.style.borderColor = styles.bd;
+      badge.textContent = 'VERIFYING...';
+      const r = await postJSON('/api/vision/verify', { query: 'keys', provider: prov, model: model });
+      if (r.ok) {
+        applyRatingStyle(badge, r.color, `${r.verdict} (${r.mean_err_px}px · ${r.mean_latency_ms}ms)`);
+      }
+      refresh();
     }
     let _keyProviders = {};
     function updateKeyBadge() {
@@ -689,7 +754,7 @@ DASHBOARD_HTML = """<!doctype html>
       const prov = document.getElementById('loc-provider').value || 'auto';
       const sel = document.getElementById('loc-model');
       const opts = VISION_MODELS[prov] || VISION_MODELS.auto;
-      sel.innerHTML = opts.map(([v, l, score, tier]) => `<option value="${v}">${l} [${tier} · ${score}/100]</option>`).join('');
+      sel.innerHTML = opts.map(([v, l, tier]) => `<option value="${v}">${l} [${tier}]</option>`).join('');
       updateKeyBadge();
       updateModelRating();
     }
