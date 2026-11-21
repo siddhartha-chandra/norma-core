@@ -33,8 +33,10 @@ from PIL import Image as PILImage
 from .calib_store import CalibrationStore, TICKS_PER_RAD
 from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
+from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort
 from .runlog import RunLogger
 from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, StationBridge, create_bridge
+from .tts import SpeakerTTS
 from .vision_3d import localize_object_3d
 
 if os.environ.get("DESK_NO_DOTENV") != "1":
@@ -49,6 +51,8 @@ _connect_cooldown_until = 0.0
 _calib = CalibrationStore()
 _ik = IKAdapter()
 _obstacles: dict[str, SceneObstacle] = {}
+_robo_jev = RoboJevGatekeeper()
+_tts = SpeakerTTS()
 
 RUNS_DIR = Path(os.environ.get("DESK_RUNS_DIR") or (REPO_ROOT / "runs"))
 _logger: RunLogger | None = None
@@ -453,6 +457,60 @@ async def localize_3d(
 
 @mcp.tool()
 @_traced
+async def robo_jev_arm_watch(
+    x: float,
+    y: float,
+    query: str = "target",
+    camera: str = "top",
+    depth_m: float | None = None,
+) -> dict:
+    """Arm Robo-Jev's <150 ms visual reflex watch on pixel (x, y) before a reach."""
+    bridge = await _get_bridge()
+    jpeg = await bridge.get_frame(camera, denoise=False)
+    d_m = float(depth_m) if depth_m is not None else _calib.get_metric_depth(float(x), float(y), camera=camera)
+    return _robo_jev.arm_watch(jpeg_bytes=jpeg, pixel=(float(x), float(y)), query=query, depth_m=d_m)
+
+
+@mcp.tool()
+@_traced
+async def robo_jev_check(
+    camera: str = "top",
+    target_x: float | None = None,
+    target_y: float | None = None,
+    abort_on_hazard: bool = True,
+) -> dict:
+    """Run Robo-Jev <150 ms reflex checks (`target_shifted`, `path_clear`, `will_tip`, `grasp_secure`)."""
+    bridge = await _get_bridge()
+    target_xy = (float(target_x), float(target_y)) if (target_x is not None and target_y is not None) else None
+    if abort_on_hazard:
+        return await check_reflex_and_abort(
+            gatekeeper=_robo_jev,
+            bridge=bridge,
+            calib=_calib,
+            obstacles=list(_obstacles.values()),
+            target_xy=target_xy,
+            camera=camera,
+        )
+    jpeg = await bridge.get_frame(camera, denoise=False)
+    return _robo_jev.evaluate(
+        curr_jpeg=jpeg,
+        calib=_calib,
+        obstacles=list(_obstacles.values()),
+        target_xy=target_xy,
+        camera=camera,
+    )
+
+
+@mcp.tool()
+@_traced
+async def speak_status(text: str) -> dict:
+    """Speak a short status cue over the portable speaker (non-blocking TTS)."""
+    queued = _tts.speak(text)
+    return {"queued": queued, "tts": _tts.status()}
+
+
+@mcp.tool()
+@_traced
 async def update_scene_obstacle(
     name: str,
     x: float,
@@ -599,6 +657,9 @@ _SEQ_TOOLS = {
     "get_metric_depth": get_metric_depth,
     "pixel_to_world": pixel_to_world,
     "localize_3d": localize_3d,
+    "robo_jev_arm_watch": robo_jev_arm_watch,
+    "robo_jev_check": robo_jev_check,
+    "speak_status": speak_status,
     "update_scene_obstacle": update_scene_obstacle,
     "get_calib_status": get_calib_status,
     "reload_config": reload_config,
