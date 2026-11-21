@@ -20,14 +20,14 @@
     },
     "sources": {
       "intrinsics (overlaid by CalibrationStore, not copied)": "calib_frames/session1/camera_calibration.json",
-      "T_ee_cam_wrist, joint_zero_ticks, joint_signs, z_table": "calib_frames/hand_eye_1/wrist_mount_final.json",
+      "T_ee_cam_wrist, joint_zero_ticks, joint_signs, z_table": "calib_frames/hand_eye_combined/wrist_mount_final.json",
       "T_world_cam_top": "calib_frames/scene_1/scene_to_base.json",
       "hardware": "calib_frames/scene_1/capture.json",
-      "exported_at_commit": "f1bad65"
+      "exported_at_commit": "5c1d2f2"
     },
     "accuracy": {
-      "wrist_fit_board_consistency_mm_deg": [9.5, 2.43],
-      "scene_board_moved_check_mm_deg": [19.0, 3.91]
+      "wrist_fit_board_consistency_mm_deg": [10.1, 2.53],
+      "scene_board_moved_check_mm_deg": [18.4, 3.85]
     },
     "valid_while": "Station motor ranges (station_data) and servo offsets are unchanged, the wrist camera mount is untouched, the scene camera is not moved, and streams run at the intrinsics' image size (1280x720)."
   },
@@ -77,19 +77,19 @@
     "min_holding_gap_ticks": 120
   },
   "home_joints_rad": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-  "z_table": 0.00258,
+  "z_table": 0.00237,
   "cam_height_top_m": 0.62,
   "cam_height_wrist_m": 0.25,
   "T_world_cam_top": [
-    [0.9798067800224669, 0.11714846076404652, -0.1620336753968746, 0.0406007170978486],
-    [0.19709578282260157, -0.7022418000649769, 0.684112349424454, -0.38061956639025096],
-    [-0.03364411115709508, -0.7022340723591496, -0.7111507444995981, 0.3675572917044944],
+    [0.9808924034568449, 0.11558336809271924, -0.15649465761168016, 0.03830240064795534],
+    [0.19203617432208656, -0.7041355517315132, 0.6836045878572606, -0.3801345210146706],
+    [-0.03118013137225727, -0.7005951825470258, -0.7128774015211219, 0.36728877051753817],
     [0.0, 0.0, 0.0, 1.0]
   ],
   "T_ee_cam_wrist": [
-    [0.9955838758331874, 0.03423720966569668, -0.08741029490440458, -0.005244625378141375],
-    [0.09368951151962315, -0.42107055277683014, 0.9021761829129767, 0.018792842110000565],
-    [-0.005917906063993873, -0.9063814887002722, -0.42241872038215345, 0.0659886696509935],
+    [0.9957262816435453, 0.029756573856901856, -0.08742836128292157, -0.005603723230335922],
+    [0.09186563376904103, -0.41630968022238873, 0.904570039015965, 0.019125930182076548],
+    [-0.009480367953341381, -0.9087358232541682, -0.41726409641621226, 0.06463393618109023],
     [0.0, 0.0, 0.0, 1.0]
   ]
 }

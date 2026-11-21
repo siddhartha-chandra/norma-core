@@ -42,7 +42,7 @@ def git_commit():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--calibration", type=Path, default=ROOT / "calib_frames/session1/camera_calibration.json")
-    parser.add_argument("--wrist-mount", type=Path, default=ROOT / "calib_frames/hand_eye_1/wrist_mount_final.json")
+    parser.add_argument("--wrist-mount", type=Path, default=ROOT / "calib_frames/hand_eye_combined/wrist_mount_final.json")
     parser.add_argument("--scene", type=Path, default=ROOT / "calib_frames/scene_1/scene_to_base.json")
     parser.add_argument("--scene-capture", type=Path, default=ROOT / "calib_frames/scene_1/capture.json")
     parser.add_argument("--rig", type=Path, default=ROOT / "calib/rig_calib.json")

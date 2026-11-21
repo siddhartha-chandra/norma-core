@@ -11,26 +11,26 @@
     "non_urdf_frames": {
       "scene_camera_optical_frame": "Not in elrobot_follower.urdf. OpenCV optical convention: +X right, +Y down, +Z forward out of the lens."
     },
-    "depends_on": "../calib_frames/hand_eye_1/wrist_mount_final.json"
+    "depends_on": "calib_frames/hand_eye_combined/wrist_mount_final.json"
   },
   "T_base_cam_scene": [
     [
-      0.9798067800224669,
-      0.11714846076404652,
-      -0.1620336753968746,
-      0.0406007170978486
+      0.9808924034568449,
+      0.11558336809271924,
+      -0.15649465761168016,
+      0.03830240064795534
     ],
     [
-      0.19709578282260157,
-      -0.7022418000649769,
-      0.684112349424454,
-      -0.38061956639025096
+      0.19203617432208656,
+      -0.7041355517315132,
+      0.6836045878572606,
+      -0.3801345210146706
     ],
     [
-      -0.03364411115709508,
-      -0.7022340723591496,
-      -0.7111507444995981,
-      0.3675572917044944
+      -0.03118013137225727,
+      -0.7005951825470258,
+      -0.7128774015211219,
+      0.36728877051753817
     ],
     [
       0.0,
@@ -44,8 +44,8 @@
   "scene_reprojection_rmse_px": 0.188,
   "scene_detector": "sb",
   "board_moved_check": {
-    "wrist_view_vs_T_base_board_mm": 19.0,
-    "wrist_view_vs_T_base_board_deg": 3.91,
+    "wrist_view_vs_T_base_board_mm": 18.4,
+    "wrist_view_vs_T_base_board_deg": 3.85,
     "wrist_reprojection_rmse_px": 0.206
   }
 }

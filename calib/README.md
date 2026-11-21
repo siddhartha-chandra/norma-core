@@ -19,18 +19,23 @@ Shared calibration contract linking Station hardware, camera extrinsics/intrinsi
 ## Regenerate (do not hand-edit calibrated values)
 `rig_calib.json` is generated from result files under `calib_frames/`. Run from the repo root:
 ```bash
-# 1. Wrist mount + board pose (fixed-board session; ranges from the station motor state)
-python3 scripts/fit_joint_offsets.py calib_frames/hand_eye_1/samples.json \
+# 1. Wrist mount + board pose (fixed-board session; ranges from the station motor state).
+#    hand_eye_combined/samples.json lists the hand_eye_1 views plus the board_check poses.
+python3 scripts/fit_joint_offsets.py calib_frames/hand_eye_combined/samples.json \
   --calibration calib_frames/session1/camera_calibration.json \
   --ranges calib_frames/hand_eye_1/follower_ranges.json --rig-zeros \
-  --output calib_frames/hand_eye_1/fit_report.json \
-  --mount-output calib_frames/hand_eye_1/wrist_mount_final.json
+  --output calib_frames/hand_eye_combined/fit_report.json \
+  --mount-output calib_frames/hand_eye_combined/wrist_mount_final.json
 # 2. Scene camera -> base_link (board must not have moved since step 1)
 python3 scripts/capture_scene_board.py calib_frames/scene_1   # needs a running station
 python3 scripts/solve_scene_to_base.py calib_frames/scene_1/capture.json \
   --calibration calib_frames/session1/camera_calibration.json \
-  --wrist-mount calib_frames/hand_eye_1/wrist_mount_final.json \
+  --wrist-mount calib_frames/hand_eye_combined/wrist_mount_final.json \
   --output calib_frames/scene_1/scene_to_base.json
+# Optional: one run per arm pose; a consistent mean offset means the board moved
+python3 scripts/check_board_moved.py calib_frames/board_check \
+  --calibration calib_frames/session1/camera_calibration.json \
+  --wrist-mount calib_frames/hand_eye_combined/wrist_mount_final.json
 # 3. Write rig_calib.json, then verify
 python3 scripts/export_rig_calib.py
 python3 scripts/verify_calib.py
