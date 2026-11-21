@@ -427,6 +427,7 @@ async def api_verify_vision(req: LocalizeReq) -> dict[str, Any]:
     errors: list[float] = []
     latencies: list[float] = []
     backends: list[str] = []
+    fallback_reasons: list[str] = []
     for q, (gx, gy) in gt.items():
         t0 = time.perf_counter()
         det = await localize_object_3d(
@@ -435,11 +436,14 @@ async def api_verify_vision(req: LocalizeReq) -> dict[str, Any]:
             calib=srv._calib,
             camera="top",
             use_gemini=req.use_gemini,
+            timeout_s=15.0,
             model=req.model,
             provider=req.provider,
         )
         latencies.append((time.perf_counter() - t0) * 1000.0)
         backends.append(det["backend"])
+        if det.get("fallback_reason"):
+            fallback_reasons.append(str(det["fallback_reason"]))
         if det.get("found"):
             px, py = det["pixel"]
             errors.append(float(np.hypot(px - gx, py - gy)))
@@ -447,12 +451,18 @@ async def api_verify_vision(req: LocalizeReq) -> dict[str, Any]:
             errors.append(999.0)
     mean_err = round(sum(errors) / len(errors), 1)
     mean_ms = round(sum(latencies) / len(latencies), 1)
+    fb = fallback_reasons[0] if fallback_reasons else None
     color = "green" if mean_err <= 65.0 else ("amber" if mean_err <= 140.0 else "red")
-    verdict = "VERIFIED PASS" if mean_err <= 65.0 else ("FAIR" if mean_err <= 140.0 else "POOR / FALLBACK")
-    _log_event("VERIFY", f"{backends[0]}: {verdict} (err={mean_err}px, {mean_ms}ms)", ok=(mean_err <= 65.0))
+    if fb:
+        verdict = f"FALLBACK ({fb[:60]})"
+        color = "red"
+    else:
+        verdict = "VERIFIED PASS" if mean_err <= 65.0 else ("FAIR" if mean_err <= 140.0 else "POOR")
+    _log_event("VERIFY", f"{backends[0]}: {verdict} (err={mean_err}px, {mean_ms}ms)", ok=(not fb and mean_err <= 65.0))
     return {
         "ok": True,
         "backend": backends[0],
+        "fallback_reason": fb,
         "mean_err_px": mean_err,
         "mean_latency_ms": mean_ms,
         "color": color,

@@ -490,7 +490,7 @@ async def localize_object_3d(
     q_rad: list[float] | None = None,
     z_m: float | None = None,
     use_gemini: bool = True,
-    timeout_s: float = 6.0,
+    timeout_s: float = 12.0,
     model: str | None = None,
     provider: str = "auto",
 ) -> dict[str, Any]:
