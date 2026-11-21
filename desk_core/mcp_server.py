@@ -35,6 +35,7 @@ from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
 from .runlog import RunLogger
 from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, StationBridge, create_bridge
+from .vision_3d import localize_object_3d
 
 if os.environ.get("DESK_NO_DOTENV") != "1":
     for _k, _v in dotenv_values(REPO_ROOT / ".env").items():
@@ -426,6 +427,32 @@ async def pixel_to_world(
 
 @mcp.tool()
 @_traced
+async def localize_3d(
+    query: str,
+    camera: str = "top",
+    z_m: float | None = None,
+    use_gemini: bool = True,
+    denoise: bool = True,
+    timeout_s: float = 6.0,
+) -> dict:
+    """Zero-shot 3D object localization via Gemini 4 Hydrogen with automatic OpenCV HSV/contour fallback."""
+    bridge = await _get_bridge()
+    jpeg = await bridge.get_frame(camera, denoise=denoise)
+    q = await _live_arm_q(None, camera)
+    return await localize_object_3d(
+        jpeg_bytes=jpeg,
+        query=query,
+        calib=_calib,
+        camera=camera,
+        q_rad=q,
+        z_m=z_m,
+        use_gemini=use_gemini,
+        timeout_s=float(timeout_s),
+    )
+
+
+@mcp.tool()
+@_traced
 async def update_scene_obstacle(
     name: str,
     x: float,
@@ -571,6 +598,7 @@ _SEQ_TOOLS = {
     "solve_ik": solve_ik,
     "get_metric_depth": get_metric_depth,
     "pixel_to_world": pixel_to_world,
+    "localize_3d": localize_3d,
     "update_scene_obstacle": update_scene_obstacle,
     "get_calib_status": get_calib_status,
     "reload_config": reload_config,
