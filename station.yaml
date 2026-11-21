@@ -6,8 +6,11 @@ drivers:
   system-info: true
   usb-video:
     enabled: true
-    resize_target: 480        # Sharper than default 224 for Gemini pointing & wrist IBVS (0 = native)
-    formats: []               # Auto-select camera format; pin e.g. {format: "640x480@30fps,mjpeg"} if needed
+    resize_target: 0          # Keep the camera capture resolution
+    formats:
+      - {format: "1920x1080@30fps,mjpeg"}
+      - {format: "1280x720@30fps,mjpeg"}
+      - {format: "640x480@30fps,mjpeg"}
     frame-skip: 0
 
 inference:
