@@ -546,7 +546,8 @@ DASHBOARD_HTML = """<!doctype html>
           <option value="deepseek">DeepSeek VL</option>
           <option value="opencv">OpenCV Only</option>
         </select>
-        <select id="loc-model" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;"></select>
+        <select id="loc-model" onchange="updateModelRating()" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;"></select>
+        <span id="model-rating" class="badge">RATING: --</span>
         <button class="act" onclick="runLocalize()">Localize 3D</button>
         <button class="act" onclick="armWatch()">Arm Watch</button>
         <button class="act" onclick="checkReflex()">Check Reflex</button>
@@ -597,14 +598,57 @@ DASHBOARD_HTML = """<!doctype html>
     }
     async function triggerEstop() { await postJSON('/api/estop'); refresh(); }
     const VISION_MODELS = {
-      auto: [['', 'Default Vision Model']],
-      gemini: [['gemini-4-hydrogen', 'gemini-4-hydrogen'], ['gemini-3.8-flash', 'gemini-3.8-flash'], ['gemini-3.8-pro', 'gemini-3.8-pro']],
-      anthropic: [['claude-sonnet-4-6', 'claude-sonnet-4-6'], ['claude-opus-4-6', 'claude-opus-4-6'], ['claude-haiku-4-5', 'claude-haiku-4-5']],
-      openai: [['gpt-4.1-mini', 'gpt-4.1-mini'], ['gpt-4.1', 'gpt-4.1'], ['gpt-4o', 'gpt-4o'], ['o4-mini', 'o4-mini']],
-      qwen: [['qwen-vl-max', 'qwen-vl-max'], ['qwen2.5-vl-72b-instruct', 'qwen2.5-vl-72b-instruct'], ['qwen-vl-plus', 'qwen-vl-plus']],
-      deepseek: [['deepseek-vl2', 'deepseek-vl2']],
-      opencv: [['', 'opencv-fallback']]
+      auto: [['', 'Default Vision Model', 98, 'S-Tier', 'green', 'Auto-picks configured provider']],
+      gemini: [
+        ['gemini-4-hydrogen', 'gemini-4-hydrogen', 98, 'S-Tier', 'green', 'Native robotics pointing'],
+        ['gemini-3.8-pro', 'gemini-3.8-pro', 94, 'A+', 'green', 'High-accuracy multimodal'],
+        ['gemini-3.8-flash', 'gemini-3.8-flash', 88, 'A', 'amber', 'Fast low-latency vision'],
+        ['gemini-2.5-pro', 'gemini-2.5-pro', 90, 'A+', 'green', 'Strong spatial grounding'],
+        ['gemini-2.5-flash', 'gemini-2.5-flash', 84, 'A', 'amber', 'Fast general vision']
+      ],
+      anthropic: [
+        ['claude-opus-4-6', 'claude-opus-4-6', 93, 'A+', 'green', 'Top-tier visual reasoning'],
+        ['claude-sonnet-4-6', 'claude-sonnet-4-6', 91, 'A+', 'green', 'Balanced high-precision vision'],
+        ['claude-haiku-4-5', 'claude-haiku-4-5', 82, 'B+', 'amber', 'Fast lightweight Claude vision']
+      ],
+      openai: [
+        ['gpt-5', 'gpt-5', 94, 'A+', 'green', 'Flagship OpenAI multimodal'],
+        ['gpt-5-mini', 'gpt-5-mini', 87, 'A', 'amber', 'Fast OpenAI mini vision'],
+        ['o3', 'o3', 92, 'A+', 'green', 'Reasoning + visual grounding'],
+        ['gpt-4.1', 'gpt-4.1', 90, 'A+', 'green', 'Reliable structured JSON vision'],
+        ['gpt-4.1-mini', 'gpt-4.1-mini', 84, 'A', 'amber', 'Fast low-cost vision'],
+        ['gpt-4o', 'gpt-4o', 85, 'A', 'amber', 'General multimodal'],
+        ['o4-mini', 'o4-mini', 83, 'B+', 'amber', 'Fast reasoning vision']
+      ],
+      qwen: [
+        ['qwen3-vl-plus', 'qwen3-vl-plus', 91, 'A+', 'green', 'Latest Qwen3 VL spatial grounding'],
+        ['qwen-vl-max', 'qwen-vl-max', 89, 'A', 'amber', 'High-res Qwen vision'],
+        ['qwen2.5-vl-72b-instruct', 'qwen2.5-vl-72b-instruct', 88, 'A', 'amber', 'Strong open-weight VL grounding'],
+        ['qwen-vl-plus', 'qwen-vl-plus', 81, 'B+', 'amber', 'Lightweight Qwen VL']
+      ],
+      deepseek: [
+        ['deepseek-vl2', 'deepseek-vl2', 78, 'B', 'amber', 'Requires VL2-compatible endpoint'],
+        ['deepseek-vl2-small', 'deepseek-vl2-small', 72, 'B-', 'amber', 'Compact DeepSeek VL2']
+      ],
+      opencv: [['', 'opencv-fallback', 45, 'Fallback', 'red', 'Offline HSV/contour heuristic only']]
     };
+    function updateModelRating() {
+      const prov = document.getElementById('loc-provider').value || 'auto';
+      const sel = document.getElementById('loc-model');
+      const opts = VISION_MODELS[prov] || VISION_MODELS.auto;
+      const picked = opts.find(o => o[0] === sel.value) || opts[0];
+      const badge = document.getElementById('model-rating');
+      const [, , score, tier, col, note] = picked;
+      const styles = {
+        green: { bg: '#064e3b', fg: '#34d399', bd: '#10b981' },
+        amber: { bg: '#78350f', fg: '#fbbf24', bd: '#f59e0b' },
+        red: { bg: '#7f1d1d', fg: '#fca5a5', bd: '#ef4444' }
+      }[col] || { bg: '#1e293b', fg: '#94a3b8', bd: '#334155' };
+      badge.textContent = `${tier} (${score}/100) · ${note}`;
+      badge.style.background = styles.bg;
+      badge.style.color = styles.fg;
+      badge.style.borderColor = styles.bd;
+    }
     let _keyProviders = {};
     function updateKeyBadge() {
       const prov = document.getElementById('loc-provider').value || 'auto';
@@ -645,8 +689,9 @@ DASHBOARD_HTML = """<!doctype html>
       const prov = document.getElementById('loc-provider').value || 'auto';
       const sel = document.getElementById('loc-model');
       const opts = VISION_MODELS[prov] || VISION_MODELS.auto;
-      sel.innerHTML = opts.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+      sel.innerHTML = opts.map(([v, l, score, tier]) => `<option value="${v}">${l} [${tier} · ${score}/100]</option>`).join('');
       updateKeyBadge();
+      updateModelRating();
     }
     syncVisionModels();
     refreshKeys();

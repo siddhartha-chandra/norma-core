@@ -39,11 +39,36 @@ DEFAULT_PROVIDER_MODELS: dict[str, str] = {
 }
 
 VISION_MODELS_BY_PROVIDER: dict[str, list[str]] = {
-    "gemini": ["gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.8-pro"],
-    "anthropic": ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"],
-    "openai": ["gpt-4.1-mini", "gpt-4.1", "gpt-4o", "o4-mini"],
-    "qwen": ["qwen-vl-max", "qwen2.5-vl-72b-instruct", "qwen-vl-plus"],
-    "deepseek": ["deepseek-vl2"],
+    "gemini": ["gemini-4-hydrogen", "gemini-3.8-pro", "gemini-3.8-flash", "gemini-2.5-pro", "gemini-2.5-flash"],
+    "anthropic": ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
+    "openai": ["gpt-5", "gpt-5-mini", "o3", "gpt-4.1", "gpt-4.1-mini", "gpt-4o", "o4-mini"],
+    "qwen": ["qwen3-vl-plus", "qwen-vl-max", "qwen2.5-vl-72b-instruct", "qwen-vl-plus"],
+    "deepseek": ["deepseek-vl2", "deepseek-vl2-small"],
+}
+
+MODEL_RATINGS: dict[str, dict[str, Any]] = {
+    "gemini-4-hydrogen": {"score": 98, "tier": "S-Tier", "color": "green", "note": "Native robotics pointing + 2D/6D grounding"},
+    "gemini-3.8-pro": {"score": 94, "tier": "A+", "color": "green", "note": "High-accuracy multimodal reasoning"},
+    "gemini-3.8-flash": {"score": 88, "tier": "A", "color": "amber", "note": "Fast low-latency vision"},
+    "gemini-2.5-pro": {"score": 90, "tier": "A+", "color": "green", "note": "Strong spatial grounding"},
+    "gemini-2.5-flash": {"score": 84, "tier": "A", "color": "amber", "note": "Fast general vision"},
+    "claude-opus-4-6": {"score": 93, "tier": "A+", "color": "green", "note": "Top-tier visual reasoning"},
+    "claude-sonnet-4-6": {"score": 91, "tier": "A+", "color": "green", "note": "Balanced high-precision vision"},
+    "claude-haiku-4-5": {"score": 82, "tier": "B+", "color": "amber", "note": "Fast lightweight Claude vision"},
+    "gpt-5": {"score": 94, "tier": "A+", "color": "green", "note": "Flagship OpenAI multimodal"},
+    "gpt-5-mini": {"score": 87, "tier": "A", "color": "amber", "note": "Fast OpenAI mini vision"},
+    "o3": {"score": 92, "tier": "A+", "color": "green", "note": "Reasoning + visual grounding"},
+    "gpt-4.1": {"score": 90, "tier": "A+", "color": "green", "note": "Reliable structured JSON vision"},
+    "gpt-4.1-mini": {"score": 84, "tier": "A", "color": "amber", "note": "Fast low-cost vision"},
+    "gpt-4o": {"score": 85, "tier": "A", "color": "amber", "note": "General multimodal"},
+    "o4-mini": {"score": 83, "tier": "B+", "color": "amber", "note": "Fast reasoning vision"},
+    "qwen3-vl-plus": {"score": 91, "tier": "A+", "color": "green", "note": "Latest Qwen3 VL spatial grounding"},
+    "qwen-vl-max": {"score": 89, "tier": "A", "color": "amber", "note": "High-res Qwen vision"},
+    "qwen2.5-vl-72b-instruct": {"score": 88, "tier": "A", "color": "amber", "note": "Strong open-weight VL grounding"},
+    "qwen-vl-plus": {"score": 81, "tier": "B+", "color": "amber", "note": "Lightweight Qwen VL"},
+    "deepseek-vl2": {"score": 78, "tier": "B", "color": "amber", "note": "Requires VL2-compatible endpoint"},
+    "deepseek-vl2-small": {"score": 72, "tier": "B-", "color": "amber", "note": "Compact DeepSeek VL2"},
+    "opencv-fallback": {"score": 45, "tier": "Fallback", "color": "red", "note": "Offline HSV/contour heuristic only"},
 }
 
 # Explicit HSV bounds for ElRobot 3D-printed / anodized orange & coral servo horns
