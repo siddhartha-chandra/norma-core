@@ -125,6 +125,15 @@ class SecureKeyStore:
             self._keys.pop(p, None)
         self._save()
 
+    def unset_key(self, provider: str, clear_env: bool = True) -> None:
+        """Remove a provider's API key from the local keystore (and current process env)."""
+        validate_vision_plugin(provider)
+        p = provider.strip().lower()
+        self._keys.pop(p, None)
+        self._save()
+        if clear_env:
+            os.environ.pop(VISION_PROVIDERS[p]["env_var"], None)
+
     def get_key(self, provider: str) -> str:
         p = provider.strip().lower()
         if p not in VISION_PROVIDERS:
@@ -386,6 +395,28 @@ def transcribe_wav_sync(wav_bytes: bytes, keystore: SecureKeyStore) -> str:
             return json.loads(resp.read().decode("utf-8")).get("text", "").strip()
 
     raise RuntimeError("Voice transcription requires a Gemini or OpenAI API key (press Ctrl+K).")
+
+
+def speak_text_sync(text: str) -> bool:
+    """Speak `text` over system audio (`say` on macOS, `pyttsx3` fallback). Disable with DESK_TTS=0."""
+    if os.environ.get("DESK_TTS", "1") == "0":
+        return False
+    clean = " ".join(str(text).split()).strip()
+    if not clean:
+        return False
+    if sys.platform == "darwin" and shutil.which("say"):
+        subprocess.run(["say", "-r", "185", clean], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    try:
+        import pyttsx3
+
+        eng = pyttsx3.init()
+        eng.setProperty("rate", 185)
+        eng.say(clean)
+        eng.runAndWait()
+        return True
+    except Exception:
+        return False
 
 
 async def run_agent_command(

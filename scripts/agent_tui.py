@@ -50,6 +50,7 @@ from desk_core.llm_plugins import (
     SecureKeyStore,
     record_wav_sync,
     run_agent_command,
+    speak_text_sync,
     transcribe_wav_sync,
 )
 
@@ -90,14 +91,20 @@ class KeyConfigModal(ModalScreen[bool]):
         align: center middle;
     }
     #key-dialog {
-        width: 68;
+        width: 74;
         height: auto;
         border: thick $accent;
         background: $surface;
         padding: 1 2;
     }
-    #key-dialog Input {
+    .key-row {
+        height: 3;
+        align: left middle;
         margin-bottom: 1;
+    }
+    .key-row Input {
+        width: 1fr;
+        margin-right: 1;
     }
     #key-actions {
         height: 3;
@@ -111,21 +118,46 @@ class KeyConfigModal(ModalScreen[bool]):
     def __init__(self, keystore: SecureKeyStore) -> None:
         super().__init__()
         self.keystore = keystore
+        self._changed = False
 
     def compose(self) -> ComposeResult:
         st = self.keystore.status()
         with Vertical(id="key-dialog"):
             yield Label("[b]Secure Vision LLM Plugins (0600 local keystore)[/b]")
             yield Label(f"[dim]Only image-capable providers allowed. Stored at: {self.keystore.path}[/dim]")
-            yield Label(f"Google Gemini ({st['gemini']['masked'] or 'not set'}):")
-            yield Input(placeholder="Paste GEMINI_API_KEY (leave blank to keep)", password=True, id="in-gemini")
-            yield Label(f"Anthropic Claude ({st['claude']['masked'] or 'not set'}):")
-            yield Input(placeholder="Paste ANTHROPIC_API_KEY (leave blank to keep)", password=True, id="in-claude")
-            yield Label(f"OpenAI ({st['openai']['masked'] or 'not set'}):")
-            yield Input(placeholder="Paste OPENAI_API_KEY (leave blank to keep)", password=True, id="in-openai")
+            yield Label(f"Google Gemini ({st['gemini']['masked'] or 'not set'}):", id="lbl-gemini")
+            with Horizontal(classes="key-row"):
+                yield Input(placeholder="Paste GEMINI_API_KEY (leave blank to keep)", password=True, id="in-gemini")
+                yield Button("Unset", variant="error", id="btn-unset-gemini")
+            yield Label(f"Anthropic Claude ({st['claude']['masked'] or 'not set'}):", id="lbl-claude")
+            with Horizontal(classes="key-row"):
+                yield Input(placeholder="Paste ANTHROPIC_API_KEY (leave blank to keep)", password=True, id="in-claude")
+                yield Button("Unset", variant="error", id="btn-unset-claude")
+            yield Label(f"OpenAI ({st['openai']['masked'] or 'not set'}):", id="lbl-openai")
+            with Horizontal(classes="key-row"):
+                yield Input(placeholder="Paste OPENAI_API_KEY (leave blank to keep)", password=True, id="in-openai")
+                yield Button("Unset", variant="error", id="btn-unset-openai")
             with Horizontal(id="key-actions"):
                 yield Button("Save Keys", variant="primary", id="btn-save-keys")
-                yield Button("Cancel", id="btn-cancel-keys")
+                yield Button("Close", id="btn-cancel-keys")
+
+    @on(Button.Pressed, "#btn-unset-gemini")
+    def _unset_gemini(self) -> None:
+        self._unset("gemini", "Google Gemini", "#lbl-gemini", "#in-gemini")
+
+    @on(Button.Pressed, "#btn-unset-claude")
+    def _unset_claude(self) -> None:
+        self._unset("claude", "Anthropic Claude", "#lbl-claude", "#in-claude")
+
+    @on(Button.Pressed, "#btn-unset-openai")
+    def _unset_openai(self) -> None:
+        self._unset("openai", "OpenAI", "#lbl-openai", "#in-openai")
+
+    def _unset(self, prov: str, title: str, lbl_id: str, in_id: str) -> None:
+        self.keystore.unset_key(prov)
+        self._changed = True
+        self.query_one(in_id, Input).value = ""
+        self.query_one(lbl_id, Label).update(f"{title} (unset):")
 
     @on(Button.Pressed, "#btn-save-keys")
     def _save(self) -> None:
@@ -133,11 +165,12 @@ class KeyConfigModal(ModalScreen[bool]):
             val = self.query_one(wid, Input).value.strip()
             if val:
                 self.keystore.set_key(prov, val)
-        self.dismiss(True)
+                self._changed = True
+        self.dismiss(self._changed)
 
     @on(Button.Pressed, "#btn-cancel-keys")
     def _cancel(self) -> None:
-        self.dismiss(False)
+        self.dismiss(self._changed)
 
 
 class RobotAgentTUI(App):
@@ -145,7 +178,8 @@ class RobotAgentTUI(App):
     CSS = """
     Screen { layout: vertical; padding: 0 1; }
     #top-bar { height: 3; align: left middle; margin-bottom: 1; }
-    #model-select { width: 48; margin-right: 1; }
+    #model-select { width: 42; margin-right: 1; }
+    #output-mode { width: 20; margin-right: 1; }
     #top-bar Button { margin-right: 1; }
     #key-status { height: auto; margin-bottom: 1; color: $text-muted; }
     #chat-log { height: 1fr; border: solid $primary; padding: 0 1; margin-bottom: 1; }
@@ -178,6 +212,12 @@ class RobotAgentTUI(App):
         yield Header(show_clock=True)
         with Horizontal(id="top-bar"):
             yield Select(options, value=default_val, allow_blank=False, id="model-select")
+            yield Select(
+                [("Audio + Text", "audio_text"), ("Audio only", "audio_only"), ("Text only", "text_only")],
+                value="audio_text",
+                allow_blank=False,
+                id="output-mode",
+            )
             yield Button("API Keys (Ctrl+K)", id="btn-keys")
             yield Button("E-STOP (Ctrl+E)", variant="error", id="btn-estop")
             yield Checkbox("Arm Motion", value=(not self.live), id="arm-motion")
@@ -327,7 +367,13 @@ class RobotAgentTUI(App):
                 tools_summary=self.tools_summary,
                 call_tool_fn=self._call_mcp_tool,
             )
-            log.write(f"[bold green]{provider}:{model_id}:[/bold green] {out['reply']}")
+            mode = str(self.query_one("#output-mode", Select).value or "audio_text")
+            if mode in ("audio_text", "text_only"):
+                log.write(f"[bold green]{provider}:{model_id}:[/bold green] {out['reply']}")
+            else:
+                log.write(f"[dim]{provider}:{model_id} (audio-only response)[/dim]")
+            if mode in ("audio_text", "audio_only"):
+                await asyncio.to_thread(speak_text_sync, out["reply"])
         except Exception as exc:
             log.write(f"[bold red]Agent error:[/bold red] {exc}")
 
@@ -348,6 +394,8 @@ async def _run_headless_test() -> int:
         ks = SecureKeyStore(Path(td) / "keys.json")
         ks.set_key("gemini", "test-gem-key-1234")
         ks.set_key("claude", "test-claude-key-5678")
+        ks.unset_key("claude")
+        assert not ks.get_key("claude"), "Expected claude key to be unset"
         mode_perm = (Path(td) / "keys.json").stat().st_mode & 0o777
         assert mode_perm == 0o600, f"Expected 0600 permissions, got {oct(mode_perm)}"
 
@@ -366,7 +414,10 @@ async def _run_headless_test() -> int:
                 done=True,
             )
             with patch("desk_core.llm_plugins.call_vision_model_step", return_value=fake_step):
+                app.query_one("#output-mode", Select).value = "audio_only"
                 await app._execute_command("check calibration")
+                app.query_one("#output-mode", Select).value = "audio_text"
+                await app._execute_command("check calibration again")
             await pilot.pause(0.1)
 
     print("VOICE & VISION AGENT TUI PASS")
