@@ -563,10 +563,17 @@ class LiveStationBridge:
             except Exception as exc:
                 log.debug("video parse skip: %s", exc)
 
-    async def _warmup(self, max_s: float = 4.0) -> None:
+    async def _warmup(self, max_s: float = 5.0) -> None:
+        want_cams = 2 if (self._cam_map.get("top") and self._cam_map.get("wrist")) else 1
+        settled_since: float | None = None
         for _ in range(int(max_s / 0.1)):
-            if self._motor_state and self._frames:
+            if self._motor_state and len(self._frames) >= want_cams:
                 break
+            if self._motor_state and self._frames:
+                settled_since = settled_since or time.monotonic()
+                # Wait briefly so both top & wrist cameras finish publishing initial frames
+                if time.monotonic() - settled_since >= 1.5:
+                    break
             await asyncio.sleep(0.1)
 
     def _select_bus(self) -> str:

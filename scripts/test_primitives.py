@@ -74,6 +74,7 @@ async def main() -> int:
 
         env = dict(os.environ)
         env["DESK_MOCK"] = "1"
+        env["DESK_NO_DOTENV"] = "1"
         env["STATION_HOST"] = ""
         env.pop("STATION_BUS_SERIAL", None)
         env.pop("CAMERA_TOP", None)
