@@ -31,7 +31,7 @@ from pydantic import BaseModel
 
 from . import mcp_server as srv
 from .robo_jev import check_reflex_and_abort, guarded_recover
-from .vision_3d import localize_object_3d
+from .vision_3d import DEFAULT_PROVIDER_MODELS, _get_api_key, _load_keystore, localize_object_3d
 
 app = FastAPI(title="DESK-CORE Mission Control")
 
@@ -63,6 +63,11 @@ class TTSReq(BaseModel):
 
 class MockDisplaceReq(BaseModel):
     mode: str = "in_bounds"  # "in_bounds" | "out_of_bounds" | "reset"
+
+
+class KeySetReq(BaseModel):
+    provider: str
+    api_key: str = ""
 
 
 @app.get("/api/health")
@@ -336,6 +341,77 @@ async def api_mock_displace(req: MockDisplaceReq) -> dict[str, Any]:
     return {"ok": True, "mode": req.mode, "label": label, "dx_px": dx, "dy_px": dy}
 
 
+def _keystore_path() -> Path:
+    env_p = os.environ.get("DESK_KEYS_PATH", "").strip()
+    return Path(env_p) if env_p else (Path.home() / ".config" / "desk-core" / "keys.json")
+
+
+def _write_keystore(data: dict[str, str]) -> None:
+    p = _keystore_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(p.parent, 0o700)
+    except OSError:
+        pass
+    payload = json.dumps(data, indent=2) + "\n"
+    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload.encode("utf-8"))
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+
+
+def _keys_status() -> dict[str, dict[str, bool]]:
+    stored = _load_keystore()
+    return {
+        prov: {
+            "configured": bool(_get_api_key(prov)),
+            "in_keystore": prov in stored,
+        }
+        for prov in DEFAULT_PROVIDER_MODELS
+    }
+
+
+@app.get("/api/keys")
+async def api_get_keys() -> dict[str, Any]:
+    return {"providers": _keys_status()}
+
+
+@app.post("/api/keys")
+async def api_set_key(req: KeySetReq) -> dict[str, Any]:
+    prov = req.provider.strip().lower()
+    if prov == "claude":
+        prov = "anthropic"
+    if prov not in DEFAULT_PROVIDER_MODELS:
+        return {"ok": False, "error": f"Unsupported provider: {prov}"}
+    val = req.api_key.strip()
+    if not val:
+        return {"ok": False, "error": "Empty API key"}
+    stored = _load_keystore()
+    stored[prov] = val
+    _write_keystore(stored)
+    _log_event("KEYS", f"Saved API key for {prov} (0600)")
+    return {"ok": True, "provider": prov, "providers": _keys_status()}
+
+
+@app.post("/api/keys/unset")
+async def api_unset_key(req: KeySetReq) -> dict[str, Any]:
+    prov = req.provider.strip().lower()
+    if prov == "claude":
+        prov = "anthropic"
+    if prov not in DEFAULT_PROVIDER_MODELS:
+        return {"ok": False, "error": f"Unsupported provider: {prov}"}
+    stored = _load_keystore()
+    stored.pop(prov, None)
+    _write_keystore(stored)
+    _log_event("KEYS", f"Unset stored API key for {prov}")
+    return {"ok": True, "provider": prov, "providers": _keys_status()}
+
+
 @app.post("/api/tts")
 async def api_tts(req: TTSReq) -> dict[str, Any]:
     queued = srv._tts.speak(req.text)
@@ -477,6 +553,12 @@ DASHBOARD_HTML = """<!doctype html>
         <button class="act" onclick="guardedRecover()">Guarded Recover</button>
       </div>
       <div class="row">
+        <input id="api-key-input" type="password" placeholder="API key for selected provider (saved 0600)..." />
+        <button class="act" onclick="saveProviderKey()">Set Key</button>
+        <button class="act" style="background:#475569;color:#fff;" onclick="unsetProviderKey()">Unset Key</button>
+        <span id="key-status" class="badge">KEY: check...</span>
+      </div>
+      <div class="row">
         <button class="act" style="background:#b45309;color:#fff;" onclick="mockDisplace('in_bounds')">Displace In Safe Bounds</button>
         <button class="act" style="background:#991b1b;color:#fff;" onclick="mockDisplace('out_of_bounds')">Displace Out of Bounds</button>
         <button class="act" onclick="mockDisplace('reset')">Reset Mock Scene</button>
@@ -523,13 +605,51 @@ DASHBOARD_HTML = """<!doctype html>
       deepseek: [['deepseek-vl2', 'deepseek-vl2']],
       opencv: [['', 'opencv-fallback']]
     };
+    let _keyProviders = {};
+    function updateKeyBadge() {
+      const prov = document.getElementById('loc-provider').value || 'auto';
+      const el = document.getElementById('key-status');
+      if (prov === 'opencv') { el.textContent = 'KEY: offline CV'; return; }
+      if (prov === 'auto') {
+        const setList = Object.entries(_keyProviders).filter(([, v]) => v.configured).map(([k]) => k);
+        el.textContent = setList.length ? `KEYS: ${setList.join(', ')}` : 'KEYS: none set';
+        return;
+      }
+      const st = _keyProviders[prov] || {};
+      el.textContent = st.configured ? (st.in_keystore ? `KEY (${prov}): SET (0600)` : `KEY (${prov}): SET (env)`) : `KEY (${prov}): unset`;
+    }
+    async function refreshKeys() {
+      try {
+        const res = await fetch('/api/keys').then(r => r.json());
+        _keyProviders = res.providers || {};
+        updateKeyBadge();
+      } catch (e) {}
+    }
+    async function saveProviderKey() {
+      const prov = document.getElementById('loc-provider').value || 'gemini';
+      const key = document.getElementById('api-key-input').value.trim();
+      if (!key || prov === 'auto' || prov === 'opencv') return;
+      await postJSON('/api/keys', { provider: prov, api_key: key });
+      document.getElementById('api-key-input').value = '';
+      await refreshKeys();
+      refresh();
+    }
+    async function unsetProviderKey() {
+      const prov = document.getElementById('loc-provider').value || 'gemini';
+      if (prov === 'auto' || prov === 'opencv') return;
+      await postJSON('/api/keys/unset', { provider: prov });
+      await refreshKeys();
+      refresh();
+    }
     function syncVisionModels() {
       const prov = document.getElementById('loc-provider').value || 'auto';
       const sel = document.getElementById('loc-model');
       const opts = VISION_MODELS[prov] || VISION_MODELS.auto;
       sel.innerHTML = opts.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+      updateKeyBadge();
     }
     syncVisionModels();
+    refreshKeys();
 
     async function runLocalize() {
       const prov = document.getElementById('loc-provider').value || 'auto';
