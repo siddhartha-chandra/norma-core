@@ -149,8 +149,15 @@ def main():
                         help='JSON {"1": [range_min, range_max], ...}; use the station viewer mapping.')
     parser.add_argument("--prior-deg", type=float, default=10.0,
                         help="Soft prior (1 sigma) keeping offsets near zero.")
+    parser.add_argument("--rig-zeros", action="store_true",
+                        help="With --ranges, keep only the rounded viewer zeros and the 2*pi/4096 scale "
+                             "that desk_core/calib_store.py supports.")
+    parser.add_argument("--mount-output", type=Path,
+                        help="Write the mount-only result as a wrist-mount file for export_rig_calib.py.")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.rig_zeros and not args.ranges:
+        parser.error("--rig-zeros needs --ranges")
 
     wrist = json.loads(args.calibration.read_text())["wrist"]
     board_spec = wrist["board"]
@@ -167,6 +174,8 @@ def main():
     robot = load_urdf()
     if args.ranges:
         zeros, scales = viewer_mapping(robot, json.loads(args.ranges.read_text()))
+        if args.rig_zeros:
+            zeros, scales = np.round(zeros), np.full(7, 1 / TICKS_PER_RAD)
     else:
         zeros, scales = np.full(7, args.zero_ticks), np.full(7, 1 / TICKS_PER_RAD)
     problem = Problem(views, robot, (matrix, distortion), grid, zeros, scales, args.prior_deg)
@@ -208,6 +217,48 @@ def main():
     report["translation_units"] = "meters"
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     print(f"\nSaved {args.output}")
+    if args.mount_output:
+        if not np.allclose(scales, 1 / TICKS_PER_RAD):
+            sys.exit("--mount-output needs a uniform 2*pi/4096 scale (use --rig-zeros or no --ranges).")
+        best = report["mount_only"]
+        mount_file = {
+            "_notes": mount_notes(args),
+            "T_ee_cam_wrist": best["T_ee_cam_wrist"],
+            "T_base_board": best["T_base_board"],
+            "translation_units": "meters",
+            "joint_zero_ticks": {str(j + 1): int(z) for j, z in enumerate(zeros)},
+            "joint_signs": {str(j + 1): 1 for j in range(7)},
+            "fit_consistency": best["fit_consistency"],
+            "reprojection_rmse_px": dict(zip([v["image"] for v in views], best["in_sample_rmse_px"])),
+            "leave_one_out_rmse_px": dict(zip([v["image"] for v in views], best["leave_one_out_rmse_px"])),
+            "method": "bundle adjustment over all views, zeros from station viewer range-to-URDF-limit mapping",
+        }
+        args.mount_output.write_text(json.dumps(mount_file, indent=2) + "\n")
+        print(f"Saved {args.mount_output}")
+
+
+def mount_notes(args):
+    return {
+        "transform_convention": "T_A_B is a 4x4 row-major matrix mapping points in frame B into frame A (p_A = T_A_B @ p_B), same as calib/rig_calib.json.",
+        "frames": {
+            "T_ee_cam_wrist": {
+                "parent": "Gripper_Base_v1_1",
+                "child": "wrist_camera_optical_frame",
+                "why_key_not_renamed": "'ee' is the URDF link Gripper_Base_v1_1 (the ee_link / wrist_mount_link in rig_calib.json). Key kept because desk_core/calib_store.py, scripts/recover_scene_to_base.py and scripts/verify_calib.py read 'T_ee_cam_wrist'.",
+            },
+            "T_base_board": {
+                "parent": "base_link",
+                "child": "calib_board",
+                "why_key_not_renamed": "'base' is the URDF link base_link. Key kept to match the T_<parent>_<child> short names used across the scripts.",
+            },
+        },
+        "non_urdf_frames": {
+            "wrist_camera_optical_frame": "Not in elrobot_follower.urdf. OpenCV optical convention: +X right, +Y down, +Z forward out of the lens. Suggested name if added to the URDF as a fixed child of Gripper_Base_v1_1.",
+            "calib_board": "Not in the URDF. Origin at the board inner corner whose outer square is dark; +X along the inner columns, +Y along the inner rows, +Z into the table.",
+        },
+        "joint_mapping": "q_rad[j] = joint_signs[j] * (ticks[j] - joint_zero_ticks[j]) * 2*pi/4096 for URDF joints rev_motor_01..07 (keys '1'..'7'). The transforms are only valid with this mapping.",
+        "reproduce": f"scripts/fit_joint_offsets.py {args.samples} --calibration {args.calibration} --ranges {args.ranges} --rig-zeros --mount-output <this file>",
+    }
 
 
 if __name__ == "__main__":

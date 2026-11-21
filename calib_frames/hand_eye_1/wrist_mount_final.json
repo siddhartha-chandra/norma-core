@@ -15,9 +15,10 @@
     },
     "non_urdf_frames": {
       "wrist_camera_optical_frame": "Not in elrobot_follower.urdf. OpenCV optical convention: +X right, +Y down, +Z forward out of the lens. Suggested name if added to the URDF as a fixed child of Gripper_Base_v1_1.",
-      "calib_board": "Not in the URDF. Origin at the board inner corner whose outer square is dark; +X along the 10 inner columns, +Y along the 7 inner rows, 15 mm squares, +Z into the table."
+      "calib_board": "Not in the URDF. Origin at the board inner corner whose outer square is dark; +X along the inner columns, +Y along the inner rows, +Z into the table."
     },
-    "joint_mapping": "q_rad[j] = joint_signs[j] * (ticks[j] - joint_zero_ticks[j]) * 2*pi/4096 for URDF joints rev_motor_01..07 (keys '1'..'7'). The transforms are only valid with this mapping."
+    "joint_mapping": "q_rad[j] = joint_signs[j] * (ticks[j] - joint_zero_ticks[j]) * 2*pi/4096 for URDF joints rev_motor_01..07 (keys '1'..'7'). The transforms are only valid with this mapping.",
+    "reproduce": "scripts/fit_joint_offsets.py calib_frames/hand_eye_1/samples.json --calibration calib_frames/session1/camera_calibration.json --ranges calib_frames/hand_eye_1/follower_ranges.json --rig-zeros --mount-output <this file>"
   },
   "T_ee_cam_wrist": [
     [
@@ -111,5 +112,22 @@
     "wrist-013.jpg": 8.04,
     "wrist-014.jpg": 3.3
   },
-  "method": "bundle adjustment over 15 views, zeros from station viewer range-to-URDF-limit mapping"
+  "leave_one_out_rmse_px": {
+    "wrist-000.jpg": 7.73,
+    "wrist-001.jpg": 17.3,
+    "wrist-002.jpg": 12.52,
+    "wrist-003.jpg": 5.32,
+    "wrist-004.jpg": 13.59,
+    "wrist-005.jpg": 11.64,
+    "wrist-006.jpg": 9.13,
+    "wrist-007.jpg": 23.83,
+    "wrist-008.jpg": 26.04,
+    "wrist-009.jpg": 3.07,
+    "wrist-010.jpg": 21.71,
+    "wrist-011.jpg": 5.2,
+    "wrist-012.jpg": 15.84,
+    "wrist-013.jpg": 21.03,
+    "wrist-014.jpg": 5.94
+  },
+  "method": "bundle adjustment over all views, zeros from station viewer range-to-URDF-limit mapping"
 }
