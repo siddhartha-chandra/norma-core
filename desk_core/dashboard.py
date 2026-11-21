@@ -162,7 +162,8 @@ async def api_localize(req: LocalizeReq) -> dict[str, Any]:
         use_gemini=req.use_gemini,
     )
     _last_detection = det
-    _log_event("LOCALIZE", f"{req.query} via {det['backend']} -> {det['world']}", ok=det["found"])
+    fb = f" ({det['fallback_reason']})" if det.get("fallback_reason") else ""
+    _log_event("LOCALIZE", f"{req.query} via {det['backend']}{fb} -> {det['world']}", ok=det["found"])
     return det
 
 

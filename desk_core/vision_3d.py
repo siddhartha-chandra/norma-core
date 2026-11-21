@@ -26,9 +26,9 @@ from .calib_store import CalibrationStore
 GEMINI_VISION_MODEL = os.environ.get("DESK_VISION_MODEL", "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
 
 # Explicit HSV bounds for ElRobot 3D-printed / anodized orange & coral servo horns
-ORANGE_HORN_LOWER_1 = np.array([2, 85, 65], dtype=np.uint8)
-ORANGE_HORN_UPPER_1 = np.array([24, 255, 255], dtype=np.uint8)
-ORANGE_HORN_LOWER_2 = np.array([168, 85, 65], dtype=np.uint8)
+ORANGE_HORN_LOWER_1 = np.array([5, 95, 70], dtype=np.uint8)
+ORANGE_HORN_UPPER_1 = np.array([22, 255, 255], dtype=np.uint8)
+ORANGE_HORN_LOWER_2 = np.array([170, 95, 70], dtype=np.uint8)
 ORANGE_HORN_UPPER_2 = np.array([180, 255, 255], dtype=np.uint8)
 
 COLOR_HINTS: dict[str, tuple[np.ndarray, np.ndarray]] = {
@@ -38,6 +38,21 @@ COLOR_HINTS: dict[str, tuple[np.ndarray, np.ndarray]] = {
     "yellow": (np.array([22, 80, 80], dtype=np.uint8), np.array([36, 255, 255], dtype=np.uint8)),
     "purple": (np.array([130, 50, 50], dtype=np.uint8), np.array([165, 255, 255], dtype=np.uint8)),
     "pink": (np.array([145, 50, 80], dtype=np.uint8), np.array([175, 255, 255], dtype=np.uint8)),
+    "brown": (np.array([8, 60, 30], dtype=np.uint8), np.array([24, 220, 160], dtype=np.uint8)),
+}
+
+# Semantic keyword -> color hint fallback for offline OpenCV detection
+QUERY_COLOR_ALIASES: dict[str, str] = {
+    "key": "blue",
+    "fob": "blue",
+    "marker": "red",
+    "pen": "red",
+    "mug": "brown",
+    "cup": "brown",
+    "coffee": "brown",
+    "note": "yellow",
+    "sticky": "yellow",
+    "cube": "green",
 }
 
 
@@ -91,15 +106,25 @@ def localize_opencv(bgr: np.ndarray, query: str) -> dict[str, Any]:
     orange_mask = build_orange_horn_mask(hsv)
     q_low = query.lower()
 
-    # Optional explicit color hint if query specifies a non-orange color
+    # Optional explicit color hint (or semantic prop alias) if query specifies a target
     hint_mask: np.ndarray | None = None
     for cname, (lo, hi) in COLOR_HINTS.items():
         if cname in q_low:
             hint_mask = cv2.inRange(hsv, lo, hi)
             break
+    if hint_mask is None:
+        for kw, cname in QUERY_COLOR_ALIASES.items():
+            if kw in q_low and cname in COLOR_HINTS:
+                lo, hi = COLOR_HINTS[cname]
+                hint_mask = cv2.inRange(hsv, lo, hi)
+                break
 
     if hint_mask is not None:
-        fg_mask = cv2.bitwise_and(hint_mask, cv2.bitwise_not(orange_mask))
+        # Don't strip brown mugs or red marker caps when explicitly queried
+        if any(k in q_low for k in ("mug", "cup", "brown", "red", "marker", "pen")):
+            fg_mask = hint_mask
+        else:
+            fg_mask = cv2.bitwise_and(hint_mask, cv2.bitwise_not(orange_mask))
     else:
         # Estimate desk background from median Lab color & find salient foreground objects
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
