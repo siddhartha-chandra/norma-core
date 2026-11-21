@@ -1,0 +1,19 @@
+drivers:
+  st3215:
+    enabled: true
+    current-threshold: 200    # Raised from 100 to prevent premature shoulder (j2) stall trips
+    deadband: 20
+  system-info: true
+  usb-video:
+    enabled: true
+    resize_target: 480        # Sharper than default 224 for Gemini pointing & wrist IBVS (0 = native)
+    formats: []               # Auto-select camera format; pin e.g. {format: "640x480@30fps,mjpeg"} if needed
+    frame-skip: 0
+
+inference:
+  - queue-id: inference/normvla
+    shm: /tmp/normvla         # macOS-safe path (/dev/shm is Linux-only)
+    shm-size-mb: 12
+    format: normvla
+    st3215-bus: auto          # IMPORTANT: Replace "auto" with FOLLOWER bus serial if leader+follower are both plugged in!
+    update-interval: 100ms

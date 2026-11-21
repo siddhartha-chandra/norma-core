@@ -1,6 +1,7 @@
 .DS_Store
 /target/
 __pycache__
+*.py[cod]
 # Local vendored JS package tarballs for offline installs.
 js-vendor/
 
@@ -9,3 +10,13 @@ js-vendor/
 # shared/libcamera/Makefile and the build-libcamera job in
 # .github/workflows/station-release.yml.
 shared/libcamera/library/
+
+# DESK-CORE hackathon workspace
+.venv/
+.env
+station_data/
+runs/
+calib_frames/
+cam_*.jpg
+logs/
+*.mcap
