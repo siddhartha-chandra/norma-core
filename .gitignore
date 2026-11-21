@@ -21,3 +21,4 @@ calib_frames/
 cam_*.jpg
 logs/
 *.mcap
+go.work.sum
