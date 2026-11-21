@@ -7,6 +7,16 @@
       "world_frame": "ElRobot base_link",
       "camera_frame": "OpenCV optical frame (+X right, +Y down, +Z forward out of lens)",
       "transform_convention": "T_A_B is 4x4 row-major mapping points in frame B into frame A (p_A = T_A_B @ p_B). For wrist cam: T_world_cam_wrist(q) = T_world_ee(q) @ T_ee_cam_wrist."
+    },
+    "required_for_3d_and_ik": {
+      "T_world_cam_top": "REQUIRED for metric depth & 3D pixel_to_world from top camera: 4x4 transform from top optical frame -> ElRobot base_link (meters).",
+      "z_table": "REQUIRED for ray-plane projection: tabletop height (meters) in ElRobot base_link frame.",
+      "H_table": "OPTIONAL (or REQUIRED if skipping T_world_cam_top): 3x3 4-corner homography mapping top pixels -> tabletop (X, Y) at z_table.",
+      "T_ee_cam_wrist": "REQUIRED for eye-in-hand 3D depth/projection: 4x4 fixed transform from wrist optical frame -> Gripper_Base_v1_1.",
+      "joint_zero_ticks": "REQUIRED for real arm motion: ST3215 ticks {'1':..,'7':..} matching ElRobot URDF zero pose (defaults to range midpoint if omitted).",
+      "joint_signs": "REQUIRED if any servo direction is inverted vs URDF: {'1': +/-1, ..., '7': +/-1} (defaults to +1).",
+      "gripper": "RECOMMENDED: {'open_ticks': int, 'close_ticks': int} for motor 8.",
+      "hardware": "OPTIONAL if already set in .env: {'bus_serial': '...', 'camera_top': '...', 'camera_wrist': '...'}."
     }
   },
   "calibrated": false,
