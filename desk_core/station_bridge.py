@@ -7,6 +7,9 @@ the critical June 2026 hardware lessons:
      or locally via `station_data/`.
   3. Safe-start torque (GoalPosition=PresentPosition before TorqueEnable=1), GoalSpeed/Acc caps,
      server-side calibrated range clamp + MAX_STEP creep limit, and instant E-STOP `abort()`.
+  4. Station restarts: station_py reconnects its socket, but NormFS follow-subscriptions die
+     with the old connection, so a supervisor task rebuilds them (and blocks motion commands
+     while the link is down) instead of steering on stale motor positions.
 """
 from __future__ import annotations
 
@@ -52,6 +55,14 @@ GRIPPER_SLACK_STEPS = 120
 DEFAULT_MAX_STEP = int(os.environ.get("ROBOT_MAX_STEP_TICKS", "250"))
 DEFAULT_SPEED = int(os.environ.get("ROBOT_GOAL_SPEED", "600"))
 DEFAULT_ACCEL = int(os.environ.get("ROBOT_GOAL_ACCEL", "20"))
+
+# Auto-reconnect (issue #3): a live NormFS subscription should see motor
+# traffic many times per second; silence this long means the subscription died
+# (e.g. Station restart) even if no explicit error surfaced.
+RESUBSCRIBE_STALE_S = float(os.environ.get("ROBOT_STALE_RESUB_S", "8"))
+# Motion commands are refused when the newest telemetry is older than this,
+# so clamping/creep math never runs on a snapshot from before a restart.
+CMD_STALE_LIMIT_S = float(os.environ.get("ROBOT_MAX_CMD_STALE_S", "10"))
 
 
 def _u16(buf: bytes, addr: int) -> int:
@@ -109,6 +120,7 @@ class RobotState:
     bus_serial: str
     motors: list[MotorState]
     torque_enabled: bool = True
+    link_age_ms: int | None = None  # live bridge: ms since last st3215 telemetry entry; None = mock
 
     def ranges(self) -> dict[int, tuple[int, int]]:
         return {m.id: (m.range_min, m.range_max) for m in self.motors}
@@ -206,11 +218,23 @@ class MockStationBridge:
         self._aborted = True
         return {"aborted": True, "positions": {k: v.position for k, v in self._motors.items()}}
 
+    def link_status(self) -> dict:
+        return {"bridge": "mock", "station": None, "socket_up": True, "resyncing": False, "rx_age_ms": None}
+
 
 class LiveStationBridge:
-    """Async client for live NormaCore Station over NormFS TCP (:8888)."""
+    """Async client for live NormaCore Station over NormFS TCP (:8888).
+
+    Survives Station restarts: station_py's Client reconnects the socket on
+    its own, but follow-subscriptions are per-connection, so a supervisor
+    task detects dead streams (error queues or stalled telemetry) and
+    re-issues them. Motion commands are refused while the link is down or
+    stale instead of steering on pre-restart positions.
+    """
 
     ET_FRAMES = 0
+    RECONNECT_WAIT_S = 30.0
+    SUPERVISE_TICK_S = 1.0
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8888, target_bus: str | None = None):
         self.host = host
@@ -230,6 +254,11 @@ class LiveStationBridge:
         self._frame_order: list[str] = []
         self._followed_video_qids: set[str] = set()
         self._tasks: list[asyncio.Task] = []
+        self._supervisor: asyncio.Task | None = None
+        self._queues: dict[str, asyncio.Queue] = {}
+        self._follow_errors: dict[str, asyncio.Queue] = {}
+        self._last_rx_mono: float | None = None
+        self._resyncing = False
         self._cam_map = {
             "top": os.environ.get("CAMERA_TOP", "").strip(),
             "wrist": os.environ.get("CAMERA_WRIST", "").strip(),
@@ -255,30 +284,52 @@ class LiveStationBridge:
         self.client = await new_station_client(f"{self.host}:{self.port}", log)
         log.info("Connected to Station at %s:%s", self.host, self.port)
 
-        inf_q: asyncio.Queue = asyncio.Queue()
-        rx_q: asyncio.Queue = asyncio.Queue()
-        inf_states_q: asyncio.Queue = asyncio.Queue()
-        self._video_q: asyncio.Queue = asyncio.Queue()
+        self._make_followers()
+        self._start_workers()
+        await self._warmup()
+        if self._supervisor is None or self._supervisor.done():
+            self._supervisor = asyncio.create_task(self._supervise())
 
-        self.client.follow("st3215/inference", inf_q)
-        self.client.follow("st3215/rx", rx_q)
-        self.client.follow("inference-states", inf_states_q)
+    # -- subscription lifecycle (rebuilt on every Station restart) -------------
 
+    def _make_followers(self) -> None:
+        """Fresh follow queues + follow() calls for the base streams.
+
+        station_py's Client re-establishes the TCP socket itself after a
+        Station restart, but follow streams do NOT survive the old
+        connection: _follow_async pushes its error onto the returned
+        *error queue* and returns, leaving the data queue silent forever.
+        We therefore keep the error queues and let _supervise() watch them.
+        """
+        if self.client is None:
+            raise RuntimeError("_make_followers() called before connect()")
+        self._queues = {qid: asyncio.Queue() for qid in self._BASE_QUEUES}
+        self._video_q = asyncio.Queue()
+        self._follow_errors = {}
+        for qid, q in self._queues.items():
+            self._follow(qid, q)
         for qid in self._discover_local_video_queues():
             self._follow_video_queue(qid)
 
+    _BASE_QUEUES = ("st3215/inference", "st3215/rx", "inference-states")
+
+    def _follow(self, qid: str, q: asyncio.Queue) -> None:
+        err_q = self.client.follow(qid, q)
+        if err_q is not None:
+            self._follow_errors[qid] = err_q
+
+    def _start_workers(self) -> None:
         self._tasks = [
-            asyncio.create_task(self._consume_inference(inf_q)),
-            asyncio.create_task(self._consume_rx(rx_q)),
-            asyncio.create_task(self._consume_inference_states(inf_states_q)),
+            asyncio.create_task(self._consume_inference(self._queues["st3215/inference"])),
+            asyncio.create_task(self._consume_rx(self._queues["st3215/rx"])),
+            asyncio.create_task(self._consume_inference_states(self._queues["inference-states"])),
             asyncio.create_task(self._consume_video(self._video_q)),
         ]
-        await self._warmup()
 
     def _follow_video_queue(self, qid: str) -> None:
         if qid not in self._followed_video_qids and self.client is not None:
             self._followed_video_qids.add(qid)
-            self.client.follow(qid, self._video_q)
+            self._follow(qid, self._video_q)
             log.info("Following camera queue: %s", qid)
 
     def _discover_local_video_queues(self, max_age_s: float = 180.0) -> list[str]:
@@ -303,6 +354,91 @@ class LiveStationBridge:
         live = [d for d in found if (now - os.path.getmtime(d)) <= max_age_s]
         return sorted({"usbvideo/" + os.path.basename(d) for d in (live or found)})
 
+    # -- auto-reconnect supervisor ---------------------------------------------
+
+    async def _supervise(self) -> None:
+        """Rebuild follow subscriptions whenever Station goes away and comes back.
+
+        station_py's own manage_connection() restores the socket; this task
+        restores everything layered on top of it (queues, consumers, camera
+        discovery). Runs forever; individual resync failures are logged and
+        retried on the next tick.
+        """
+        while True:
+            await asyncio.sleep(self.SUPERVISE_TICK_S)
+            if self._resyncing:
+                continue
+            reason = self._dead_reason()
+            if reason is None:
+                continue
+            await self._resync(reason)
+
+    def _dead_reason(self) -> str | None:
+        for qid, eq in list(self._follow_errors.items()):
+            try:
+                err = eq.get_nowait()
+            except asyncio.QueueEmpty:
+                continue
+            return f"follow {qid!r} died: {err!r}"
+        for t in self._tasks:
+            if t.done():
+                exc = None if t.cancelled() else t.exception()
+                return f"consumer task exited ({exc!r})"
+        if self._last_rx_mono is not None:
+            silence = time.monotonic() - self._last_rx_mono
+            if silence > RESUBSCRIBE_STALE_S:
+                return f"no st3215 telemetry for {silence:.1f}s"
+        return None
+
+    async def _resync(self, reason: str) -> None:
+        self._resyncing = True
+        log.warning("Station link lost (%s) — auto-resubscribing", reason)
+        try:
+            for t in self._tasks:
+                t.cancel()
+            await asyncio.gather(*self._tasks, return_exceptions=True)
+            self._tasks = []
+            # Block until station_py's manage_connection has re-setup the socket.
+            try:
+                await self.client.wait_ready(timeout=self.RECONNECT_WAIT_S)
+            except TimeoutError:
+                log.error("Station socket not back after %.0fs, retrying…", self.RECONNECT_WAIT_S)
+                return
+            self._followed_video_qids.clear()
+            self._make_followers()
+            self._start_workers()
+            await self._warmup(max_s=8.0)
+            log.info("Station link restored (%d bus(es), %d camera(s))",
+                     len(self._motor_state), len(self._frame_order))
+        except Exception as exc:
+            log.error("Resync attempt failed: %s", exc)
+        finally:
+            self._resyncing = False
+
+    def link_status(self) -> dict:
+        up = bool(self.client and self.client.connected and self.client.setup_done)
+        age = None
+        if self._last_rx_mono is not None:
+            age = int((time.monotonic() - self._last_rx_mono) * 1000)
+        return {
+            "bridge": "live",
+            "station": f"{self.host}:{self.port}",
+            "socket_up": up,
+            "resyncing": self._resyncing,
+            "rx_age_ms": age,
+        }
+
+    def _require_fresh(self) -> None:
+        """Refuse motion commands built on pre-restart / stalled telemetry."""
+        if self._last_rx_mono is None:
+            raise RuntimeError("No live telemetry yet — refusing to command motion (Station offline or resyncing).")
+        age = time.monotonic() - self._last_rx_mono
+        if age > CMD_STALE_LIMIT_S:
+            raise RuntimeError(
+                f"Telemetry stale for {age:.1f}s (> {CMD_STALE_LIMIT_S:.0f}s limit) — "
+                "motion is blocked until the Station link is healthy again."
+            )
+
     async def _consume_inference_states(self, q: asyncio.Queue) -> None:
         qdt_video = getattr(self._drivers.QueueDataType, "QDT_USB_VIDEO_FRAMES", 21)
         while True:
@@ -324,6 +460,7 @@ class LiveStationBridge:
             entry = await q.get()
             if entry is None:
                 break
+            self._last_rx_mono = time.monotonic()
             try:
                 reader = self._st3215.InferenceStateReader(memoryview(bytes(entry.Data)))
                 for bus in reader.get_buses():
@@ -357,6 +494,7 @@ class LiveStationBridge:
             entry = await q.get()
             if entry is None:
                 break
+            self._last_rx_mono = time.monotonic()
             try:
                 r = self._st3215.RxEnvelopeReader(memoryview(bytes(entry.Data)))
                 sb = bytes(r.get_data())
@@ -432,7 +570,10 @@ class LiveStationBridge:
                 serial = self._select_bus()
                 motors = sorted(self._motor_state[serial].values(), key=lambda m: m.id)
                 if motors:
-                    return RobotState(serial, motors, bool(self._torque_started))
+                    age = None
+                    if self._last_rx_mono is not None:
+                        age = int((time.monotonic() - self._last_rx_mono) * 1000)
+                    return RobotState(serial, motors, bool(self._torque_started), age)
             await asyncio.sleep(0.1)
         raise RuntimeError("Timed out waiting for ST3215 joint state from Station.")
 
@@ -475,6 +616,9 @@ class LiveStationBridge:
         )
 
     async def set_torque(self, enable: bool, motor_ids: list[int] | None = None) -> bool:
+        if enable:
+            # Safe-start writes Goal=Present; both must come from live telemetry.
+            self._require_fresh()
         st = await self.get_state()
         mids = motor_ids or [m.id for m in st.motors]
         pack = []
@@ -492,6 +636,7 @@ class LiveStationBridge:
         return True
 
     async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP) -> dict[int, int]:
+        self._require_fresh()
         st = await self.get_state()
         by_id = {m.id: m for m in st.motors}
         applied: dict[int, int] = {}
@@ -547,17 +692,25 @@ class LiveStationBridge:
         }
 
     async def abort(self) -> dict:
+        # Hold Position uses live PresentPosition when fresh (prevents jumping
+        # by unseen drift); if telemetry is stale, drop torque safely instead
+        # of refusing an emergency stop.
+        try:
+            self._require_fresh()
+        except RuntimeError as exc:
+            await self.set_torque(False)
+            return {"aborted": True, "mode": "torque_off_stale", "reason": str(exc)}
         st = await self.get_state()
         hold = {m.id: m.position.to_bytes(2, "little") for m in st.motors}
         cmd = self._sync_write(st.bus_serial, RAM_GOAL_POSITION, hold)
         await self._send_commands(self.client, [cmd])
-        return {"aborted": True, "positions": st.positions()}
+        return {"aborted": True, "mode": "hold", "positions": st.positions()}
 
 
 def create_bridge() -> StationBridge:
     host = os.environ.get("STATION_HOST", "").strip()
     port = int(os.environ.get("STATION_PORT", "8888"))
     bus = os.environ.get("STATION_BUS_SERIAL", "").strip() or None
-    if not host:
+    if os.environ.get("DESK_MOCK") == "1" or not host:
         return MockStationBridge()
     return LiveStationBridge(host=host, port=port, target_bus=bus)

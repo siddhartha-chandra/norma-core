@@ -1,0 +1,5 @@
+[mcp_servers.desk-core]
+command = "uv"
+args = ["run", "--offline", "--managed-python", "python", "-m", "desk_core.mcp_server"]
+startup_timeout_sec = 30
+tool_timeout_sec = 60

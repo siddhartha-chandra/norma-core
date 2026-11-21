@@ -14,6 +14,7 @@ shared/libcamera/library/
 # DESK-CORE hackathon workspace
 .venv/
 .env
+.claude/settings.local.json
 station_data/
 runs/
 calib_frames/
