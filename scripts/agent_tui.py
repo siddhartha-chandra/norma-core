@@ -177,13 +177,14 @@ class RobotAgentTUI(App):
     TITLE = "DESK-CORE Voice & Vision Robot Agent"
     CSS = """
     Screen { layout: vertical; padding: 0 1; }
-    #top-bar { height: 3; align: left middle; margin-bottom: 1; }
-    #model-select { width: 42; margin-right: 1; }
-    #output-mode { width: 20; margin-right: 1; }
-    #top-bar Button { margin-right: 1; }
+    #model-bar { height: auto; align: left middle; margin-bottom: 0; }
+    #model-select { width: 1fr; margin-right: 1; }
+    #output-mode { width: 20; }
+    #action-bar { height: auto; align: left middle; margin-bottom: 1; }
+    #action-bar Button { margin-right: 1; }
     #key-status { height: auto; margin-bottom: 1; color: $text-muted; }
     #chat-log { height: 1fr; border: solid $primary; padding: 0 1; margin-bottom: 1; }
-    #input-bar { height: 3; align: left middle; }
+    #input-bar { height: auto; align: left middle; }
     #cmd-input { width: 1fr; margin-right: 1; }
     #input-bar Button { margin-right: 1; }
     """
@@ -210,7 +211,7 @@ class RobotAgentTUI(App):
         options = self.keystore.available_dropdown_options()
         default_val = options[0][1] if options else "gemini:gemini-4-hydrogen"
         yield Header(show_clock=True)
-        with Horizontal(id="top-bar"):
+        with Horizontal(id="model-bar"):
             yield Select(options, value=default_val, allow_blank=False, id="model-select")
             yield Select(
                 [("Audio + Text", "audio_text"), ("Audio only", "audio_only"), ("Text only", "text_only")],
@@ -218,6 +219,7 @@ class RobotAgentTUI(App):
                 allow_blank=False,
                 id="output-mode",
             )
+        with Horizontal(id="action-bar"):
             yield Button("API Keys (Ctrl+K)", id="btn-keys")
             yield Button("E-STOP (Ctrl+E)", variant="error", id="btn-estop")
             yield Checkbox("Arm Motion", value=(not self.live), id="arm-motion")
@@ -251,8 +253,9 @@ class RobotAgentTUI(App):
 
     async def _mcp_runner(self) -> None:
         log = self.query_one("#chat-log", RichLog)
+        err_fh = open(os.devnull, "w", encoding="utf-8")
         try:
-            async with stdio_client(_server_params(self.live)) as (read, write):
+            async with stdio_client(_server_params(self.live), errlog=err_fh) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     self.session = session
@@ -269,6 +272,7 @@ class RobotAgentTUI(App):
             log.write(f"[bold red]MCP error:[/bold red] {exc}")
         finally:
             self.session = None
+            err_fh.close()
 
     async def on_unmount(self) -> None:
         self._stop_event.set()
