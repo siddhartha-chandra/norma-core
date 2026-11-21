@@ -1,4 +1,24 @@
 {
+  "_desk_core_comment": {
+    "status": "Intrinsics calibrated at 1280x720 (wrist rmse=0.18px, scene->top rmse=0.24px). Note: desk_core maps 'scene' -> 'top' automatically.",
+    "required_missing_for_3d_pick": {
+      "T_world_cam_top (or scene.T_world_cam)": "REQUIRED for metric depth & 3D pixel_to_world from top camera: 4x4 transform from cam2 optical frame -> ElRobot base_link (meters).",
+      "z_table": "REQUIRED for ray-plane projection: tabletop height (meters) in ElRobot base_link frame.",
+      "H_table": "OPTIONAL (or REQUIRED if skipping T_world_cam_top): 3x3 4-corner homography mapping 1280x720 top pixels -> tabletop (X, Y) at z_table."
+    },
+    "required_missing_for_wrist_3d": {
+      "T_ee_cam_wrist (or wrist.T_ee_cam)": "REQUIRED for eye-in-hand 3D depth/projection: 4x4 fixed transform from cam1 optical frame -> Gripper_Base_v1_1."
+    },
+    "required_missing_for_joints_and_ik": {
+      "joint_zero_ticks": "REQUIRED for real arm motion: ST3215 ticks {'1':..,'7':..} matching ElRobot URDF zero pose (defaults to range midpoint if omitted).",
+      "joint_signs": "REQUIRED if any servo direction is inverted vs URDF: {'1': +/-1, ..., '7': +/-1} (defaults to +1).",
+      "gripper": "RECOMMENDED: {'open_ticks': int, 'close_ticks': int} for motor 8."
+    },
+    "optional_for_station_routing": {
+      "hardware": "OPTIONAL if already set in .env: {'bus_serial': '...', 'camera_top': '...', 'camera_wrist': '...'}. Note /dev/video0 & /dev/video4 are Station-local V4L2 nodes; NormFS needs unique_id/product substrings from scripts/probe_station.py."
+    },
+    "note_edge_coverage": "Calibration edge_coverage reported bottom=false (both) and left/right=false (scene); monitor corner accuracy near image edges."
+  },
   "wrist": {
     "camera": "cam1",
     "device": "/dev/video0",

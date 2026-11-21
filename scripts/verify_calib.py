@@ -24,7 +24,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from desk_core.calib_store import CalibrationStore, DEFAULT_CALIB_PATH, TICKS_PER_RAD  # noqa: E402
+from desk_core.calib_store import CalibrationStore, TICKS_PER_RAD, resolve_default_calib_path  # noqa: E402
 from desk_core.station_bridge import MockStationBridge, create_bridge  # noqa: E402
 from desk_core.urdf_fk import load_urdf  # noqa: E402
 
@@ -104,7 +104,7 @@ def _save_overlay(
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--calib", type=Path, default=DEFAULT_CALIB_PATH, help="Path to rig_calib.json")
+    ap.add_argument("--calib", type=Path, default=None, help="Path to rig_calib.json or camera_calibration.json")
     ap.add_argument("--live", action="store_true", help="Read live robot ticks & top camera from Station")
     ap.add_argument("--save-overlay", action="store_true", help="Save base/EE reprojection overlay JPEG")
     ap.add_argument("--overlay-path", type=Path, default=REPO_ROOT / "calib_frames" / "verify_top_overlay.jpg")
@@ -113,16 +113,20 @@ def main() -> int:
     errors: list[str] = []
     warnings: list[str] = []
 
-    print(f"=== DESK-CORE Calibration Check: {args.calib} ===")
-    if not args.calib.exists():
-        print(f"ERROR: file not found: {args.calib}", file=sys.stderr)
+    calib_path = args.calib or resolve_default_calib_path()
+    print(f"=== DESK-CORE Calibration Check: {calib_path} ===")
+    if not calib_path.exists():
+        print(f"ERROR: file not found: {calib_path}", file=sys.stderr)
         return 1
 
-    calib = CalibrationStore(args.calib)
+    calib = CalibrationStore(calib_path)
     st_info = calib.status()
     print(f"  arm_type={st_info['arm_type']} | calibrated={st_info['calibrated']} | z_table={calib.z_table()} m")
     print(f"  hardware (effective): {st_info['hardware']}")
-    if not st_info["calibrated"]:
+    if st_info["missing_required"]:
+        print(f"  missing_required: {st_info['missing_required']}")
+        warnings.append("incomplete calibration: " + ", ".join(st_info["missing_required"]))
+    elif not st_info["calibrated"]:
         warnings.append("calibrated=false (still running placeholder values from rig_calib.json)")
 
     # 1. Camera intrinsics & extrinsics
@@ -136,7 +140,7 @@ def main() -> int:
 
     T_top = calib.T_world_cam("top")
     if T_top is None:
-        errors.append("T_world_cam_top is missing")
+        warnings.append("T_world_cam_top missing (ray-plane & overlay projection disabled; using nominal overhead height)")
     else:
         _check_so3("T_world_cam_top", T_top, warnings, errors)
         if T_top[2, 3] <= calib.z_table():
@@ -164,10 +168,12 @@ def main() -> int:
             s = (calib.z_table() - T_top[2, 3]) / rw[2]
             pw_ray = T_top[:3, 3] + s * rw
             depth_z = (s * ray)[2]
+            line = f"  px=({u:.0f},{v:.0f}) -> ray_world=({pw_ray[0]:+.4f}, {pw_ray[1]:+.4f}, {pw_ray[2]:+.4f})m depth={depth_z:.4f}m"
         else:
-            pw_ray = np.zeros(3)
+            pw_nom = calib.pixel_to_world(u, v, camera="top")
+            pw_ray = np.array(pw_nom, dtype=float)
             depth_z = calib.get_metric_depth(u, v, "top")
-        line = f"  px=({u:.0f},{v:.0f}) -> ray_world=({pw_ray[0]:+.4f}, {pw_ray[1]:+.4f}, {pw_ray[2]:+.4f})m depth={depth_z:.4f}m"
+            line = f"  px=({u:.0f},{v:.0f}) -> nominal_world=({pw_ray[0]:+.4f}, {pw_ray[1]:+.4f}, {pw_ray[2]:+.4f})m depth={depth_z:.4f}m (T_world_cam_top unset)"
         if H is not None:
             hp = H @ np.array([u, v, 1.0])
             hx, hy = hp[0] / hp[2], hp[1] / hp[2]
@@ -185,8 +191,18 @@ def main() -> int:
     signs = calib.data.get("joint_signs", {})
     zeros = calib.data.get("joint_zero_ticks", {})
     for idx, (jname, (lo, hi)) in enumerate(zip(jnames, lims), start=1):
-        z_t = zeros.get(str(idx), 2048) if isinstance(zeros, dict) else zeros[idx - 1]
-        s_t = signs.get(str(idx), 1) if isinstance(signs, dict) else signs[idx - 1]
+        if isinstance(zeros, dict):
+            z_t = zeros.get(str(idx), "midpoint(unset)")
+        elif isinstance(zeros, list) and idx - 1 < len(zeros):
+            z_t = zeros[idx - 1]
+        else:
+            z_t = "midpoint(unset)"
+        if isinstance(signs, dict):
+            s_t = signs.get(str(idx), 1)
+        elif isinstance(signs, list) and idx - 1 < len(signs):
+            s_t = signs[idx - 1]
+        else:
+            s_t = 1
         if s_t not in (-1, 1, -1.0, 1.0):
             errors.append(f"joint_signs[{idx}]={s_t} must be +1 or -1")
         print(f"  j{idx} ({jname}): zero_tick={z_t} sign={s_t:+d} urdf_limits=[{lo:.3f}, {hi:.3f}] rad")

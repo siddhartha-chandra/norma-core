@@ -15,6 +15,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
@@ -138,6 +140,17 @@ async def main() -> int:
                 cal_st = _parse(await session.call_tool("get_calib_status", {}))
                 hw = cal_st["calibration"]["hardware"]
                 check("hardware fallback read from rig_calib.json", hw == {"bus_serial": "CAL-BUS-99", "camera_top": "cal-top-cam", "camera_wrist": "cal-wrist-cam"}, str(hw))
+
+                # 6. Verify {wrist, scene} camera_calibration.json schema normalization + missing_required
+                from desk_core.calib_store import CalibrationStore
+                cam_only = Path(tmpdir) / "camera_calibration.json"
+                cam_only.write_text(json.dumps({
+                    "wrist": {"camera_matrix": [[457.0, 0.0, 650.0], [0.0, 456.0, 368.0], [0.0, 0.0, 1.0]], "distortion_coefficients": [0.08, -0.09, 0.0, 0.0, 0.02]},
+                    "scene": {"camera_matrix": [[458.7, 0.0, 652.0], [0.0, 457.8, 375.3], [0.0, 0.0, 1.0]], "distortion_coefficients": [0.086, -0.115, 0.0, 0.0, 0.039]},
+                }))
+                cs_cam = CalibrationStore(cam_only)
+                st_cam = cs_cam.status()
+                check("camera_calibration.json maps scene->top & reports missing_required", st_cam["has_K_top"] and st_cam["has_K_wrist"] and "T_world_cam_top (or H_table)" in st_cam["missing_required"], str(st_cam["missing_required"]))
 
                 # 6. Composite execute_sequence ($var pipeline) + pick_pixel
                 seq_res = _parse(await session.call_tool("execute_sequence", {

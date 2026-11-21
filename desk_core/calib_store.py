@@ -20,19 +20,84 @@ from .station_bridge import MAX_ANGLE_STEP, REPO_ROOT, MotorState
 from .urdf_fk import DEFAULT_ARM_JOINTS, DEFAULT_ELROBOT_URDF, load_urdf
 
 TICKS_PER_RAD = (MAX_ANGLE_STEP + 1) / (2.0 * math.pi)
-DEFAULT_CALIB_PATH = Path(os.environ.get("DESK_CALIB_PATH") or (REPO_ROOT / "calib" / "rig_calib.json"))
+RIG_CALIB_PATH = REPO_ROOT / "calib" / "rig_calib.json"
+
+
+def resolve_default_calib_path() -> Path:
+    """Resolve active calibration JSON path.
+
+    Priority when `DESK_CALIB_PATH` env var is unset:
+      1. `calib/rig_calib.json` if it exists and has `calibrated == true`.
+      2. Newest `calib_frames/*/camera_calibration.json` if present (Scot's intrinsics output).
+      3. `calib/rig_calib.json` (nominal tracked contract).
+    """
+    env_p = os.environ.get("DESK_CALIB_PATH", "").strip()
+    if env_p:
+        return Path(env_p)
+    if RIG_CALIB_PATH.exists():
+        try:
+            rig_raw = json.loads(RIG_CALIB_PATH.read_text(encoding="utf-8"))
+            if rig_raw.get("calibrated"):
+                return RIG_CALIB_PATH
+        except Exception:
+            pass
+    cam_calibs = sorted(
+        (REPO_ROOT / "calib_frames").glob("*/camera_calibration.json"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    if cam_calibs:
+        return cam_calibs[-1]
+    return RIG_CALIB_PATH
+
+
+DEFAULT_CALIB_PATH = resolve_default_calib_path()
+
+
+def _normalize_calib_dict(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize either `rig_calib.json` or nested `{wrist, scene}` `camera_calibration.json`."""
+    data = dict(raw)
+    cam_aliases = {"top": ("top", "scene"), "wrist": ("wrist",)}
+    for target_cam, aliases in cam_aliases.items():
+        for alias in aliases:
+            block = raw.get(alias)
+            if not isinstance(block, dict):
+                continue
+            if f"K_{target_cam}" not in data and "camera_matrix" in block:
+                data[f"K_{target_cam}"] = block["camera_matrix"]
+            if f"dist_{target_cam}" not in data and "distortion_coefficients" in block:
+                data[f"dist_{target_cam}"] = block["distortion_coefficients"]
+            if f"image_size_{target_cam}" not in data and "image_size" in block:
+                data[f"image_size_{target_cam}"] = block["image_size"]
+            if f"T_world_cam_{target_cam}" not in data and "T_world_cam" in block:
+                data[f"T_world_cam_{target_cam}"] = block["T_world_cam"]
+            if f"T_ee_cam_{target_cam}" not in data and "T_ee_cam" in block:
+                data[f"T_ee_cam_{target_cam}"] = block["T_ee_cam"]
+            if target_cam == "top":
+                if "z_table" not in data and "z_table" in block:
+                    data["z_table"] = block["z_table"]
+                if "H_table" not in data and "H_table" in block:
+                    data["H_table"] = block["H_table"]
+    if "num_arm_joints" not in data:
+        data["num_arm_joints"] = 7
+    if "arm_type" not in data and ("wrist" in raw or "scene" in raw):
+        data["arm_type"] = "elrobot"
+    return data
 
 
 class CalibrationStore:
-    def __init__(self, path: Path = DEFAULT_CALIB_PATH):
-        self.path = Path(path)
+    def __init__(self, path: Path | None = None):
+        self._explicit_path = Path(path) if path is not None else None
+        self.path = self._explicit_path or resolve_default_calib_path()
         self.data: dict[str, Any] = {}
         self._custom_depth_fn = None
         self.reload()
 
     def reload(self) -> dict[str, Any]:
+        if self._explicit_path is None:
+            self.path = resolve_default_calib_path()
         if self.path.exists():
-            self.data = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            self.data = _normalize_calib_dict(raw)
         else:
             self.data = {}
         self._load_depth_hook()
@@ -272,11 +337,10 @@ class CalibrationStore:
             pw = t + max(0.05, s) * ray_w
             return (round(float(pw[0]), 5), round(float(pw[1]), 5), round(float(pw[2]), 5))
 
-        # Nominal overhead pixel scaling fallback (~1.2 mm/px at 0.62 m above center)
-        K = self._K(camera)
+        # Nominal overhead pixel scaling fallback (uses undistorted ray when dist_top is calibrated)
         depth = self.get_metric_depth(x, y, camera, q_rad=q_rad)
-        X_robot = 0.25 - ((float(y) - K[1, 2]) / K[1, 1]) * depth
-        Y_robot = -((float(x) - K[0, 2]) / K[0, 0]) * depth
+        X_robot = 0.25 - float(ray_cam[1]) * depth
+        Y_robot = -float(ray_cam[0]) * depth
         Z_robot = self.z_table() if z_m is None else float(z_m)
         return (round(float(X_robot), 5), round(float(Y_robot), 5), round(float(Z_robot), 5))
 
@@ -306,11 +370,31 @@ class CalibrationStore:
         )
         return (float(img_pts[0, 0, 0]), float(img_pts[0, 0, 1]))
 
+    def missing_required_fields(self) -> list[str]:
+        missing: list[str] = []
+        if "K_top" not in self.data:
+            missing.append("K_top (or scene.camera_matrix)")
+        if "T_world_cam_top" not in self.data and "H_table" not in self.data:
+            missing.append("T_world_cam_top (or H_table)")
+        if "z_table" not in self.data:
+            missing.append("z_table")
+        if "K_wrist" not in self.data:
+            missing.append("K_wrist (or wrist.camera_matrix)")
+        if "T_ee_cam_wrist" not in self.data:
+            missing.append("T_ee_cam_wrist")
+        if "joint_zero_ticks" not in self.data:
+            missing.append("joint_zero_ticks")
+        if "joint_signs" not in self.data:
+            missing.append("joint_signs")
+        return missing
+
     def status(self) -> dict[str, Any]:
+        missing = self.missing_required_fields()
+        calibrated_flag = bool(self.data["calibrated"]) if "calibrated" in self.data else (len(missing) == 0)
         return {
             "calib_file": str(self.path),
             "calib_loaded": self.path.exists(),
-            "calibrated": bool(self.data.get("calibrated", False)),
+            "calibrated": calibrated_flag,
             "arm_type": self.data.get("arm_type", "elrobot-7dof-nominal"),
             "has_K_top": "K_top" in self.data,
             "has_dist_top": "dist_top" in self.data,
@@ -323,4 +407,5 @@ class CalibrationStore:
             "has_depth_hook": self._custom_depth_fn is not None,
             "z_table": self.z_table(),
             "hardware": self.hardware_config(),
+            "missing_required": missing,
         }
