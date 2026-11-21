@@ -438,8 +438,10 @@ async def localize_3d(
     use_gemini: bool = True,
     denoise: bool = True,
     timeout_s: float = 6.0,
+    provider: str = "auto",
+    model: str | None = None,
 ) -> dict:
-    """Zero-shot 3D object localization via Gemini 4 Hydrogen with automatic OpenCV HSV/contour fallback."""
+    """Zero-shot 3D object localization via Gemini/Anthropic/OpenAI/Qwen/DeepSeek with automatic OpenCV fallback."""
     bridge = await _get_bridge()
     jpeg = await bridge.get_frame(camera, denoise=denoise)
     q = await _live_arm_q(None, camera)
@@ -452,6 +454,8 @@ async def localize_3d(
         z_m=z_m,
         use_gemini=use_gemini,
         timeout_s=float(timeout_s),
+        model=model,
+        provider=provider,
     )
 
 

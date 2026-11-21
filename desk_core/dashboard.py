@@ -53,6 +53,8 @@ class LocalizeReq(BaseModel):
     query: str = "keys"
     camera: str = "top"
     use_gemini: bool = True
+    provider: str = "auto"
+    model: str | None = None
 
 
 class TTSReq(BaseModel):
@@ -164,6 +166,8 @@ async def api_localize(req: LocalizeReq) -> dict[str, Any]:
         calib=srv._calib,
         camera=req.camera,
         use_gemini=req.use_gemini,
+        model=req.model,
+        provider=req.provider,
     )
     _last_detection = det
     fb = f" ({det['fallback_reason']})" if det.get("fallback_reason") else ""
@@ -457,6 +461,15 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
       <div class="row">
         <input id="loc-query" type="text" value="keys" placeholder="Object query (keys, mug, marker...)" />
+        <select id="loc-provider" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;">
+          <option value="auto">Auto (Env Key)</option>
+          <option value="gemini">Gemini (4 Hydrogen)</option>
+          <option value="anthropic">Anthropic (Claude Sonnet 4.6)</option>
+          <option value="openai">OpenAI (GPT-4.1 Mini)</option>
+          <option value="qwen">Qwen (Qwen-VL-Max)</option>
+          <option value="deepseek">DeepSeek (DeepSeek-VL2)</option>
+          <option value="opencv">OpenCV Only (Offline)</option>
+        </select>
         <button class="act" onclick="runLocalize()">Localize 3D</button>
         <button class="act" onclick="armWatch()">Arm Watch</button>
         <button class="act" onclick="checkReflex()">Check Reflex</button>
@@ -500,7 +513,13 @@ DASHBOARD_HTML = """<!doctype html>
       return r.json();
     }
     async function triggerEstop() { await postJSON('/api/estop'); refresh(); }
-    async function runLocalize() { await postJSON('/api/localize', { query: document.getElementById('loc-query').value || 'keys' }); refresh(); }
+    async function runLocalize() {
+      await postJSON('/api/localize', {
+        query: document.getElementById('loc-query').value || 'keys',
+        provider: document.getElementById('loc-provider').value || 'auto'
+      });
+      refresh();
+    }
     async function armWatch() { await postJSON('/api/robo_jev/arm'); refresh(); }
     async function checkReflex() { await postJSON('/api/robo_jev/check'); refresh(); }
     async function guardedRecover() { await postJSON('/api/robo_jev/recover'); refresh(); }

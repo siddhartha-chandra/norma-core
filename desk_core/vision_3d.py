@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import math
 import os
+import re
+import urllib.error
+import urllib.request
 from typing import Any
 
 import cv2
@@ -24,6 +28,14 @@ from pydantic import BaseModel, Field
 from .calib_store import CalibrationStore
 
 GEMINI_VISION_MODEL = os.environ.get("DESK_VISION_MODEL", "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
+
+DEFAULT_PROVIDER_MODELS: dict[str, str] = {
+    "gemini": GEMINI_VISION_MODEL,
+    "anthropic": "claude-sonnet-4-6",
+    "openai": "gpt-4.1-mini",
+    "qwen": "qwen-vl-max",
+    "deepseek": "deepseek-vl2",
+}
 
 # Explicit HSV bounds for ElRobot 3D-printed / anodized orange & coral servo horns
 ORANGE_HORN_LOWER_1 = np.array([5, 95, 70], dtype=np.uint8)
@@ -199,36 +211,25 @@ def localize_opencv(bgr: np.ndarray, query: str) -> dict[str, Any]:
     }
 
 
-def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str, Any]:
-    from google import genai
-
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set")
-
-    client = genai.Client(api_key=api_key)
-    b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
-    prompt = (
+def _vision_prompt(query: str) -> str:
+    return (
         f"Locate the desk item matching '{query}' in this robot workspace image. "
         "Ignore orange/coral robot arm links, servo horns, and gripper fingers unless explicitly queried. "
-        "Return JSON with: found (bool), label (str), point ([y, x] grasp center normalized 0-1000), "
+        "Return ONLY valid JSON with keys: found (bool), label (str), point ([y, x] grasp center normalized 0-1000), "
         "box_2d ([ymin, xmin, ymax, xmax] normalized 0-1000), yaw_deg (principal axis angle -90..90), "
         "and confidence (0.0..1.0). If not visible, set found=false."
     )
-    interaction = client.interactions.create(
-        model=model,
-        input=[
-            {"type": "image", "data": b64_jpeg, "mime_type": "image/jpeg"},
-            {"type": "text", "text": prompt},
-        ],
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": GeminiPoint2DResult.model_json_schema(),
-        },
-        store=False,
-    )
-    parsed = GeminiPoint2DResult.model_validate_json(interaction.output_text)
+
+
+def _parse_vlm_json(raw_text: str, query: str) -> dict[str, Any]:
+    txt = raw_text.strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```(?:json)?\s*", "", txt)
+        txt = re.sub(r"\s*```$", "", txt)
+    m = re.search(r"\{.*\}", txt, re.DOTALL)
+    if m:
+        txt = m.group(0)
+    parsed = GeminiPoint2DResult.model_validate_json(txt)
     pt = parsed.point if len(parsed.point) == 2 else [500, 500]
     box = parsed.box_2d if len(parsed.box_2d) == 4 else [0, 0, 0, 0]
     return {
@@ -241,6 +242,160 @@ def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str, model: str) ->
     }
 
 
+def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str, Any]:
+    from google import genai
+
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    client = genai.Client(api_key=api_key)
+    b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
+    interaction = client.interactions.create(
+        model=model,
+        input=[
+            {"type": "image", "data": b64_jpeg, "mime_type": "image/jpeg"},
+            {"type": "text", "text": _vision_prompt(query)},
+        ],
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": GeminiPoint2DResult.model_json_schema(),
+        },
+        store=False,
+    )
+    return _parse_vlm_json(interaction.output_text, query)
+
+
+def _call_anthropic_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str, Any]:
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "max_tokens": 300,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_jpeg},
+                    },
+                    {"type": "text", "text": _vision_prompt(query)},
+                ],
+            }
+        ],
+    }
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Anthropic HTTP {exc.code}: {body[:200]}") from exc
+    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    return _parse_vlm_json(text, query)
+
+
+def _call_openai_compat_sync(
+    jpeg_bytes: bytes,
+    query: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    provider_label: str,
+) -> dict[str, Any]:
+    if not api_key:
+        raise RuntimeError(f"{provider_label} API key not set")
+    b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "max_tokens": 300,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_jpeg}"}},
+                    {"type": "text", "text": _vision_prompt(query)},
+                ],
+            }
+        ],
+    }
+    req = urllib.request.Request(
+        base_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{provider_label} HTTP {exc.code}: {body[:200]}") from exc
+    text = data["choices"][0]["message"]["content"]
+    return _parse_vlm_json(text, query)
+
+
+def _resolve_provider(provider: str) -> str:
+    p = (provider or "auto").strip().lower()
+    if p == "claude":
+        return "anthropic"
+    if p != "auto":
+        return p
+    env_p = os.environ.get("DESK_VISION_PROVIDER", "").strip().lower()
+    if env_p:
+        return "anthropic" if env_p == "claude" else env_p
+    if os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip():
+        return "gemini"
+    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
+        return "anthropic"
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        return "openai"
+    if os.environ.get("QWEN_API_KEY", "").strip() or os.environ.get("DASHSCOPE_API_KEY", "").strip():
+        return "qwen"
+    if os.environ.get("DEEPSEEK_API_KEY", "").strip():
+        return "deepseek"
+    return "gemini"
+
+
+def _call_vlm_sync(jpeg_bytes: bytes, query: str, provider: str, model: str) -> dict[str, Any]:
+    if provider == "gemini":
+        return _call_gemini_interactions_sync(jpeg_bytes, query, model)
+    if provider == "anthropic":
+        return _call_anthropic_sync(jpeg_bytes, query, model)
+    if provider == "openai":
+        key = os.environ.get("OPENAI_API_KEY", "").strip()
+        url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+        return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "OpenAI")
+    if provider == "qwen":
+        key = os.environ.get("QWEN_API_KEY", "").strip() or os.environ.get("DASHSCOPE_API_KEY", "").strip()
+        url = os.environ.get(
+            "QWEN_BASE_URL",
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        ).rstrip("/") + "/chat/completions"
+        return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "Qwen")
+    if provider == "deepseek":
+        key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/") + "/chat/completions"
+        return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "DeepSeek")
+    raise ValueError(f"Unsupported vision provider: {provider!r}")
+
+
 async def localize_object_3d(
     jpeg_bytes: bytes,
     query: str,
@@ -251,8 +406,9 @@ async def localize_object_3d(
     use_gemini: bool = True,
     timeout_s: float = 6.0,
     model: str | None = None,
+    provider: str = "auto",
 ) -> dict[str, Any]:
-    """Localize `query` in `jpeg_bytes` via Gemini 4 Hydrogen (with OpenCV fallback) and project to 3D."""
+    """Localize `query` in `jpeg_bytes` via Gemini/Anthropic/OpenAI/Qwen/DeepSeek (with OpenCV fallback) and project to 3D."""
     bgr = _decode_bgr(jpeg_bytes)
     h, w = bgr.shape[:2]
 
@@ -260,19 +416,20 @@ async def localize_object_3d(
     fallback_reason: str | None = None
     det: dict[str, Any] | None = None
 
-    if use_gemini:
-        chosen_model = model or GEMINI_VISION_MODEL
+    resolved_provider = _resolve_provider(provider)
+    if use_gemini and resolved_provider != "opencv":
+        chosen_model = model or DEFAULT_PROVIDER_MODELS.get(resolved_provider, GEMINI_VISION_MODEL)
         try:
             det = await asyncio.wait_for(
-                asyncio.to_thread(_call_gemini_interactions_sync, jpeg_bytes, query, chosen_model),
+                asyncio.to_thread(_call_vlm_sync, jpeg_bytes, query, resolved_provider, chosen_model),
                 timeout=timeout_s,
             )
-            backend = chosen_model
+            backend = chosen_model if resolved_provider == "gemini" else f"{resolved_provider}:{chosen_model}"
         except Exception as exc:
             fallback_reason = str(exc) or exc.__class__.__name__
             det = None
     else:
-        fallback_reason = "use_gemini=False"
+        fallback_reason = "opencv_only" if resolved_provider == "opencv" else "use_gemini=False"
 
     if det is None:
         det = await asyncio.to_thread(localize_opencv, bgr, query)
