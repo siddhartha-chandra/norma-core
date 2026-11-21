@@ -238,7 +238,14 @@ class LiveStationBridge:
     RECONNECT_WAIT_S = 30.0
     SUPERVISE_TICK_S = 1.0
 
-    def __init__(self, host: str = "127.0.0.1", port: int = 8888, target_bus: str | None = None):
+    def __init__(
+        self,
+        host: str = "127.0.0.1",
+        port: int = 8888,
+        target_bus: str | None = None,
+        cam_top: str | None = None,
+        cam_wrist: str | None = None,
+    ):
         self.host = host
         self.port = port
         self.target_bus = (target_bus or "").strip() or None
@@ -262,9 +269,17 @@ class LiveStationBridge:
         self._last_rx_mono: float | None = None
         self._resyncing = False
         self._cam_map = {
-            "top": os.environ.get("CAMERA_TOP", "").strip(),
-            "wrist": os.environ.get("CAMERA_WRIST", "").strip(),
+            "top": (cam_top if cam_top is not None else os.environ.get("CAMERA_TOP", "")).strip(),
+            "wrist": (cam_wrist if cam_wrist is not None else os.environ.get("CAMERA_WRIST", "")).strip(),
         }
+
+    def apply_hardware_config(self, bus_serial: str | None = None, cam_top: str | None = None, cam_wrist: str | None = None) -> None:
+        if bus_serial is not None:
+            self.target_bus = bus_serial.strip() or None
+        if cam_top is not None:
+            self._cam_map["top"] = cam_top.strip()
+        if cam_wrist is not None:
+            self._cam_map["wrist"] = cam_wrist.strip()
 
     async def connect(self) -> None:
         from station_py import new_station_client, send_commands  # type: ignore
@@ -709,10 +724,22 @@ class LiveStationBridge:
         return {"aborted": True, "mode": "hold", "positions": st.positions()}
 
 
+def _load_hardware_fallback() -> dict[str, str]:
+    try:
+        from .calib_store import CalibrationStore
+
+        return CalibrationStore().hardware_config()
+    except Exception:
+        return {"bus_serial": "", "camera_top": "", "camera_wrist": ""}
+
+
 def create_bridge() -> StationBridge:
     host = os.environ.get("STATION_HOST", "").strip()
     port = int(os.environ.get("STATION_PORT", "8888"))
-    bus = os.environ.get("STATION_BUS_SERIAL", "").strip() or None
     if os.environ.get("DESK_MOCK") == "1" or not host:
         return MockStationBridge()
-    return LiveStationBridge(host=host, port=port, target_bus=bus)
+    hw = _load_hardware_fallback()
+    bus = os.environ.get("STATION_BUS_SERIAL", "").strip() or hw.get("bus_serial") or None
+    cam_top = os.environ.get("CAMERA_TOP", "").strip() or hw.get("camera_top") or ""
+    cam_wrist = os.environ.get("CAMERA_WRIST", "").strip() or hw.get("camera_wrist") or ""
+    return LiveStationBridge(host=host, port=port, target_bus=bus, cam_top=cam_top, cam_wrist=cam_wrist)

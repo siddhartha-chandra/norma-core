@@ -13,9 +13,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 
 from .station_bridge import MAX_ANGLE_STEP, REPO_ROOT, MotorState
+from .urdf_fk import DEFAULT_ARM_JOINTS, DEFAULT_ELROBOT_URDF, load_urdf
 
 TICKS_PER_RAD = (MAX_ANGLE_STEP + 1) / (2.0 * math.pi)
 DEFAULT_CALIB_PATH = Path(os.environ.get("DESK_CALIB_PATH") or (REPO_ROOT / "calib" / "rig_calib.json"))
@@ -122,6 +124,15 @@ class CalibrationStore:
                 return False, f"motor {m.id} target tick {raw:.0f} outside calibrated range [{lo}, {hi}]"
         return True, None
 
+    def hardware_config(self) -> dict[str, str]:
+        """Effective hardware routing IDs: non-empty env vars take priority over rig_calib.json."""
+        hw = self.data.get("hardware") if isinstance(self.data.get("hardware"), dict) else {}
+        return {
+            "bus_serial": (os.environ.get("STATION_BUS_SERIAL", "").strip() or str(hw.get("bus_serial", "")).strip()),
+            "camera_top": (os.environ.get("CAMERA_TOP", "").strip() or str(hw.get("camera_top", "")).strip()),
+            "camera_wrist": (os.environ.get("CAMERA_WRIST", "").strip() or str(hw.get("camera_wrist", "")).strip()),
+        }
+
     def _K(self, camera: str) -> np.ndarray:
         key = f"K_{camera}"
         if key in self.data:
@@ -129,29 +140,98 @@ class CalibrationStore:
         # Reasonable nominal pinhole K for 640x480 UVC webcam (~65 deg HFOV)
         return np.array([[560.0, 0.0, 320.0], [0.0, 560.0, 240.0], [0.0, 0.0, 1.0]], dtype=float)
 
-    def _T_world_cam(self, camera: str) -> np.ndarray | None:
+    def _dist(self, camera: str) -> np.ndarray:
+        key = f"dist_{camera}"
+        if key in self.data and self.data[key] is not None:
+            return np.asarray(self.data[key], dtype=float).reshape(-1)
+        return np.zeros(5, dtype=float)
+
+    def _ray_cam(self, x: float, y: float, camera: str) -> np.ndarray:
+        """Normalized unit-Z camera ray for raw image pixel (x, y), undistorted when dist_{camera} is present."""
+        K = self._K(camera)
+        dist = self._dist(camera)
+        if np.any(np.abs(dist) > 1e-12):
+            pts = np.array([[[float(x), float(y)]]], dtype=np.float64)
+            und = cv2.undistortPoints(pts, K, dist)
+            xn, yn = float(und[0, 0, 0]), float(und[0, 0, 1])
+        else:
+            xn = (float(x) - K[0, 2]) / K[0, 0]
+            yn = (float(y) - K[1, 2]) / K[1, 1]
+        return np.array([xn, yn, 1.0], dtype=float)
+
+    def wrist_mount_link(self) -> str:
+        return str(self.data.get("wrist_mount_link") or self.data.get("ee_link") or "Gripper_Base_v1_1")
+
+    def world_frame(self) -> str:
+        return str(self.data.get("world_frame") or "base_link")
+
+    def joint_names(self) -> list[str]:
+        names = self.data.get("joint_names")
+        if isinstance(names, list) and names:
+            return [str(n) for n in names]
+        return list(DEFAULT_ARM_JOINTS)
+
+    def urdf_path(self) -> Path:
+        raw = str(self.data.get("urdf_path") or "").strip()
+        if raw:
+            p = Path(raw)
+            return p if p.is_absolute() else (REPO_ROOT / p)
+        return DEFAULT_ELROBOT_URDF
+
+    def fk_ee_pose(self, q_rad: list[float] | np.ndarray, target_link: str | None = None) -> np.ndarray:
+        """Compute 4x4 homogeneous transform ``T_world_ee(q_rad)`` from the ElRobot URDF."""
+        urdf = load_urdf(self.urdf_path())
+        return urdf.fk(
+            q_rad=q_rad,
+            target_link=target_link or self.wrist_mount_link(),
+            base_link=self.world_frame(),
+            joint_names=self.joint_names(),
+        )
+
+    def T_world_cam(self, camera: str = "top", q_rad: list[float] | np.ndarray | None = None) -> np.ndarray | None:
+        """Return 4x4 transform mapping points from camera frame into world (``base_link``).
+
+        - For static cameras (``top``), reads ``T_world_cam_top``.
+        - For robot-mounted cameras (``wrist``), composes ``T_world_ee(q) @ T_ee_cam_wrist``
+          via URDF forward kinematics unless a static ``T_world_cam_{camera}`` override exists.
+        """
         key = f"T_world_cam_{camera}"
         if key in self.data:
             return np.asarray(self.data[key], dtype=float).reshape(4, 4)
+
+        ee_key = f"T_ee_cam_{camera}"
+        if ee_key in self.data:
+            T_ee_cam = np.asarray(self.data[ee_key], dtype=float).reshape(4, 4)
+            n_arm = len(self.joint_names())
+            q = list(q_rad) if q_rad is not None else [0.0] * n_arm
+            T_world_ee = self.fk_ee_pose(q, target_link=self.wrist_mount_link())
+            return T_world_ee @ T_ee_cam
         return None
+
+    def _T_world_cam(self, camera: str, q_rad: list[float] | np.ndarray | None = None) -> np.ndarray | None:
+        return self.T_world_cam(camera=camera, q_rad=q_rad)
 
     def z_table(self) -> float:
         return float(self.data.get("z_table", 0.0))
 
-    def get_metric_depth(self, x: float, y: float, camera: str = "top") -> float:
+    def get_metric_depth(
+        self,
+        x: float,
+        y: float,
+        camera: str = "top",
+        q_rad: list[float] | np.ndarray | None = None,
+    ) -> float:
         """Estimate metric depth z (meters from camera frame) for pixel (x, y).
 
-        Uses custom depth hook if plugged in, else exact ray-plane intersection
-        with calibrated T_world_cam + z_table, else nominal camera-to-tabletop ray geometry.
+        Uses custom depth hook if plugged in, else undistorted ray-plane intersection
+        with calibrated T_world_cam (or T_world_ee(q) @ T_ee_cam_wrist) + z_table,
+        else nominal camera-to-tabletop ray geometry.
         """
         if self._custom_depth_fn is not None:
             return float(self._custom_depth_fn(x, y, camera=camera))
 
-        K = self._K(camera)
-        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
-        ray_cam = np.array([(float(x) - cx) / fx, (float(y) - cy) / fy, 1.0], dtype=float)
-
-        T = self._T_world_cam(camera)
+        ray_cam = self._ray_cam(x, y, camera)
+        T = self.T_world_cam(camera, q_rad=q_rad)
         if T is not None:
             R = T[:3, :3]
             t = T[:3, 3]
@@ -166,7 +246,14 @@ class CalibrationStore:
         h_cam = float(self.data.get(f"cam_height_{camera}_m", 0.62 if camera == "top" else 0.25))
         return round(float(h_cam), 5)
 
-    def pixel_to_world(self, x: float, y: float, z_m: float | None = None, camera: str = "top") -> tuple[float, float, float]:
+    def pixel_to_world(
+        self,
+        x: float,
+        y: float,
+        z_m: float | None = None,
+        camera: str = "top",
+        q_rad: list[float] | np.ndarray | None = None,
+    ) -> tuple[float, float, float]:
         """Project 2D pixel (x, y) into metric robot base-frame (X, Y, Z) in meters."""
         H = self.data.get("H_table")
         if H is not None and camera == "top" and z_m is None:
@@ -175,32 +262,65 @@ class CalibrationStore:
             if abs(pt[2]) > 1e-8:
                 return (round(float(pt[0] / pt[2]), 5), round(float(pt[1] / pt[2]), 5), round(self.z_table(), 5))
 
-        K = self._K(camera)
-        ray_cam = np.array([(float(x) - K[0, 2]) / K[0, 0], (float(y) - K[1, 2]) / K[1, 1], 1.0], dtype=float)
-        T = self._T_world_cam(camera)
+        ray_cam = self._ray_cam(x, y, camera)
+        T = self.T_world_cam(camera, q_rad=q_rad)
         if T is not None:
             R, t = T[:3, :3], T[:3, 3]
             target_z = self.z_table() if z_m is None else float(z_m)
             ray_w = R @ ray_cam
-            s = (target_z - t[2]) / ray_w[2] if abs(ray_w[2]) > 1e-6 else self.get_metric_depth(x, y, camera)
+            s = (target_z - t[2]) / ray_w[2] if abs(ray_w[2]) > 1e-6 else self.get_metric_depth(x, y, camera, q_rad=q_rad)
             pw = t + max(0.05, s) * ray_w
             return (round(float(pw[0]), 5), round(float(pw[1]), 5), round(float(pw[2]), 5))
 
         # Nominal overhead pixel scaling fallback (~1.2 mm/px at 0.62 m above center)
-        depth = self.get_metric_depth(x, y, camera)
+        K = self._K(camera)
+        depth = self.get_metric_depth(x, y, camera, q_rad=q_rad)
         X_robot = 0.25 - ((float(y) - K[1, 2]) / K[1, 1]) * depth
         Y_robot = -((float(x) - K[0, 2]) / K[0, 0]) * depth
         Z_robot = self.z_table() if z_m is None else float(z_m)
         return (round(float(X_robot), 5), round(float(Y_robot), 5), round(float(Z_robot), 5))
 
+    def project_world_to_pixel(
+        self,
+        point_world: list[float] | tuple[float, float, float] | np.ndarray,
+        camera: str = "top",
+        q_rad: list[float] | np.ndarray | None = None,
+    ) -> tuple[float, float] | None:
+        """Project a 3D world point (``base_link`` meters) to distorted pixel coordinates ``(u, v)``."""
+        T_wc = self.T_world_cam(camera, q_rad=q_rad)
+        if T_wc is None:
+            return None
+        T_cw = np.linalg.inv(T_wc)
+        pw = np.asarray(point_world, dtype=float).reshape(3)
+        p_cam = T_cw[:3, :3] @ pw + T_cw[:3, 3]
+        if p_cam[2] <= 1e-4:
+            return None
+        K = self._K(camera)
+        dist = self._dist(camera)
+        img_pts, _ = cv2.projectPoints(
+            p_cam.reshape(1, 1, 3),
+            np.zeros((3, 1), dtype=np.float64),
+            np.zeros((3, 1), dtype=np.float64),
+            K,
+            dist,
+        )
+        return (float(img_pts[0, 0, 0]), float(img_pts[0, 0, 1]))
+
     def status(self) -> dict[str, Any]:
         return {
             "calib_file": str(self.path),
             "calib_loaded": self.path.exists(),
+            "calibrated": bool(self.data.get("calibrated", False)),
             "arm_type": self.data.get("arm_type", "elrobot-7dof-nominal"),
             "has_K_top": "K_top" in self.data,
+            "has_dist_top": "dist_top" in self.data,
             "has_T_world_cam_top": "T_world_cam_top" in self.data,
             "has_H_table": "H_table" in self.data,
+            "has_K_wrist": "K_wrist" in self.data,
+            "has_dist_wrist": "dist_wrist" in self.data,
+            "has_T_ee_cam_wrist": "T_ee_cam_wrist" in self.data,
+            "has_urdf_fk": self.urdf_path().exists(),
             "has_depth_hook": self._custom_depth_fn is not None,
             "z_table": self.z_table(),
+            "hardware": self.hardware_config(),
         }

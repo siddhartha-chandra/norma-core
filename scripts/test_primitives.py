@@ -46,11 +46,25 @@ async def main() -> int:
         calib_path.write_text(json.dumps({
             "arm_type": "elrobot-8dof-test",
             "num_arm_joints": 7,
+            "hardware": {
+                "bus_serial": "CAL-BUS-99",
+                "camera_top": "cal-top-cam",
+                "camera_wrist": "cal-wrist-cam",
+            },
             "K_top": [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]],
+            "dist_top": [-0.25, 0.05, 0.0, 0.0, 0.0],
             "T_world_cam_top": [
                 [1.0, 0.0, 0.0, 0.25],
                 [0.0, -1.0, 0.0, 0.0],
                 [0.0, 0.0, -1.0, 0.70],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            "K_wrist": [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]],
+            "dist_wrist": [0.0, 0.0, 0.0, 0.0, 0.0],
+            "T_ee_cam_wrist": [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, -0.5, 0.8660254, -0.04],
+                [0.0, -0.8660254, -0.5, 0.03],
                 [0.0, 0.0, 0.0, 1.0],
             ],
             "z_table": 0.05,
@@ -59,6 +73,9 @@ async def main() -> int:
         env = dict(os.environ)
         env["DESK_MOCK"] = "1"
         env["STATION_HOST"] = ""
+        env.pop("STATION_BUS_SERIAL", None)
+        env.pop("CAMERA_TOP", None)
+        env.pop("CAMERA_WRIST", None)
         env["ROBOT_NUM_MOTORS"] = "8"
         env["DESK_CALIB_PATH"] = str(calib_path)
 
@@ -106,9 +123,21 @@ async def main() -> int:
                 check("get_frame saves full (480,640,3) uint8 ndarray", arr.shape == (480, 640, 3) and arr.dtype == np.uint8, str(arr.shape))
                 check("get_frame inline matrix matches requested max_dim", "matrix" in meta and len(meta["matrix"]) == 12, str(meta.get("matrix_shape")))
 
-                # 5. get_metric_depth(x, y) -> z (uses temp rig_calib.json: z_cam = 0.70 - 0.05 = 0.65m)
+                # 5. get_metric_depth(x, y) + undistortion + wrist FK check
                 depth_z = _parse(await session.call_tool("get_metric_depth", {"x": 320.0, "y": 240.0, "camera": "top"}))
                 check("get_metric_depth uses calibrated ray-plane z", isinstance(depth_z, float) and abs(depth_z - 0.65) < 1e-3, f"z={depth_z}")
+
+                corner_no_dist_x = 0.25 + ((560.0 - 320.0) / 600.0) * 0.65
+                w_corner = _parse(await session.call_tool("pixel_to_world", {"x": 560.0, "y": 240.0, "camera": "top"}))
+                check("pixel_to_world applies cv2 undistortion on corners", abs(w_corner["x"] - corner_no_dist_x) > 0.01, f"x={w_corner['x']} vs pinhole={corner_no_dist_x:.4f}")
+
+                w_wrist_before = _parse(await session.call_tool("pixel_to_world", {"x": 320.0, "y": 240.0, "camera": "wrist", "q_rad": [0.0] * 7}))
+                w_wrist_moved = _parse(await session.call_tool("pixel_to_world", {"x": 320.0, "y": 240.0, "camera": "wrist"}))
+                check("wrist FK shifts pixel_to_world with live joint pose", w_wrist_before != w_wrist_moved, f"{w_wrist_before} -> {w_wrist_moved}")
+
+                cal_st = _parse(await session.call_tool("get_calib_status", {}))
+                hw = cal_st["calibration"]["hardware"]
+                check("hardware fallback read from rig_calib.json", hw == {"bus_serial": "CAL-BUS-99", "camera_top": "cal-top-cam", "camera_wrist": "cal-wrist-cam"}, str(hw))
 
                 # 6. Composite execute_sequence ($var pipeline) + pick_pixel
                 seq_res = _parse(await session.call_tool("execute_sequence", {

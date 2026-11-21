@@ -200,6 +200,10 @@ async def move_joints(targets: dict[str, int], max_step: int = DEFAULT_MAX_STEP,
 async def grasp(close_ticks: int | None = None) -> dict:
     """Close gripper jaws and verify grasp via jaw encoder slack + motor current."""
     bridge = await _get_bridge()
+    if close_ticks is None and _calib.data.get("calibrated"):
+        grp = _calib.data.get("gripper") or {}
+        if "close_ticks" in grp:
+            close_ticks = int(grp["close_ticks"])
     return await bridge.grasp_with_verify(close_ticks=close_ticks)
 
 
@@ -210,7 +214,12 @@ async def release() -> dict:
     bridge = await _get_bridge()
     st = await bridge.get_state()
     gripper = st.motors[-1]
-    applied = await bridge.send_joint_targets({gripper.id: gripper.range_max}, max_step=1200)
+    target_open = gripper.range_max
+    if _calib.data.get("calibrated"):
+        grp = _calib.data.get("gripper") or {}
+        if "open_ticks" in grp:
+            target_open = int(grp["open_ticks"])
+    applied = await bridge.send_joint_targets({gripper.id: target_open}, max_step=1200)
     await bridge.wait_settle(applied, timeout_s=2.0)
     return {"released": True, "gripper_id": gripper.id, "target": applied.get(gripper.id)}
 
@@ -375,11 +384,22 @@ async def solve_ik(
     )
 
 
+async def _live_arm_q(q_rad: list[float] | None, camera: str) -> list[float] | None:
+    if q_rad is not None:
+        return [float(v) for v in q_rad]
+    if f"T_world_cam_{camera}" in _calib.data or f"T_ee_cam_{camera}" not in _calib.data:
+        return None
+    bridge = await _get_bridge()
+    st = await bridge.get_state()
+    return _calib.ticks_to_rad(st.motors)
+
+
 @mcp.tool()
 @_traced
-async def get_metric_depth(x: float, y: float, camera: str = "top") -> float:
+async def get_metric_depth(x: float, y: float, camera: str = "top", q_rad: list[float] | None = None) -> float:
     """Estimate metric depth z (meters) at 2D pixel coordinate (x, y) in the specified camera."""
-    return _calib.get_metric_depth(float(x), float(y), camera=camera)
+    q = await _live_arm_q(q_rad, camera)
+    return _calib.get_metric_depth(float(x), float(y), camera=camera, q_rad=q)
 
 
 # =============================================================================
@@ -389,10 +409,17 @@ async def get_metric_depth(x: float, y: float, camera: str = "top") -> float:
 
 @mcp.tool()
 @_traced
-async def pixel_to_world(x: float, y: float, z_m: float | None = None, camera: str = "top") -> dict:
+async def pixel_to_world(
+    x: float,
+    y: float,
+    z_m: float | None = None,
+    camera: str = "top",
+    q_rad: list[float] | None = None,
+) -> dict:
     """Project 2D image pixel (x, y) into 3D metric (x, y, z) meters in robot base frame."""
-    wx, wy, wz = _calib.pixel_to_world(float(x), float(y), z_m=z_m, camera=camera)
-    depth_cam_z = _calib.get_metric_depth(float(x), float(y), camera=camera)
+    q = await _live_arm_q(q_rad, camera)
+    wx, wy, wz = _calib.pixel_to_world(float(x), float(y), z_m=z_m, camera=camera, q_rad=q)
+    depth_cam_z = _calib.get_metric_depth(float(x), float(y), camera=camera, q_rad=q)
     return {"x": wx, "y": wy, "z": wz, "cam_depth_z": depth_cam_z, "camera": camera}
 
 
@@ -436,6 +463,13 @@ async def reload_config() -> dict:
     """Hot-reload calib/rig_calib.json and Suhail's Pink IK module without restarting the MCP server."""
     cal_status = _calib.reload()
     _ik.reload()
+    if _bridge is not None and hasattr(_bridge, "apply_hardware_config"):
+        hw = _calib.hardware_config()
+        _bridge.apply_hardware_config(
+            bus_serial=hw.get("bus_serial"),
+            cam_top=hw.get("camera_top"),
+            cam_wrist=hw.get("camera_wrist"),
+        )
     return {"calibration": cal_status, "ik_backend": _ik.backend_name()}
 
 
@@ -620,14 +654,15 @@ def _init_run_logger() -> None:
     if os.environ.get("DESK_RUNLOG", "1") == "0":
         return
     host = "" if os.environ.get("DESK_MOCK") == "1" else os.environ.get("STATION_HOST", "").strip()
+    hw = _calib.hardware_config()
     _logger = RunLogger(
         RUNS_DIR,
         meta={
             "mode": "live" if host else "mock",
             "station": f"{host}:{os.environ.get('STATION_PORT', '8888')}" if host else None,
-            "bus_serial": os.environ.get("STATION_BUS_SERIAL") or None,
-            "camera_top": os.environ.get("CAMERA_TOP") or None,
-            "camera_wrist": os.environ.get("CAMERA_WRIST") or None,
+            "bus_serial": hw.get("bus_serial") or None,
+            "camera_top": hw.get("camera_top") or None,
+            "camera_wrist": hw.get("camera_wrist") or None,
             "pid": os.getpid(),
         },
     )
