@@ -461,15 +461,16 @@ DASHBOARD_HTML = """<!doctype html>
       </div>
       <div class="row">
         <input id="loc-query" type="text" value="keys" placeholder="Object query (keys, mug, marker...)" />
-        <select id="loc-provider" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;">
-          <option value="auto">Auto (Env Key)</option>
-          <option value="gemini">Gemini (4 Hydrogen)</option>
-          <option value="anthropic">Anthropic (Claude Sonnet 4.6)</option>
-          <option value="openai">OpenAI (GPT-4.1 Mini)</option>
-          <option value="qwen">Qwen (Qwen-VL-Max)</option>
-          <option value="deepseek">DeepSeek (DeepSeek-VL2)</option>
-          <option value="opencv">OpenCV Only (Offline)</option>
+        <select id="loc-provider" onchange="syncVisionModels()" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;">
+          <option value="auto">Auto (Env/Keystore)</option>
+          <option value="gemini">Gemini</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="openai">OpenAI</option>
+          <option value="qwen">Qwen VL</option>
+          <option value="deepseek">DeepSeek VL</option>
+          <option value="opencv">OpenCV Only</option>
         </select>
+        <select id="loc-model" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;"></select>
         <button class="act" onclick="runLocalize()">Localize 3D</button>
         <button class="act" onclick="armWatch()">Arm Watch</button>
         <button class="act" onclick="checkReflex()">Check Reflex</button>
@@ -513,10 +514,30 @@ DASHBOARD_HTML = """<!doctype html>
       return r.json();
     }
     async function triggerEstop() { await postJSON('/api/estop'); refresh(); }
+    const VISION_MODELS = {
+      auto: [['', 'Default Vision Model']],
+      gemini: [['gemini-4-hydrogen', 'gemini-4-hydrogen'], ['gemini-3.8-flash', 'gemini-3.8-flash'], ['gemini-3.8-pro', 'gemini-3.8-pro']],
+      anthropic: [['claude-sonnet-4-6', 'claude-sonnet-4-6'], ['claude-opus-4-6', 'claude-opus-4-6'], ['claude-haiku-4-5', 'claude-haiku-4-5']],
+      openai: [['gpt-4.1-mini', 'gpt-4.1-mini'], ['gpt-4.1', 'gpt-4.1'], ['gpt-4o', 'gpt-4o'], ['o4-mini', 'o4-mini']],
+      qwen: [['qwen-vl-max', 'qwen-vl-max'], ['qwen2.5-vl-72b-instruct', 'qwen2.5-vl-72b-instruct'], ['qwen-vl-plus', 'qwen-vl-plus']],
+      deepseek: [['deepseek-vl2', 'deepseek-vl2']],
+      opencv: [['', 'opencv-fallback']]
+    };
+    function syncVisionModels() {
+      const prov = document.getElementById('loc-provider').value || 'auto';
+      const sel = document.getElementById('loc-model');
+      const opts = VISION_MODELS[prov] || VISION_MODELS.auto;
+      sel.innerHTML = opts.map(([v, l]) => `<option value="${v}">${l}</option>`).join('');
+    }
+    syncVisionModels();
+
     async function runLocalize() {
+      const prov = document.getElementById('loc-provider').value || 'auto';
+      const model = document.getElementById('loc-model').value || null;
       await postJSON('/api/localize', {
         query: document.getElementById('loc-query').value || 'keys',
-        provider: document.getElementById('loc-provider').value || 'auto'
+        provider: prov,
+        model: model
       });
       refresh();
     }

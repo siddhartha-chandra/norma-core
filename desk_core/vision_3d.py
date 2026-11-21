@@ -38,6 +38,14 @@ DEFAULT_PROVIDER_MODELS: dict[str, str] = {
     "deepseek": "deepseek-vl2",
 }
 
+VISION_MODELS_BY_PROVIDER: dict[str, list[str]] = {
+    "gemini": ["gemini-4-hydrogen", "gemini-3.8-flash", "gemini-3.8-pro"],
+    "anthropic": ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5"],
+    "openai": ["gpt-4.1-mini", "gpt-4.1", "gpt-4o", "o4-mini"],
+    "qwen": ["qwen-vl-max", "qwen2.5-vl-72b-instruct", "qwen-vl-plus"],
+    "deepseek": ["deepseek-vl2"],
+}
+
 # Explicit HSV bounds for ElRobot 3D-printed / anodized orange & coral servo horns
 ORANGE_HORN_LOWER_1 = np.array([5, 95, 70], dtype=np.uint8)
 ORANGE_HORN_UPPER_1 = np.array([22, 255, 255], dtype=np.uint8)
@@ -448,6 +456,9 @@ async def localize_object_3d(
     resolved_provider = _resolve_provider(provider)
     if use_gemini and resolved_provider != "opencv":
         chosen_model = model or DEFAULT_PROVIDER_MODELS.get(resolved_provider, GEMINI_VISION_MODEL)
+        allowed = VISION_MODELS_BY_PROVIDER.get(resolved_provider)
+        if allowed and model and model not in allowed:
+            raise ValueError(f"Model {model!r} is not in vision-capable list for {resolved_provider}: {allowed}")
         try:
             det = await asyncio.wait_for(
                 asyncio.to_thread(_call_vlm_sync, jpeg_bytes, query, resolved_provider, chosen_model),
