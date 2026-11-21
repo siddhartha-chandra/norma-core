@@ -26,15 +26,18 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
     Checkbox,
     Footer,
     Header,
+    Input,
     Label,
     ListItem,
     ListView,
     RichLog,
+    Select,
     Static,
     TextArea,
 )
@@ -171,6 +174,110 @@ class ToolItem(ListItem):
         self.tool_name = tool_name
 
 
+KEY_PROVIDERS = ["gemini", "anthropic", "openai", "qwen", "deepseek"]
+
+
+def _keystore_path() -> Path:
+    env_p = os.environ.get("DESK_KEYS_PATH", "").strip()
+    return Path(env_p) if env_p else (Path.home() / ".config" / "desk-core" / "keys.json")
+
+
+def _read_keystore() -> dict[str, str]:
+    p = _keystore_path()
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return {str(k).strip().lower(): str(v).strip() for k, v in raw.items() if str(v).strip()}
+    except Exception:
+        return {}
+
+
+def _write_keystore(data: dict[str, str]) -> Path:
+    p = _keystore_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(p.parent, 0o700)
+    except OSError:
+        pass
+    payload = json.dumps(data, indent=2) + "\n"
+    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload.encode("utf-8"))
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+    return p
+
+
+class KeysModal(ModalScreen[None]):
+    CSS = """
+    KeysModal {
+        align: center middle;
+    }
+    #keys-dialog {
+        width: 64;
+        height: auto;
+        border: solid $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #keys-btns {
+        height: 3;
+        margin-top: 1;
+    }
+    #keys-btns Button {
+        margin-right: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="keys-dialog"):
+            yield Label("[b]Secure Vision API Key Store (0600)[/b]")
+            yield Static("", id="keys-status")
+            yield Select([(p.title(), p) for p in KEY_PROVIDERS], value="gemini", id="key-provider")
+            yield Input(placeholder="Paste API key (masked)...", password=True, id="key-input")
+            with Horizontal(id="keys-btns"):
+                yield Button("Save (0600)", id="btn-key-save", variant="primary")
+                yield Button("Unset", id="btn-key-unset", variant="warning")
+                yield Button("Close", id="btn-key-close")
+
+    def on_mount(self) -> None:
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        store = _read_keystore()
+        parts = [f"{p}:{'SET' if p in store else 'unset'}" for p in KEY_PROVIDERS]
+        self.query_one("#keys-status", Static).update("Stored: " + " | ".join(parts))
+
+    @on(Button.Pressed, "#btn-key-save")
+    def on_save(self) -> None:
+        prov = str(self.query_one("#key-provider", Select).value or "gemini")
+        val = self.query_one("#key-input", Input).value.strip()
+        if not val:
+            return
+        store = _read_keystore()
+        store[prov] = val
+        _write_keystore(store)
+        self.query_one("#key-input", Input).value = ""
+        self._refresh_status()
+
+    @on(Button.Pressed, "#btn-key-unset")
+    def on_unset(self) -> None:
+        prov = str(self.query_one("#key-provider", Select).value or "gemini")
+        store = _read_keystore()
+        store.pop(prov, None)
+        _write_keystore(store)
+        self._refresh_status()
+
+    @on(Button.Pressed, "#btn-key-close")
+    def on_close(self) -> None:
+        self.dismiss(None)
+
+
 class DeskCoreTUI(App):
     TITLE = "DESK-CORE MCP Tester"
     CSS = """
@@ -221,6 +328,7 @@ class DeskCoreTUI(App):
 
     BINDINGS = [
         Binding("ctrl+r", "run_selected", "Run Tool"),
+        Binding("ctrl+k", "open_keys", "API Keys"),
         Binding("ctrl+e", "trigger_estop", "E-STOP"),
         Binding("f12", "trigger_estop", "E-STOP"),
         Binding("q", "quit", "Quit"),
@@ -248,6 +356,7 @@ class DeskCoreTUI(App):
                 yield TextArea("{}", language="json", id="args-editor")
                 with Horizontal(id="controls"):
                     yield Button("Run Tool (Ctrl+R)", id="btn-run", variant="primary")
+                    yield Button("API Keys (Ctrl+K)", id="btn-keys", variant="default")
                     yield Button("E-STOP (Ctrl+E)", id="btn-estop", variant="error")
                     yield Checkbox("Arm Motion", value=(not self.live), id="arm-motion")
                 yield RichLog(id="output-log", highlight=True, markup=True, wrap=True)
@@ -261,8 +370,9 @@ class DeskCoreTUI(App):
 
     async def _mcp_runner(self) -> None:
         log = self.query_one("#output-log", RichLog)
+        devnull = open(os.devnull, "w", encoding="utf-8")
         try:
-            async with stdio_client(_server_params(self.live)) as (read, write):
+            async with stdio_client(_server_params(self.live), errlog=devnull) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     self.session = session
@@ -291,6 +401,7 @@ class DeskCoreTUI(App):
             log.write(f"[bold red]MCP connect failed:[/bold red] {exc}")
         finally:
             self.session = None
+            devnull.close()
 
     async def on_unmount(self) -> None:
         self._stop_event.set()
@@ -335,6 +446,13 @@ class DeskCoreTUI(App):
     @on(Button.Pressed, "#btn-estop")
     async def _on_estop_btn(self) -> None:
         await self.action_trigger_estop()
+
+    @on(Button.Pressed, "#btn-keys")
+    def _on_keys_btn(self) -> None:
+        self.action_open_keys()
+
+    def action_open_keys(self) -> None:
+        self.push_screen(KeysModal())
 
     async def action_trigger_estop(self) -> None:
         await self._call_tool("estop", {})

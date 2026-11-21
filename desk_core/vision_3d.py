@@ -19,6 +19,7 @@ import os
 import re
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -242,10 +243,45 @@ def _parse_vlm_json(raw_text: str, query: str) -> dict[str, Any]:
     }
 
 
+def _load_keystore() -> dict[str, str]:
+    env_path = os.environ.get("DESK_KEYS_PATH", "").strip()
+    path = Path(env_path) if env_path else (Path.home() / ".config" / "desk-core" / "keys.json")
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        out: dict[str, str] = {}
+        for k, v in raw.items():
+            val = str(v).strip()
+            if not val:
+                continue
+            norm_k = "anthropic" if k == "claude" else k.strip().lower()
+            out[norm_k] = val
+        return out
+    except Exception:
+        return {}
+
+
+def _get_api_key(provider: str) -> str:
+    p = "anthropic" if provider == "claude" else provider.strip().lower()
+    env_map = {
+        "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        "anthropic": ("ANTHROPIC_API_KEY",),
+        "openai": ("OPENAI_API_KEY",),
+        "qwen": ("QWEN_API_KEY", "DASHSCOPE_API_KEY"),
+        "deepseek": ("DEEPSEEK_API_KEY",),
+    }
+    for var in env_map.get(p, ()):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    return _load_keystore().get(p, "")
+
+
 def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str, Any]:
     from google import genai
 
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
+    api_key = _get_api_key("gemini")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set")
 
@@ -268,7 +304,7 @@ def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str, model: str) ->
 
 
 def _call_anthropic_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str, Any]:
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    api_key = _get_api_key("anthropic")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
     b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
@@ -360,16 +396,9 @@ def _resolve_provider(provider: str) -> str:
     env_p = os.environ.get("DESK_VISION_PROVIDER", "").strip().lower()
     if env_p:
         return "anthropic" if env_p == "claude" else env_p
-    if os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip():
-        return "gemini"
-    if os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        return "anthropic"
-    if os.environ.get("OPENAI_API_KEY", "").strip():
-        return "openai"
-    if os.environ.get("QWEN_API_KEY", "").strip() or os.environ.get("DASHSCOPE_API_KEY", "").strip():
-        return "qwen"
-    if os.environ.get("DEEPSEEK_API_KEY", "").strip():
-        return "deepseek"
+    for cand in ("gemini", "anthropic", "openai", "qwen", "deepseek"):
+        if _get_api_key(cand):
+            return cand
     return "gemini"
 
 
@@ -379,18 +408,18 @@ def _call_vlm_sync(jpeg_bytes: bytes, query: str, provider: str, model: str) -> 
     if provider == "anthropic":
         return _call_anthropic_sync(jpeg_bytes, query, model)
     if provider == "openai":
-        key = os.environ.get("OPENAI_API_KEY", "").strip()
+        key = _get_api_key("openai")
         url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
         return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "OpenAI")
     if provider == "qwen":
-        key = os.environ.get("QWEN_API_KEY", "").strip() or os.environ.get("DASHSCOPE_API_KEY", "").strip()
+        key = _get_api_key("qwen")
         url = os.environ.get(
             "QWEN_BASE_URL",
             "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
         ).rstrip("/") + "/chat/completions"
         return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "Qwen")
     if provider == "deepseek":
-        key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        key = _get_api_key("deepseek")
         url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/") + "/chat/completions"
         return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "DeepSeek")
     raise ValueError(f"Unsupported vision provider: {provider!r}")
