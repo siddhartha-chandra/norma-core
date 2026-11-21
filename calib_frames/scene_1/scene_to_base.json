@@ -1,0 +1,51 @@
+{
+  "_notes": {
+    "transform_convention": "T_A_B maps points in frame B into frame A (p_A = T_A_B @ p_B), row-major, meters.",
+    "frames": {
+      "T_base_cam_scene": {
+        "parent": "base_link",
+        "child": "scene_camera_optical_frame",
+        "why_key_not_renamed": "Matches the T_world_cam_top role in calib/rig_calib.json, where world_frame is base_link and 'top' is this scene camera."
+      }
+    },
+    "non_urdf_frames": {
+      "scene_camera_optical_frame": "Not in elrobot_follower.urdf. OpenCV optical convention: +X right, +Y down, +Z forward out of the lens."
+    },
+    "depends_on": "../calib_frames/hand_eye_1/wrist_mount_final.json"
+  },
+  "T_base_cam_scene": [
+    [
+      0.9798067800224669,
+      0.11714846076404652,
+      -0.1620336753968746,
+      0.0406007170978486
+    ],
+    [
+      0.19709578282260157,
+      -0.7022418000649769,
+      0.684112349424454,
+      -0.38061956639025096
+    ],
+    [
+      -0.03364411115709508,
+      -0.7022340723591496,
+      -0.7111507444995981,
+      0.3675572917044944
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "translation_units": "meters",
+  "scene_camera": "11391:19040:1:38",
+  "scene_reprojection_rmse_px": 0.188,
+  "scene_detector": "sb",
+  "board_moved_check": {
+    "wrist_view_vs_T_base_board_mm": 19.0,
+    "wrist_view_vs_T_base_board_deg": 3.91,
+    "wrist_reprojection_rmse_px": 0.206
+  }
+}

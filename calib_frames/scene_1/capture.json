@@ -1,0 +1,16 @@
+{
+  "scene_image": "scene.jpg",
+  "wrist_image": "wrist.jpg",
+  "bus": "5B8E115307",
+  "scene_camera": "11391:19040:1:38",
+  "wrist_camera": "11391:19040:1:40",
+  "joint_ticks": [
+    2100,
+    2722,
+    900,
+    893,
+    1877,
+    1044,
+    145
+  ]
+}
