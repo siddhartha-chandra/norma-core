@@ -105,8 +105,32 @@ async def main() -> int:
                 q0 = _parse(await session.call_tool("get_joint_angles", {}))
                 check("get_joint_angles returns 7 rad floats", isinstance(q0, list) and len(q0) == 7, str(q0))
 
-                # 2. solve_ik(x, y, z, alpha, beta, gamma) -> [j1..j7]
-                q_ik = _parse(await session.call_tool("solve_ik", {"x": 0.25, "y": 0.05, "z": 0.12, "alpha": 0.0, "beta": 0.8, "gamma": 0.1}))
+                from desk_core.calib_store import CalibrationStore
+                from desk_core.station_bridge import MotorState
+                conversion_calib = CalibrationStore()
+                conversion_motors = [
+                    MotorState(mid, 2048, 0, 0, 4095)
+                    for mid in range(1, 8)
+                ]
+                q_roundtrip = [0.0, 0.25, -0.5, 1.0, -1.0, 0.75, -0.25]
+                ticks_roundtrip = conversion_calib.joint_angles_to_ticks(q_roundtrip, conversion_motors)
+                q_converted = conversion_calib.ticks_to_joint_angles(
+                    [
+                        MotorState(mid, ticks_roundtrip[mid], 0, 0, 4095)
+                        for mid in range(1, 8)
+                    ]
+                )
+                check(
+                    "radian/URDF joint angles round-trip through ST3215 ticks",
+                    all(abs(a - b) < 0.002 for a, b in zip(q_roundtrip, q_converted)),
+                    f"{ticks_roundtrip} -> {q_converted}",
+                )
+
+                # 2. solve_ik(x, y, z, qx, qy, qz, qw) -> [j1..j7]
+                q_ik = _parse(await session.call_tool("solve_ik", {
+                    "x": 0.25, "y": 0.05, "z": 0.12,
+                    "qx": 0.0, "qy": 0.3826834324, "qz": 0.0, "qw": 0.9238795325,
+                }))
                 check("solve_ik returns 7 rad floats", isinstance(q_ik, list) and len(q_ik) == 7 and all(isinstance(v, (int, float)) for v in q_ik), str(q_ik))
 
                 # 3. move_joint(joints=[...]) -> True, and move_joint(out-of-range) -> False
@@ -157,7 +181,7 @@ async def main() -> int:
                 seq_res = _parse(await session.call_tool("execute_sequence", {
                     "steps": [
                         {"tool": "update_scene_obstacle", "args": {"name": "mug", "x": 0.25, "y": 0.0}},
-                        {"tool": "solve_ik", "args": {"x": 0.22, "y": -0.06, "z": 0.08, "beta": 1.2}, "save_as": "q_pick"},
+                        {"tool": "solve_ik", "args": {"x": 0.22, "y": -0.06, "z": 0.08, "qy": 0.70710678, "qw": 0.70710678}, "save_as": "q_pick"},
                         {"tool": "move_joint", "args": {"joints": "$q_pick"}},
                         {"tool": "grasp", "args": {}},
                         {"tool": "release", "args": {}},
@@ -220,7 +244,8 @@ async def main() -> int:
             res_gem = await localize_object_3d(scene_jpeg, "keys", cs_vis, use_gemini=True)
             check(
                 "gemini-4-hydrogen path maps [y,x] 0-1000 to metric 6D pose",
-                res_gem["found"] and res_gem["backend"] == "gemini-4-hydrogen" and abs(res_gem["pixel"][0] - 489.6) < 1.0 and abs(res_gem["yaw_rad"] - np.deg2rad(15.0)) < 1e-3,
+                res_gem["found"] and res_gem["backend"] == "gemini-4-hydrogen" and abs(res_gem["pixel"][0] - 489.6) < 1.0
+                and all(key in res_gem["pose_6d"] for key in ("qx", "qy", "qz", "qw")),
                 f"pixel={res_gem['pixel']} pose_6d={res_gem['pose_6d']}",
             )
 

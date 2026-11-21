@@ -77,7 +77,7 @@ DEFAULT_ARGS: dict[str, dict[str, Any]] = {
     "localize_3d": {"query": "keys", "camera": "top", "use_gemini": True, "timeout_s": 6.0},
     "pixel_to_world": {"x": 640.0, "y": 360.0, "camera": "top"},
     "get_metric_depth": {"x": 640.0, "y": 360.0, "camera": "top"},
-    "solve_ik": {"x": 0.25, "y": 0.0, "z": 0.10, "alpha": 0.0, "beta": 1.2, "gamma": 0.0},
+    "solve_ik": {"x": 0.25, "y": 0.0, "z": 0.10, "qx": 0.0, "qy": 0.564687767, "qz": 0.0, "qw": 0.825335614},
     "update_scene_obstacle": {
         "name": "mug",
         "x": 0.25,
@@ -95,10 +95,10 @@ DEFAULT_ARGS: dict[str, dict[str, Any]] = {
     "move_joints": {"targets": {"1": 2048}, "max_step": 150, "wait": True},
     "move_joint": {"joints": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "max_step_rad": 0.2, "wait": True},
     "go_home": {},
-    "move_to_pose": {"x": 0.25, "y": 0.0, "z": 0.12, "alpha": 0.0, "beta": 1.2, "gamma": 0.0},
-    "pick_at": {"x": 0.25, "y": 0.0, "z": 0.05, "yaw": 0.0, "approach_dz": 0.06},
-    "place_at": {"x": 0.25, "y": 0.12, "z": 0.05, "yaw": 0.0, "retract_dz": 0.06},
-    "pick_pixel": {"x": 640.0, "y": 360.0, "camera": "top", "yaw": 0.0},
+    "move_to_pose": {"x": 0.25, "y": 0.0, "z": 0.12, "qx": 0.0, "qy": 0.564687767, "qz": 0.0, "qw": 0.825335614},
+    "pick_at": {"x": 0.25, "y": 0.0, "z": 0.05, "qx": 0.0, "qy": 0.707106781, "qz": 0.0, "qw": 0.707106781, "approach_dz": 0.06},
+    "place_at": {"x": 0.25, "y": 0.12, "z": 0.05, "qx": 0.0, "qy": 0.707106781, "qz": 0.0, "qw": 0.707106781, "retract_dz": 0.06},
+    "pick_pixel": {"x": 640.0, "y": 360.0, "camera": "top", "qx": 0.0, "qy": 0.707106781, "qz": 0.0, "qw": 0.707106781},
     "execute_sequence": {
         "steps": [
             {"tool": "get_calib_status", "args": {}, "save_as": "cal"},

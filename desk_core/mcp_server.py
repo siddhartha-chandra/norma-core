@@ -17,7 +17,6 @@ import atexit
 import functools
 import io
 import json
-import math
 import os
 import time
 from pathlib import Path
@@ -363,26 +362,27 @@ async def solve_ik(
     x: float,
     y: float,
     z: float,
-    alpha: float = 0.0,
-    beta: float = 0.0,
-    gamma: float = 0.0,
+    qx: float = 0.0,
+    qy: float = 0.0,
+    qz: float = 0.0,
+    qw: float = 1.0,
 ) -> list[float]:
-    """Solve IK for metric target pose (x, y, z [m], alpha, beta, gamma [rad]) -> [j_1, ..., j_7] (rad)."""
+    """Solve IK for a metric target pose with an xyzw quaternion."""
     bridge = await _get_bridge()
     st = await bridge.get_state()
-    q_curr = _calib.ticks_to_rad(st.motors)
+    seed_joints_rad = _calib.ticks_to_rad(st.motors)
     n_arm = _calib.num_arm_joints(len(st.motors))
     return _ik.solve_ik(
         x=float(x),
         y=float(y),
         z=float(z),
-        alpha=float(alpha),
-        beta=float(beta),
-        gamma=float(gamma),
-        q_curr_rad=q_curr,
+        qx=float(qx),
+        qy=float(qy),
+        qz=float(qz),
+        qw=float(qw),
+        seed_joints_rad=seed_joints_rad,
         obstacles=list(_obstacles.values()),
         n_arm=n_arm,
-        bounds_rad=_calib.bounds_rad(st.motors),
     )
 
 
@@ -399,7 +399,7 @@ async def _live_arm_q(q_rad: list[float] | None, camera: str) -> list[float] | N
 @mcp.tool()
 @_traced
 async def get_metric_depth(x: float, y: float, camera: str = "top", q_rad: list[float] | None = None) -> float:
-    """Estimate metric depth z (meters) at 2D pixel coordinate (x, y) in the specified camera."""
+    """Estimate metric depth z (meters) at a 2D pixel coordinate in the specified camera."""
     q = await _live_arm_q(q_rad, camera)
     return _calib.get_metric_depth(float(x), float(y), camera=camera, q_rad=q)
 
@@ -477,7 +477,7 @@ async def update_scene_obstacle(
 @mcp.tool()
 @_traced
 async def get_calib_status() -> dict:
-    """Inspect active calibration files, IK backend (Pink vs fallback), and registered obstacles."""
+    """Inspect active calibration files, Pink IK backend availability, and registered obstacles."""
     return {
         "calibration": _calib.status(),
         "ik_backend": _ik.backend_name(),
@@ -512,14 +512,15 @@ async def move_to_pose(
     x: float,
     y: float,
     z: float,
-    alpha: float = 0.0,
-    beta: float = 0.0,
-    gamma: float = 0.0,
+    qx: float = 0.0,
+    qy: float = 0.0,
+    qz: float = 0.0,
+    qw: float = 1.0,
 ) -> dict:
-    """Composite move: get_joint_angles -> solve_ik -> move_joint."""
-    angles = await solve_ik(x=x, y=y, z=z, alpha=alpha, beta=beta, gamma=gamma)
+    """Move to a metric target position and xyzw orientation quaternion."""
+    angles = await solve_ik(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
     ok = await move_joint(joints=angles, wait=True)
-    return {"ok": ok, "pose": [x, y, z, alpha, beta, gamma], "joints_rad": angles}
+    return {"ok": ok, "pose": [x, y, z, qx, qy, qz, qw], "joints_rad": angles}
 
 
 @mcp.tool()
@@ -528,19 +529,22 @@ async def pick_at(
     x: float,
     y: float,
     z: float,
-    yaw: float = 0.0,
+    qx: float = 0.0,
+    qy: float = 0.7071067811865476,
+    qz: float = 0.0,
+    qw: float = 0.7071067811865476,
     approach_dz: float = 0.06,
 ) -> dict:
     """Composite pick: open jaws -> hover above -> descend -> grasp_with_verify -> retract cleanly."""
     await release()
-    hover = await move_to_pose(x=x, y=y, z=z + approach_dz, beta=math.pi / 2, gamma=yaw)
+    hover = await move_to_pose(x=x, y=y, z=z + approach_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     if not hover["ok"]:
         return {"ok": False, "stage": "hover", **hover}
-    descend = await move_to_pose(x=x, y=y, z=z, beta=math.pi / 2, gamma=yaw)
+    descend = await move_to_pose(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
     if not descend["ok"]:
         return {"ok": False, "stage": "descend", **descend}
     grip = await grasp()
-    retract = await move_to_pose(x=x, y=y, z=z + approach_dz, beta=math.pi / 2, gamma=yaw)
+    retract = await move_to_pose(x=x, y=y, z=z + approach_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     return {"ok": bool(grip.get("ok")) and bool(retract.get("ok")), "grasp": grip, "retract_ok": retract["ok"]}
 
 
@@ -550,28 +554,41 @@ async def place_at(
     x: float,
     y: float,
     z: float,
-    yaw: float = 0.0,
+    qx: float = 0.0,
+    qy: float = 0.7071067811865476,
+    qz: float = 0.0,
+    qw: float = 0.7071067811865476,
     retract_dz: float = 0.06,
 ) -> dict:
     """Composite place: hover above tray/drop -> lower -> release jaws -> retract."""
-    hover = await move_to_pose(x=x, y=y, z=z + retract_dz, beta=math.pi / 2, gamma=yaw)
+    hover = await move_to_pose(x=x, y=y, z=z + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     if not hover["ok"]:
         return {"ok": False, "stage": "hover", **hover}
-    lower = await move_to_pose(x=x, y=y, z=z, beta=math.pi / 2, gamma=yaw)
+    lower = await move_to_pose(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
     if not lower["ok"]:
         return {"ok": False, "stage": "lower", **lower}
     rel = await release()
-    retract = await move_to_pose(x=x, y=y, z=z + retract_dz, beta=math.pi / 2, gamma=yaw)
+    retract = await move_to_pose(x=x, y=y, z=z + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     return {"ok": bool(rel.get("released")) and bool(retract.get("ok")), "release": rel, "retract_ok": retract["ok"]}
 
 
 @mcp.tool()
 @_traced
-async def pick_pixel(x: float, y: float, camera: str = "top", yaw: float = 0.0) -> dict:
+async def pick_pixel(
+    x: float,
+    y: float,
+    camera: str = "top",
+    qx: float = 0.0,
+    qy: float = 0.7071067811865476,
+    qz: float = 0.0,
+    qw: float = 0.7071067811865476,
+) -> dict:
     """Composite vision-to-grasp: pixel (x, y) -> get_metric_depth -> pixel_to_world -> pick_at."""
     depth_z = await get_metric_depth(x=x, y=y, camera=camera)
     world = await pixel_to_world(x=x, y=y, camera=camera)
-    res = await pick_at(x=world["x"], y=world["y"], z=world["z"], yaw=yaw)
+    res = await pick_at(
+        x=world["x"], y=world["y"], z=world["z"], qx=qx, qy=qy, qz=qz, qw=qw
+    )
     return {"pixel": [x, y], "depth_z": depth_z, "world": world, **res}
 
 

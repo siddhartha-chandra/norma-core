@@ -267,7 +267,15 @@ async def localize_object_3d(
     w_m = round((box_w_px / max(1.0, float(K[0, 0]))) * depth_m, 4)
     h_m = round((box_h_px / max(1.0, float(K[1, 1]))) * depth_m, 4)
 
-    yaw_rad = math.radians(float(det.get("yaw_deg", 0.0)))
+    yaw_deg = float(det.get("yaw_deg", 0.0))
+    half_yaw = math.radians(yaw_deg) * 0.5
+    half_pitch = math.pi / 4.0
+    cy, sy = math.cos(half_yaw), math.sin(half_yaw)
+    cp, sp = math.cos(half_pitch), math.sin(half_pitch)
+    qx = -sp * sy
+    qy = sp * cy
+    qz = cp * sy
+    qw = cp * cy
 
     return {
         "query": query,
@@ -285,11 +293,11 @@ async def localize_object_3d(
             "x": wx,
             "y": wy,
             "z": wz,
-            "alpha": 0.0,
-            "beta": round(math.pi / 2, 5),
-            "gamma": round(yaw_rad, 4),
+            "qx": round(qx, 8),
+            "qy": round(qy, 8),
+            "qz": round(qz, 8),
+            "qw": round(qw, 8),
         },
-        "yaw_rad": round(yaw_rad, 4),
         "depth_m": depth_m,
         "size_m": [w_m, h_m],
         "confidence": round(float(det.get("confidence", 0.0)), 3),
