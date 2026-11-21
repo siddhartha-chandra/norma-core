@@ -154,13 +154,12 @@ def _server_params(live: bool) -> StdioServerParameters:
         env["DESK_MOCK"] = "1"
         env["DESK_NO_DOTENV"] = "1"
         env["STATION_HOST"] = ""
-    cmd = "uv" if shutil.which("uv") else sys.executable
-    args = (
-        ["run", "--offline", "--managed-python", "python", "-m", "desk_core.mcp_server"]
-        if cmd == "uv"
-        else ["-m", "desk_core.mcp_server"]
+    return StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "desk_core.mcp_server"],
+        env=env,
+        cwd=str(REPO_ROOT),
     )
-    return StdioServerParameters(command=cmd, args=args, env=env, cwd=str(REPO_ROOT))
 
 
 class ToolItem(ListItem):
