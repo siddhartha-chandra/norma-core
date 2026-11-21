@@ -108,8 +108,17 @@ async def main() -> int:
                 from desk_core.calib_store import CalibrationStore
                 from desk_core.station_bridge import MotorState
                 conversion_calib = CalibrationStore()
+                measured_ranges = {
+                    1: (1146, 2950),
+                    2: (1002, 3094),
+                    3: (907, 3189),
+                    4: (900, 3196),
+                    5: (166, 3930),
+                    6: (1061, 3035),
+                    7: (124, 3972),
+                }
                 conversion_motors = [
-                    MotorState(mid, 2048, 0, 0, 4095)
+                    MotorState(mid, 2048, 0, *measured_ranges[mid])
                     for mid in range(1, 8)
                 ]
                 q_roundtrip = [0.0, 0.25, -0.5, 1.0, -1.0, 0.75, -0.25]

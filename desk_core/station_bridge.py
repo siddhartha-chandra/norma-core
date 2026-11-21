@@ -57,6 +57,17 @@ DEFAULT_MAX_STEP = int(os.environ.get("ROBOT_MAX_STEP_TICKS", "250"))
 DEFAULT_SPEED = int(os.environ.get("ROBOT_GOAL_SPEED", "600"))
 DEFAULT_ACCEL = int(os.environ.get("ROBOT_GOAL_ACCEL", "20"))
 
+ELROBOT_MOTOR_RANGES: dict[int, tuple[int, int]] = {
+    1: (1146, 2950),
+    2: (1002, 3094),
+    3: (907, 3189),
+    4: (900, 3196),
+    5: (166, 3930),
+    6: (1061, 3035),
+    7: (124, 3972),
+    8: (1255, 2841),
+}
+
 # Auto-reconnect (issue #3): a live NormFS subscription should see motor
 # traffic many times per second; silence this long means the subscription died
 # (e.g. Station restart) even if no explicit error surfaced.
@@ -153,7 +164,13 @@ class MockStationBridge:
         self._torque_on = True
         self._aborted = False
         self._motors: dict[int, MotorState] = {
-            mid: MotorState(mid, 2048, 35, 1000, 3100, 0)
+            mid: MotorState(
+                mid,
+                2048,
+                35,
+                *ELROBOT_MOTOR_RANGES.get(mid, (0, MAX_ANGLE_STEP)),
+                0,
+            )
             for mid in range(1, num_joints + 1)
         }
 
