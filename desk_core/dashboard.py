@@ -30,7 +30,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import mcp_server as srv
-from .robo_jev import check_reflex_and_abort
+from .robo_jev import check_reflex_and_abort, guarded_recover
 from .vision_3d import localize_object_3d
 
 app = FastAPI(title="DESK-CORE Mission Control")
@@ -57,6 +57,10 @@ class LocalizeReq(BaseModel):
 
 class TTSReq(BaseModel):
     text: str
+
+
+class MockDisplaceReq(BaseModel):
+    mode: str = "in_bounds"  # "in_bounds" | "out_of_bounds" | "reset"
 
 
 @app.get("/api/health")
@@ -200,6 +204,134 @@ async def api_check_reflex() -> dict[str, Any]:
     return res
 
 
+@app.post("/api/robo_jev/recover")
+async def api_guarded_recover() -> dict[str, Any]:
+    global _last_detection
+    bridge = await srv._get_bridge()
+    q = (_last_detection or {}).get("query") or (srv._robo_jev.watch.query if srv._robo_jev.watch else "keys")
+    res = await guarded_recover(
+        gatekeeper=srv._robo_jev,
+        bridge=bridge,
+        calib=srv._calib,
+        query=q,
+        obstacles_fn=lambda: list(srv._obstacles.values()),
+        camera="top",
+        use_gemini=bool(os.environ.get("GEMINI_API_KEY")),
+    )
+    if res.get("ok") and res.get("action") == "recalibrated" and res.get("world"):
+        _last_detection = {
+            **(_last_detection or {}),
+            "found": True,
+            "query": q,
+            "label": q,
+            "pixel": res["pixel"],
+            "world": res["world"],
+        }
+    _log_event("RECOVER", f"action={res.get('action')} reason={res.get('reason', 'ok')}", ok=res.get("ok", False))
+    return res
+
+
+def _displace_object_in_frame(
+    bgr: np.ndarray,
+    box_px: tuple[int, int, int, int],
+    mode: str,
+) -> tuple[np.ndarray, tuple[int, int]]:
+    """Shift the object inside `box_px` either inside WorkspaceBounds or out of bounds."""
+    h, w = bgr.shape[:2]
+    x1, y1, x2, y2 = box_px
+    x1, y1 = max(4, x1), max(4, y1)
+    x2, y2 = min(w - 4, x2), min(h - 4, y2)
+    bw, bh = max(24, x2 - x1), max(24, y2 - y1)
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+
+    def _in_safe_bounds(px: int, py: int) -> bool:
+        wx, wy, wz = srv._calib.pixel_to_world(float(px), float(py), camera="top")
+        return srv._robo_jev.safe_bounds.contains(wx, wy, wz)
+
+    if mode == "out_of_bounds":
+        candidates = [
+            (w - max(bw // 2 + 20, 90), h - max(bh // 2 + 20, 80)),
+            (max(bw // 2 + 20, 90), h - max(bh // 2 + 20, 80)),
+            (w - max(bw // 2 + 20, 90), max(bh // 2 + 20, 80)),
+        ]
+        dst_cx, dst_cy = candidates[0]
+        for cand_x, cand_y in candidates:
+            if not _in_safe_bounds(cand_x, cand_y) and np.hypot(cand_x - cx, cand_y - cy) >= 120:
+                dst_cx, dst_cy = cand_x, cand_y
+                break
+    else:
+        # Pick a destination shifted >= 45 px whose world pose is guaranteed inside WorkspaceBounds
+        candidates = [
+            (cx + 60, cy),
+            (cx - 60, cy),
+            (cx, cy - 60),
+            (cx + 80, cy - 60),
+            (int(w * 0.5), int(h * 0.42)),
+            (int(w * 0.48), int(h * 0.35)),
+        ]
+        dst_cx, dst_cy = int(w * 0.5), int(h * 0.42)
+        for cand_x, cand_y in candidates:
+            cand_x = max(bw // 2 + 8, min(w - bw // 2 - 8, cand_x))
+            cand_y = max(bh // 2 + 8, min(h - bh // 2 - 8, cand_y))
+            if _in_safe_bounds(cand_x, cand_y) and np.hypot(cand_x - cx, cand_y - cy) >= 45:
+                dst_cx, dst_cy = cand_x, cand_y
+                break
+
+    nx1 = max(4, min(w - bw - 4, dst_cx - bw // 2))
+    ny1 = max(4, min(h - bh - 4, dst_cy - bh // 2))
+    nx2, ny2 = nx1 + bw, ny1 + bh
+
+    patch = bgr[y1:y2, x1:x2].copy()
+    mask = np.zeros((h, w), dtype=np.uint8)
+    pad = 6
+    mask[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)] = 255
+    out = cv2.inpaint(bgr, mask, 7, cv2.INPAINT_TELEA)
+    out[ny1:ny2, nx1:nx2] = patch
+    return out, (nx1 + bw // 2 - cx, ny1 + bh // 2 - cy)
+
+
+@app.post("/api/mock/displace")
+async def api_mock_displace(req: MockDisplaceReq) -> dict[str, Any]:
+    bridge = await srv._get_bridge()
+    if not hasattr(bridge, "set_frame_override"):
+        return {"ok": False, "error": "Mock displacement only available in mock mode"}
+
+    if req.mode == "reset":
+        bridge.set_frame_override("top", None)
+        _log_event("MOCK", "Reset top workspace frame to original")
+        return {"ok": True, "mode": "reset"}
+
+    # Always displace from the clean un-overridden base frame
+    bridge.set_frame_override("top", None)
+    base_jpeg = await bridge.get_frame("top", denoise=False)
+    arr = np.frombuffer(base_jpeg, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        return {"ok": False, "error": "Failed to decode base mock frame"}
+
+    h, w = bgr.shape[:2]
+    if _last_detection and _last_detection.get("found"):
+        ymin, xmin, ymax, xmax = _last_detection["box_2d"]
+        box_px = (int(xmin / 1000.0 * w), int(ymin / 1000.0 * h), int(xmax / 1000.0 * w), int(ymax / 1000.0 * h))
+        label = _last_detection.get("query", "target")
+    elif srv._robo_jev.watch is not None:
+        box_px = srv._robo_jev.watch.box_px
+        label = srv._robo_jev.watch.query
+    else:
+        # Default keys region on mock_frames/top.jpg (1280x720)
+        box_px = (220, 340, 495, 535)
+        label = "keys"
+
+    displaced, (dx, dy) = _displace_object_in_frame(bgr, box_px, req.mode)
+    ok_enc, buf = cv2.imencode(".jpg", displaced, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    if not ok_enc:
+        return {"ok": False, "error": "Failed to encode displaced frame"}
+
+    bridge.set_frame_override("top", buf.tobytes())
+    _log_event("MOCK", f"Displaced '{label}' ({req.mode}) by dx={dx}px, dy={dy}px")
+    return {"ok": True, "mode": req.mode, "label": label, "dx_px": dx, "dy_px": dy}
+
+
 @app.post("/api/tts")
 async def api_tts(req: TTSReq) -> dict[str, Any]:
     queued = srv._tts.speak(req.text)
@@ -328,6 +460,12 @@ DASHBOARD_HTML = """<!doctype html>
         <button class="act" onclick="runLocalize()">Localize 3D</button>
         <button class="act" onclick="armWatch()">Arm Watch</button>
         <button class="act" onclick="checkReflex()">Check Reflex</button>
+        <button class="act" onclick="guardedRecover()">Guarded Recover</button>
+      </div>
+      <div class="row">
+        <button class="act" style="background:#b45309;color:#fff;" onclick="mockDisplace('in_bounds')">Displace In Safe Bounds</button>
+        <button class="act" style="background:#991b1b;color:#fff;" onclick="mockDisplace('out_of_bounds')">Displace Out of Bounds</button>
+        <button class="act" onclick="mockDisplace('reset')">Reset Mock Scene</button>
       </div>
       <div class="row">
         <input id="tts-text" type="text" value="Desk core standing by." placeholder="Speaker TTS message" />
@@ -365,6 +503,8 @@ DASHBOARD_HTML = """<!doctype html>
     async function runLocalize() { await postJSON('/api/localize', { query: document.getElementById('loc-query').value || 'keys' }); refresh(); }
     async function armWatch() { await postJSON('/api/robo_jev/arm'); refresh(); }
     async function checkReflex() { await postJSON('/api/robo_jev/check'); refresh(); }
+    async function guardedRecover() { await postJSON('/api/robo_jev/recover'); refresh(); }
+    async function mockDisplace(mode) { await postJSON('/api/mock/displace', { mode }); refreshFrames(); refresh(); }
     async function sendTTS() { await postJSON('/api/tts', { text: document.getElementById('tts-text').value }); refresh(); }
     async function runFirstLight() { await postJSON('/api/first_light'); refresh(); }
 

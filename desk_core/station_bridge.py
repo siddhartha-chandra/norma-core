@@ -152,6 +152,7 @@ class MockStationBridge:
         self.num_joints = num_joints
         self._torque_on = True
         self._aborted = False
+        self._frame_overrides: dict[str, bytes] = {}
         self._motors: dict[int, MotorState] = {
             mid: MotorState(mid, 2048, 35, 1000, 3100, 0)
             for mid in range(1, num_joints + 1)
@@ -166,7 +167,15 @@ class MockStationBridge:
     async def list_cameras(self) -> list[str]:
         return ["mock-top", "mock-wrist"]
 
+    def set_frame_override(self, camera: str, jpeg_bytes: bytes | None) -> None:
+        if jpeg_bytes is None:
+            self._frame_overrides.pop(camera, None)
+        else:
+            self._frame_overrides[camera] = jpeg_bytes
+
     async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
+        if camera in self._frame_overrides:
+            return self._frame_overrides[camera]
         # 1. Explicit realistic test image override via env var or repo `mock_frames/{top,wrist}.jpg`
         env_key = "DESK_MOCK_TOP_IMAGE" if camera == "top" else "DESK_MOCK_WRIST_IMAGE"
         candidates = []
