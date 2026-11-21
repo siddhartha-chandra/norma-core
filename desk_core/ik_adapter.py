@@ -1,11 +1,11 @@
-"""IK solver adapter: plugs straight into Suhail's Pink solver when available.
+"""IK solver adapter: plugs straight into a Pink IK solver when available.
 
 Resolution order:
-  1. External HTTP service if `PINK_IK_URL` env var is set (lets Suhail run Pink on his own laptop!).
+  1. External HTTP service if `PINK_IK_URL` env var is set (remote Pink IK server).
   2. Local Python module `desk_core/ik_pink.py` exporting
      `solve_ik(x, y, z, alpha, beta, gamma, q_curr_rad=..., obstacles=...) -> list[float]`.
   3. Built-in 7-DoF damped kinematic fallback so offline MCP tool chains
-     (`solve_ik -> move_joint`, `move_to_pose`, `pick_at`) run cleanly before Pink lands.
+     (`solve_ik -> move_joint`, `move_to_pose`, `pick_at`) run cleanly without external IK.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from .station_bridge import REPO_ROOT
 def _fk_and_jac_nominal(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Smooth 7-DoF serial arm forward kinematics + 6xN finite-diff Jacobian (nominal link lengths).
 
-    Used ONLY when Suhail's Pink solver (`desk_core/ik_pink.py` or `PINK_IK_URL`) is absent.
+    Used ONLY when the Pink solver (`desk_core/ik_pink.py` or `PINK_IK_URL`) is absent.
     Joint convention: j1 yaw, j2 shoulder pitch, j3 elbow pitch, j4 pitch, j5 roll, j6 wrist pitch, j7 wrist roll.
     """
     n = len(q)

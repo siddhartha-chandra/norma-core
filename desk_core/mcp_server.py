@@ -460,7 +460,7 @@ async def get_calib_status() -> dict:
 @mcp.tool()
 @_traced
 async def reload_config() -> dict:
-    """Hot-reload calib/rig_calib.json and Suhail's Pink IK module without restarting the MCP server."""
+    """Hot-reload calib/rig_calib.json and the Pink IK module without restarting the MCP server."""
     cal_status = _calib.reload()
     _ik.reload()
     if _bridge is not None and hasattr(_bridge, "apply_hardware_config"):

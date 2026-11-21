@@ -1,9 +1,9 @@
 """Shared datatypes and Protocol contracts for DESK-CORE.
 
-Allows parallel development across the team:
-  - Abhimanyu + Scot: rig setup, camera calibration, homography, ray-plane depth (`calib/rig_calib.json`)
-  - Suhail: Pink (Pinocchio) IK solver (`desk_core/ik_pink.py` or `PINK_IK_URL`)
-  - Siddhartha: MCP server, Gemini 4 Hydrogen localize_3d, Robo-Jev, Dashboard
+Clean subsystem boundaries:
+  - Calibration & Geometry: rig setup, camera calibration, homography, ray-plane depth (`calib/rig_calib.json`)
+  - Inverse Kinematics: Pink (Pinocchio) IK solver (`desk_core/ik_pink.py` or `PINK_IK_URL`)
+  - MCP & Perception: MCP server, vision localization, safety reflex, dashboard
 """
 from __future__ import annotations
 
@@ -58,7 +58,7 @@ class IKRequest:
 
 @runtime_checkable
 class IKSolver(Protocol):
-    """Contract for Suhail's Pink IK solver (or fallback solver)."""
+    """Contract for a Pink IK solver (or fallback solver)."""
 
     def solve_ik(
         self,
@@ -77,7 +77,7 @@ class IKSolver(Protocol):
 
 @runtime_checkable
 class DepthEstimator(Protocol):
-    """Contract for Scot/Abhimanyu's metric depth & pixel->world projection."""
+    """Contract for metric depth & pixel->world projection."""
 
     def get_metric_depth(self, x: float, y: float, camera: str = "top") -> float:
         """Return metric depth z (meters) along camera ray or height above camera for pixel (x, y)."""

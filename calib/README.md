@@ -1,6 +1,6 @@
 # Rig Calibration (`calib/rig_calib.json`)
 
-Shared calibration contract for **Abhimanyu & Scot** (`#19`, `#4`, `#6`), **Suhail** (`#9` / Pink IK), and **Sid** (MCP & Gemini 4 Hydrogen).
+Shared calibration contract linking Station hardware, camera extrinsics/intrinsics, Pink IK, and MCP tools.
 
 - Edit **`calib/rig_calib.json`** with real measurements (never overwrite `calib/rig_calib.example.json`, which stays as the clean reference schema).
 
@@ -13,7 +13,7 @@ Shared calibration contract for **Abhimanyu & Scot** (`#19`, `#4`, `#6`), **Suha
   - `T_ee_cam_wrist`: follower wrist camera → `wrist_mount_link` (`Gripper_Base_v1_1`). At runtime, `T_world_cam_wrist(q) = T_world_ee(q) @ T_ee_cam_wrist` via URDF FK (`elrobot_follower.urdf`).
   - `dist_top` / `dist_wrist`: OpenCV 5-element `[k1, k2, p1, p2, k3]` distortion coefficients (automatically applied via `cv2.undistortPoints`).
   - `H_table`: optional `3x3` 4-corner planar homography mapping `top` pixel `[u, v, 1]` to tabletop `[X, Y, 1]` at `z = z_table`.
-- **Joint mapping:** `angle_rad = joint_signs[i] * (tick - joint_zero_ticks[i]) / (4096 / 2pi)`, aligned with Suhail's URDF zero pose (`hardware/elrobot/simulation/elrobot_follower.urdf`).
+- **Joint mapping:** `angle_rad = joint_signs[i] * (tick - joint_zero_ticks[i]) / (4096 / 2pi)`, aligned with the URDF zero pose (`hardware/elrobot/simulation/elrobot_follower.urdf`).
 - **Hardware IDs (`hardware.*`):** `bus_serial`, `camera_top`, `camera_wrist` auto-populate if omitted from `.env`.
 
 ## Verify & Hot Reload

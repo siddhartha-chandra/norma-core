@@ -16,6 +16,6 @@ uv run --offline --managed-python python scripts/test_primitives.py
 4. Use the Pink IK / pose pipeline (`solve_ik -> move_joint`, `move_to_pose`, `pick_at`, `place_at`, `execute_sequence`) rather than blind raw tick guesses.
 5. If anything shifts or stalls, call `estop()` immediately and re-`observe()`.
 
-## Teammate Integration Plug-Ins
-- **Suhail (`Pink` IK):** Implement `desk_core/ik_pink.py` with `solve_ik(x, y, z, alpha, beta, gamma, q_curr_rad=..., obstacles=...) -> list[float]` (or set `PINK_IK_URL`), then call `reload_config()`.
-- **Abhimanyu & Scot (Calibration + Depth):** Write `calib/rig_calib.json` (intrinsics `K_top`, extrinsics `T_world_cam_top`, `z_table`, `H_table`, `joint_signs`, `joint_zero_ticks`) or `desk_core/geom_depth.py:get_metric_depth(x, y, camera)`, then call `reload_config()`.
+## Module Integration Plug-Ins
+- **Pink IK (`solve_ik`):** Implement `desk_core/ik_pink.py` with `solve_ik(x, y, z, alpha, beta, gamma, q_curr_rad=..., obstacles=...) -> list[float]` (or set `PINK_IK_URL`), then call `reload_config()`.
+- **Calibration & Depth (`rig_calib.json`):** Write `calib/rig_calib.json` (intrinsics `K_top`, extrinsics `T_world_cam_top`, `z_table`, `H_table`, `joint_signs`, `joint_zero_ticks`) or `desk_core/geom_depth.py:get_metric_depth(x, y, camera)`, then call `reload_config()`.

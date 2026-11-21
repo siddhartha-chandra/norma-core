@@ -1,6 +1,6 @@
 # DESK-CORE System Architecture & Claude Control Guide
 
-How **Claude Code** (or **Codex**) talks to the **ElRobot 7-DoF + gripper** rig over MCP, using calibration, forward kinematics, and Suhail's **Pink IK** solver.
+How **Claude Code** (or **Codex**) talks to the **ElRobot 7-DoF + gripper** rig over MCP, using calibration, forward kinematics, and the **Pink IK** solver.
 
 ---
 
@@ -18,7 +18,7 @@ flowchart TD
         Cams --> Station
     end
 
-    subgraph SUHAIL["2. Suhail Laptop (Optional Remote IK Host)"]
+    subgraph IKHOST["2. Remote IK Laptop (Optional HTTP Service)"]
         Pink["Pink Pinocchio IK Server (PINK_IK_URL)"]
     end
 
@@ -65,13 +65,13 @@ flowchart TD
 Claude reads `.mcp.json` automatically and starts the `desk-core` MCP server:
 
 ```bash
-cd /Users/siddhartha/playarea/hackathons/normacore_hackathon/norma-core
+cd /path/to/norma-core
 claude
 ```
 
 Check `.env` first:
 - **Offline test (no hardware needed):** leave `STATION_HOST=` empty (or set `DESK_MOCK=1`).
-- **Real robot:** set `STATION_HOST=<rig-host-ip>` (and optionally `PINK_IK_URL=http://<suhail-ip>:<port>/solve`).
+- **Real robot:** set `STATION_HOST=<rig-host-ip>` (and optionally `PINK_IK_URL=http://<ik-host-ip>:<port>/solve`).
 - Hardware routing IDs (`bus_serial`, `camera_top`, `camera_wrist`) load automatically from `.env` or `calib/rig_calib.json`.
 
 ---

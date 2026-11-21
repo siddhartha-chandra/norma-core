@@ -1,6 +1,6 @@
 """Calibration store, encoder<->radian conversion, and metric depth / ray-plane projection.
 
-Reads `calib/rig_calib.json` (when dropped by Abhimanyu/Scot from #19 / #4 / #6).
+Reads `calib/rig_calib.json` (or `calib_frames/*/camera_calibration.json`) when calibrated.
 If not yet present on disk, provides clean nominal defaults for 7-DoF arm + gripper
 so MCP tools and pipelines remain runnable end-to-end offline.
 """
@@ -28,7 +28,7 @@ def resolve_default_calib_path() -> Path:
 
     Priority when `DESK_CALIB_PATH` env var is unset:
       1. `calib/rig_calib.json` if it exists and has `calibrated == true`.
-      2. Newest `calib_frames/*/camera_calibration.json` if present (Scot's intrinsics output).
+      2. Newest `calib_frames/*/camera_calibration.json` if present (camera intrinsics output).
       3. `calib/rig_calib.json` (nominal tracked contract).
     """
     env_p = os.environ.get("DESK_CALIB_PATH", "").strip()

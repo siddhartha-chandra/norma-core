@@ -1,7 +1,7 @@
 {
   "_notes": {
     "purpose": "Reference calibration template for DESK-CORE (copy/edit into calib/rig_calib.json; leave this example intact).",
-    "status_hint": "Set calibrated=true in calib/rig_calib.json once Abhimanyu/Scot replace placeholder numbers from issues #19, #4, and #6.",
+    "status_hint": "Set calibrated=true in calib/rig_calib.json once placeholder values are replaced with real rig measurements.",
     "units": "meters and radians; joint ticks are ST3215 12-bit [0..4095].",
     "frames": {
       "world_frame": "ElRobot base_link",

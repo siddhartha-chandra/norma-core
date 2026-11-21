@@ -1,7 +1,7 @@
 {
   "_notes": {
     "purpose": "Single-source rig calibration file for DESK-CORE (ElRobot 7-DoF + gripper, fixed topdown cam, follower wrist cam).",
-    "status_hint": "Set calibrated=true once Abhimanyu/Scot replace placeholder numbers from issues #19, #4, and #6.",
+    "status_hint": "Set calibrated=true once placeholder values are replaced with real rig measurements.",
     "units": "meters and radians; joint ticks are ST3215 12-bit [0..4095].",
     "frames": {
       "world_frame": "ElRobot base_link",
