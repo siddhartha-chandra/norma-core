@@ -1,0 +1,95 @@
+{
+  "_notes": {
+    "purpose": "Single-source rig calibration file for DESK-CORE (ElRobot 7-DoF + gripper, fixed topdown cam, follower wrist cam).",
+    "status_hint": "Set calibrated=true once Abhimanyu/Scot replace placeholder numbers from issues #19, #4, and #6.",
+    "units": "meters and radians; joint ticks are ST3215 12-bit [0..4095].",
+    "frames": {
+      "world_frame": "ElRobot base_link",
+      "camera_frame": "OpenCV optical frame (+X right, +Y down, +Z forward out of lens)",
+      "transform_convention": "T_A_B is 4x4 row-major mapping points in frame B into frame A (p_A = T_A_B @ p_B). For wrist cam: T_world_cam_wrist(q) = T_world_ee(q) @ T_ee_cam_wrist."
+    }
+  },
+  "calibrated": false,
+  "arm_type": "elrobot",
+  "num_arm_joints": 7,
+  "world_frame": "base_link",
+  "ee_link": "Gripper_Base_v1_1",
+  "wrist_mount_link": "Gripper_Base_v1_1",
+
+  "hardware": {
+    "bus_serial": "",
+    "camera_top": "",
+    "camera_wrist": ""
+  },
+
+  "joint_names": [
+    "rev_motor_01",
+    "rev_motor_02",
+    "rev_motor_03",
+    "rev_motor_04",
+    "rev_motor_05",
+    "rev_motor_06",
+    "rev_motor_07"
+  ],
+  "joint_zero_ticks": {
+    "1": 2048,
+    "2": 2048,
+    "3": 2048,
+    "4": 2048,
+    "5": 2048,
+    "6": 2048,
+    "7": 2048
+  },
+  "joint_signs": {
+    "1": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1
+  },
+  "gripper": {
+    "motor_id": 8,
+    "joint_name": "rev_motor_08",
+    "open_ticks": 3000,
+    "close_ticks": 1150,
+    "min_holding_gap_ticks": 120
+  },
+  "home_joints_rad": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+
+  "z_table": 0.0,
+  "cam_height_top_m": 0.62,
+  "cam_height_wrist_m": 0.25,
+
+  "K_top": [
+    [560.0, 0.0, 320.0],
+    [0.0, 560.0, 240.0],
+    [0.0, 0.0, 1.0]
+  ],
+  "dist_top": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "T_world_cam_top": [
+    [0.0, -1.0, 0.0, 0.25],
+    [-1.0, 0.0, 0.0, 0.0],
+    [0.0, 0.0, -1.0, 0.62],
+    [0.0, 0.0, 0.0, 1.0]
+  ],
+  "H_table": [
+    [0.0, -0.00110714, 0.51571429],
+    [-0.00110714, 0.0, 0.35428571],
+    [0.0, 0.0, 1.0]
+  ],
+
+  "K_wrist": [
+    [560.0, 0.0, 320.0],
+    [0.0, 560.0, 240.0],
+    [0.0, 0.0, 1.0]
+  ],
+  "dist_wrist": [0.0, 0.0, 0.0, 0.0, 0.0],
+  "T_ee_cam_wrist": [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, -0.04],
+    [0.0, 0.0, 1.0, 0.03],
+    [0.0, 0.0, 0.0, 1.0]
+  ]
+}

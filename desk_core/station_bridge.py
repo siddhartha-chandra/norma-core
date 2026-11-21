@@ -145,7 +145,9 @@ class StationBridge(Protocol):
 class MockStationBridge:
     """Zero-hardware tabletop simulation for parallel team development and offline tests."""
 
-    def __init__(self, num_joints: int = 6):
+    def __init__(self, num_joints: int | None = None):
+        if num_joints is None:
+            num_joints = int(os.environ.get("ROBOT_NUM_MOTORS", "8"))
         self.num_joints = num_joints
         self._torque_on = True
         self._aborted = False
