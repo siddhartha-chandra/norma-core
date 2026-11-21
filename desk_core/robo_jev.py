@@ -32,6 +32,24 @@ def _decode_bgr(jpeg_bytes: bytes) -> np.ndarray:
 
 
 @dataclass
+class WorkspaceBounds:
+    """Safe 3D tabletop bounding box (meters in robot base_link) for target recalibration."""
+    x_min: float = 0.08
+    x_max: float = 0.44
+    y_min: float = -0.26
+    y_max: float = 0.26
+    z_min: float = -0.02
+    z_max: float = 0.35
+
+    def contains(self, x: float, y: float, z: float = 0.0) -> bool:
+        return (
+            self.x_min <= x <= self.x_max
+            and self.y_min <= y <= self.y_max
+            and self.z_min <= z <= self.z_max
+        )
+
+
+@dataclass
 class ReflexWatchTarget:
     """Reference snapshot around a localized target for mid-flight shift detection."""
     query: str
@@ -45,9 +63,15 @@ class ReflexWatchTarget:
 class RoboJevGatekeeper:
     """Sub-150 ms visual + geometric reflex gatekeeper."""
 
-    def __init__(self, shift_px_threshold: float = 18.0, shift_mm_threshold: float = 22.0) -> None:
+    def __init__(
+        self,
+        shift_px_threshold: float = 18.0,
+        shift_mm_threshold: float = 22.0,
+        safe_bounds: WorkspaceBounds | None = None,
+    ) -> None:
         self.shift_px_threshold = float(shift_px_threshold)
         self.shift_mm_threshold = float(shift_mm_threshold)
+        self.safe_bounds = safe_bounds or WorkspaceBounds()
         self.watch: ReflexWatchTarget | None = None
         self.last_report: dict[str, Any] = {
             "ok": True,
@@ -287,3 +311,112 @@ async def check_reflex_and_abort(
     report["abort_result"] = abort_res
     report["total_roundtrip_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
     return report
+
+
+async def guarded_recover(
+    gatekeeper: RoboJevGatekeeper,
+    bridge: Any,
+    calib: CalibrationStore,
+    query: str = "target",
+    obstacles_fn: Any = None,
+    target_xy: tuple[float, float] | None = None,
+    camera: str = "top",
+    obstacle_wait_timeout_s: float = 8.0,
+    poll_interval_s: float = 0.1,
+    use_gemini: bool = False,
+) -> dict[str, Any]:
+    """Pause on obstacle until clear & resume; recalibrate on shift if inside safe bounds.
+
+    Returns:
+      - `ok=True, action="proceed"|"resumed_after_obstacle"|"recalibrated"` when safe to continue
+      - `ok=False, action="halted", reason="obstacle_timeout"|"target_out_of_bounds"` otherwise
+    """
+    import asyncio
+    from .vision_3d import localize_object_3d
+
+    def _get_obs() -> list[SceneObstacle]:
+        return list(obstacles_fn()) if callable(obstacles_fn) else list(obstacles_fn or [])
+
+    jpeg = await bridge.get_frame(camera, denoise=False)
+    report = gatekeeper.evaluate(
+        curr_jpeg=jpeg,
+        calib=calib,
+        obstacles=_get_obs(),
+        target_xy=target_xy,
+        camera=camera,
+    )
+
+    if report["ok"]:
+        return {"ok": True, "action": "proceed", "target_xy": list(target_xy) if target_xy else None, "report": report}
+
+    # Immediate safe pause
+    await bridge.abort()
+
+    # Case 1: Transient obstacle in path -> pause and poll until obstacle moves out
+    if report.get("blocker") is not None or report.get("reason") == "will_tip":
+        deadline = time.monotonic() + float(obstacle_wait_timeout_s)
+        while time.monotonic() < deadline:
+            await asyncio.sleep(poll_interval_s)
+            jpeg = await bridge.get_frame(camera, denoise=False)
+            rep_retry = gatekeeper.evaluate(
+                curr_jpeg=jpeg,
+                calib=calib,
+                obstacles=_get_obs(),
+                target_xy=target_xy,
+                camera=camera,
+            )
+            if rep_retry["ok"]:
+                return {
+                    "ok": True,
+                    "action": "resumed_after_obstacle",
+                    "target_xy": list(target_xy) if target_xy else None,
+                    "report": rep_retry,
+                }
+        return {
+            "ok": False,
+            "action": "halted",
+            "reason": "obstacle_timeout",
+            "report": report,
+        }
+
+    # Case 2: Target shifted -> recalibrate & verify inside safe boundary bounding box
+    if report.get("target_shifted"):
+        det = await localize_object_3d(
+            jpeg_bytes=jpeg,
+            query=query,
+            calib=calib,
+            camera=camera,
+            use_gemini=use_gemini,
+        )
+        if det.get("found"):
+            new_px = (float(det["pixel"][0]), float(det["pixel"][1]))
+            wx, wy, wz = float(det["world"]["x"]), float(det["world"]["y"]), float(det["world"]["z"])
+            depth_m = float(det["depth_m"])
+        elif report.get("new_pixel"):
+            new_px = (float(report["new_pixel"][0]), float(report["new_pixel"][1]))
+            wx, wy, wz = calib.pixel_to_world(new_px[0], new_px[1], camera=camera)
+            depth_m = calib.get_metric_depth(new_px[0], new_px[1], camera=camera)
+        else:
+            return {"ok": False, "action": "halted", "reason": "target_lost", "report": report}
+
+        if not gatekeeper.safe_bounds.contains(wx, wy, wz):
+            return {
+                "ok": False,
+                "action": "halted",
+                "reason": "target_out_of_bounds",
+                "world": {"x": wx, "y": wy, "z": wz},
+                "safe_bounds": vars(gatekeeper.safe_bounds),
+                "report": report,
+            }
+
+        gatekeeper.arm_watch(jpeg_bytes=jpeg, pixel=new_px, query=query, depth_m=depth_m)
+        return {
+            "ok": True,
+            "action": "recalibrated",
+            "pixel": [round(new_px[0], 1), round(new_px[1], 1)],
+            "world": {"x": wx, "y": wy, "z": wz},
+            "target_xy": [wx, wy],
+            "report": report,
+        }
+
+    return {"ok": False, "action": "halted", "reason": report.get("reason", "hazard"), "report": report}

@@ -33,7 +33,7 @@ from PIL import Image as PILImage
 from .calib_store import CalibrationStore, TICKS_PER_RAD
 from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
-from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort
+from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
 from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, StationBridge, create_bridge
 from .tts import SpeakerTTS
@@ -503,6 +503,32 @@ async def robo_jev_check(
 
 @mcp.tool()
 @_traced
+async def robo_jev_guard(
+    query: str = "keys",
+    target_x: float | None = None,
+    target_y: float | None = None,
+    camera: str = "top",
+    obstacle_wait_timeout_s: float = 8.0,
+    use_gemini: bool = False,
+) -> dict:
+    """Pause on obstacle until clear & resume; recalibrate on target shift if inside safe bounds."""
+    bridge = await _get_bridge()
+    target_xy = (float(target_x), float(target_y)) if (target_x is not None and target_y is not None) else None
+    return await guarded_recover(
+        gatekeeper=_robo_jev,
+        bridge=bridge,
+        calib=_calib,
+        query=query,
+        obstacles_fn=lambda: list(_obstacles.values()),
+        target_xy=target_xy,
+        camera=camera,
+        obstacle_wait_timeout_s=float(obstacle_wait_timeout_s),
+        use_gemini=use_gemini,
+    )
+
+
+@mcp.tool()
+@_traced
 async def speak_status(text: str) -> dict:
     """Speak a short status cue over the portable speaker (non-blocking TTS)."""
     queued = _tts.speak(text)
@@ -659,6 +685,7 @@ _SEQ_TOOLS = {
     "localize_3d": localize_3d,
     "robo_jev_arm_watch": robo_jev_arm_watch,
     "robo_jev_check": robo_jev_check,
+    "robo_jev_guard": robo_jev_guard,
     "speak_status": speak_status,
     "update_scene_obstacle": update_scene_obstacle,
     "get_calib_status": get_calib_status,
