@@ -13,12 +13,15 @@ from typing import Protocol, runtime_checkable
 
 @dataclass
 class Pose6D:
+    """Metric position and unit orientation quaternion in xyzw order."""
+
     x: float
     y: float
     z: float
-    alpha: float = 0.0  # roll (rad)
-    beta: float = 0.0   # pitch (rad)
-    gamma: float = 0.0  # yaw (rad)
+    qx: float = 0.0
+    qy: float = 0.0
+    qz: float = 0.0
+    qw: float = 1.0
 
 
 @dataclass
@@ -46,29 +49,33 @@ class Detection:
 
 @dataclass
 class IKRequest:
+    """IK target pose with a separate seed joint vector."""
+
     x: float
     y: float
     z: float
-    alpha: float = 0.0
-    beta: float = 0.0
-    gamma: float = 0.0
-    q_curr_rad: list[float] = field(default_factory=list)
+    qx: float = 0.0
+    qy: float = 0.0
+    qz: float = 0.0
+    qw: float = 1.0
+    seed_joints_rad: list[float] = field(default_factory=list)
     obstacles: list[SceneObstacle] = field(default_factory=list)
 
 
 @runtime_checkable
 class IKSolver(Protocol):
-    """Contract for a Pink IK solver (or fallback solver)."""
+    """Contract for a configured Pink IK solver."""
 
     def solve_ik(
         self,
         x: float,
         y: float,
         z: float,
-        alpha: float = 0.0,
-        beta: float = 0.0,
-        gamma: float = 0.0,
-        q_curr_rad: list[float] | None = None,
+        qx: float = 0.0,
+        qy: float = 0.0,
+        qz: float = 0.0,
+        qw: float = 1.0,
+        seed_joints_rad: list[float] | None = None,
         obstacles: list[SceneObstacle] | None = None,
     ) -> list[float]:
         """Return target arm joint angles [j_1, ..., j_N] in radians."""

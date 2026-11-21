@@ -176,13 +176,37 @@ class CalibrationStore:
             out[m.id] = max(lo, min(hi, tick))
         return out
 
+    def joint_angles_to_ticks(self, joints_rad: list[float], motors: list[MotorState]) -> dict[int, int]:
+        """Convert URDF/MCP arm angles (radians) to ST3215 encoder ticks."""
+        return self.rad_to_ticks(joints_rad, motors)
+
+    def ticks_to_joint_angles(self, motors: list[MotorState]) -> list[float]:
+        """Convert ST3215 encoder ticks to URDF/MCP arm angles (radians)."""
+        return self.ticks_to_rad(motors)
+
+    def _urdf_angle_limits(self, n_arm: int) -> list[tuple[float | None, float | None]]:
+        try:
+            urdf = load_urdf(DEFAULT_ELROBOT_URDF)
+            limits = urdf.joint_limits(DEFAULT_ARM_JOINTS)
+            return limits[:n_arm]
+        except Exception:
+            return [(None, None)] * n_arm
+
     def validate_joint_limits(self, joints_rad: list[float], motors: list[MotorState]) -> tuple[bool, str | None]:
         n_arm = self.num_arm_joints(len(motors))
         if len(joints_rad) != n_arm:
             return False, f"expected {n_arm} angles, got {len(joints_rad)}"
-        for m, angle in zip(motors[:n_arm], joints_rad):
+        urdf_limits = self._urdf_angle_limits(n_arm)
+        for index, (m, angle) in enumerate(zip(motors[:n_arm], joints_rad)):
             if not math.isfinite(angle):
                 return False, f"non-finite angle for motor {m.id}"
+            urdf_lo, urdf_hi = urdf_limits[index]
+            if urdf_lo is not None and urdf_hi is not None:
+                if angle < urdf_lo - 1e-6 or angle > urdf_hi + 1e-6:
+                    return False, (
+                        f"motor {m.id} angle {angle:.6f} rad outside URDF limits "
+                        f"[{urdf_lo:.6f}, {urdf_hi:.6f}]"
+                    )
             raw = self._zero_tick(m) + self._sign(m.id) * float(angle) * TICKS_PER_RAD
             lo, hi = (m.range_min, m.range_max) if m.range_max > m.range_min else (0, MAX_ANGLE_STEP)
             if raw < lo - 40 or raw > hi + 40:
