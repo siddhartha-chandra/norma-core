@@ -672,6 +672,7 @@ DASHBOARD_HTML = """<!doctype html>
         ['gpt-4.1', 'gpt-4.1', 'Legacy Vision', 'amber', 'Deprecated 4.1 series']
       ],
       qwen: [
+        ['qwen4-max', 'qwen4-max', 'Frontier Vision', 'green', 'Qwen 4 Max (GA Nov 2026)'],
         ['qwen3.8-max', 'qwen3.8-max', 'Frontier Vision', 'green', 'Top ERQA Qwen3.8 VL'],
         ['qwen3-vl-plus', 'qwen3-vl-plus', 'Balanced Vision', 'green', 'Qwen3 VL spatial grounding'],
         ['qwen-vl-max', 'qwen-vl-max', 'Balanced Vision', 'amber', 'High-res Qwen VL'],

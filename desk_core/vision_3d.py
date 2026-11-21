@@ -34,7 +34,7 @@ DEFAULT_PROVIDER_MODELS: dict[str, str] = {
     "gemini": GEMINI_VISION_MODEL,
     "anthropic": "claude-sonnet-5-5",
     "openai": "gpt-6.1-terra",
-    "qwen": "qwen3.8-max",
+    "qwen": "qwen4-max",
     "deepseek": "deepseek-vl2",
 }
 
@@ -62,7 +62,7 @@ VISION_MODELS_BY_PROVIDER: dict[str, list[str]] = {
         "gpt-5",
         "gpt-4.1",
     ],
-    "qwen": ["qwen3.8-max", "qwen3-vl-plus", "qwen-vl-max", "qwen2.5-vl-72b-instruct"],
+    "qwen": ["qwen4-max", "qwen3.8-max", "qwen3-vl-plus", "qwen-vl-max", "qwen2.5-vl-72b-instruct"],
     "deepseek": ["deepseek-vl2", "deepseek-vl2-small"],
 }
 
@@ -85,6 +85,7 @@ MODEL_RATINGS: dict[str, dict[str, Any]] = {
     "gpt-6-luna": {"tier": "Fast Vision", "color": "amber", "note": "High-volume fast vision"},
     "gpt-5": {"tier": "Legacy Vision", "color": "amber", "note": "Retiring Dec 2026"},
     "gpt-4.1": {"tier": "Legacy Vision", "color": "amber", "note": "Deprecated 4.1 series"},
+    "qwen4-max": {"tier": "Frontier Vision", "color": "green", "note": "Qwen 4 Max (GA Nov 2026)"},
     "qwen3.8-max": {"tier": "Frontier Vision", "color": "green", "note": "Top ERQA Qwen3.8 VL"},
     "qwen3-vl-plus": {"tier": "Balanced Vision", "color": "green", "note": "Qwen3 VL spatial grounding"},
     "qwen-vl-max": {"tier": "Balanced Vision", "color": "amber", "note": "High-res Qwen VL"},
