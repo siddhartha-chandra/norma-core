@@ -234,7 +234,7 @@ async def go_home() -> dict:
     n_arm = _calib.num_arm_joints(len(st.motors))
     mids = {m.id: (m.range_min + m.range_max) // 2 for m in st.motors[:n_arm]}
     applied = await bridge.send_joint_targets(mids, max_step=300)
-    settled = await bridge.wait_settle(applied, timeout_s=4.0)
+    settled = await bridge.wait_settle(applied, tol_ticks=40, timeout_s=4.0)
     return {"home": applied, "settled": settled}
 
 

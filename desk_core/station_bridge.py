@@ -264,6 +264,8 @@ class LiveStationBridge:
         self._frame_buf: dict[str, deque[bytes]] = {}
         self._frame_order: list[str] = []
         self._followed_video_qids: set[str] = set()
+        self._key_to_qid: dict[str, str] = {}
+        self._probe_tasks: dict[str, asyncio.Task] = {}
         self._tasks: list[asyncio.Task] = []
         self._supervisor: asyncio.Task | None = None
         self._queues: dict[str, asyncio.Queue] = {}
@@ -322,13 +324,18 @@ class LiveStationBridge:
         """
         if self.client is None:
             raise RuntimeError("_make_followers() called before connect()")
-        self._queues = {qid: asyncio.Queue() for qid in self._BASE_QUEUES}
+        # When read_from_tail is available (live station_py), poll st3215/inference
+        # on-demand instead of following the 400-800 Hz st3215/rx & st3215/inference
+        # firehoses continuously over Tailscale (which drifts behind by seconds).
+        queues = ("inference-states",) if hasattr(self.client, "read_from_tail") else self._BASE_QUEUES
+        self._queues = {qid: asyncio.Queue() for qid in queues}
         self._video_q = asyncio.Queue()
         self._follow_errors = {}
         for qid, q in self._queues.items():
             self._follow(qid, q)
-        for qid in self._discover_local_video_queues():
-            self._follow_video_queue(qid)
+        if self.host in ("127.0.0.1", "localhost", "::1"):
+            for qid in self._discover_local_video_queues():
+                self._follow_video_queue(qid)
 
     _BASE_QUEUES = ("st3215/inference", "st3215/rx", "inference-states")
 
@@ -338,18 +345,27 @@ class LiveStationBridge:
             self._follow_errors[qid] = err_q
 
     def _start_workers(self) -> None:
-        self._tasks = [
-            asyncio.create_task(self._consume_inference(self._queues["st3215/inference"])),
-            asyncio.create_task(self._consume_rx(self._queues["st3215/rx"])),
-            asyncio.create_task(self._consume_inference_states(self._queues["inference-states"])),
-            asyncio.create_task(self._consume_video(self._video_q)),
-        ]
+        tasks = []
+        if "st3215/inference" in self._queues:
+            tasks.append(asyncio.create_task(self._consume_inference(self._queues["st3215/inference"])))
+        if "st3215/rx" in self._queues:
+            tasks.append(asyncio.create_task(self._consume_rx(self._queues["st3215/rx"])))
+        if "inference-states" in self._queues:
+            tasks.append(asyncio.create_task(self._consume_inference_states(self._queues["inference-states"])))
+        if not hasattr(self.client, "read_from_tail"):
+            tasks.append(asyncio.create_task(self._consume_video(self._video_q)))
+        self._tasks = tasks
 
     def _follow_video_queue(self, qid: str) -> None:
         if qid not in self._followed_video_qids and self.client is not None:
             self._followed_video_qids.add(qid)
-            self._follow(qid, self._video_q)
-            log.info("Following camera queue: %s", qid)
+            # Fetch camera frames on-demand via read_from_tail instead of continuous 30fps
+            # follow(), so ~100 Mbps of MJPEG never congests st3215/rx or commands over Tailscale.
+            if hasattr(self.client, "read_from_tail"):
+                self._probe_tasks[qid] = asyncio.create_task(self._probe_video_queue(qid))
+            else:
+                self._follow(qid, self._video_q)
+            log.info("Registered camera queue: %s", qid)
 
     def _discover_local_video_queues(self, max_age_s: float = 180.0) -> list[str]:
         roots = [
@@ -387,6 +403,13 @@ class LiveStationBridge:
             await asyncio.sleep(self.SUPERVISE_TICK_S)
             if self._resyncing:
                 continue
+            if (
+                hasattr(self.client, "read_from_tail")
+                and self._last_rx_mono is not None
+                and (time.monotonic() - self._last_rx_mono) > RESUBSCRIBE_STALE_S
+                and bool(self.client and self.client.connected and self.client.setup_done)
+            ):
+                await self._poll_inference_tail(timeout_s=2.0)
             reason = self._dead_reason()
             if reason is None:
                 continue
@@ -413,10 +436,11 @@ class LiveStationBridge:
         self._resyncing = True
         log.warning("Station link lost (%s) — auto-resubscribing", reason)
         try:
-            for t in self._tasks:
+            for t in [*self._tasks, *self._probe_tasks.values()]:
                 t.cancel()
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+            await asyncio.gather(*self._tasks, *self._probe_tasks.values(), return_exceptions=True)
             self._tasks = []
+            self._probe_tasks.clear()
             # Block until station_py's manage_connection has re-setup the socket.
             try:
                 await self.client.wait_ready(timeout=self.RECONNECT_WAIT_S)
@@ -474,6 +498,68 @@ class LiveStationBridge:
             except Exception as exc:
                 log.debug("inference-states parse skip: %s", exc)
 
+    def _ingest_inference_bytes(self, raw: bytes | memoryview) -> bool:
+        reader = self._st3215.InferenceStateReader(memoryview(bytes(raw)))
+        updated = False
+        for bus in reader.get_buses():
+            info = bus.get_bus()
+            serial = info.get_serial_number() if info else ""
+            if not serial:
+                continue
+            slot = self._motor_state.setdefault(serial, {})
+            volts: list[float] = []
+            for m in bus.get_motors():
+                sb = bytes(m.get_state())
+                if len(sb) < FULL_STATE_LEN:
+                    continue
+                if sb[RAM_PRESENT_VOLTAGE] > 0:
+                    volts.append(sb[RAM_PRESENT_VOLTAGE] / 10.0)
+                mid = m.get_id()
+                pos = _norm_pos(_u16(sb, RAM_PRESENT_POSITION))
+                cur = _u16(sb, RAM_PRESENT_CURRENT)
+                err = sb[RAM_STATUS]
+                if mid in slot:
+                    slot[mid].position = pos
+                    slot[mid].current_ma = cur
+                    slot[mid].error_status = err
+                    slot[mid].range_min = m.get_range_min()
+                    slot[mid].range_max = m.get_range_max()
+                else:
+                    slot[mid] = MotorState(
+                        mid,
+                        pos,
+                        cur,
+                        m.get_range_min(),
+                        m.get_range_max(),
+                        err,
+                    )
+                updated = True
+            if volts:
+                self._bus_voltage[serial] = sum(volts) / len(volts)
+        return updated
+
+    async def _poll_inference_tail(self, timeout_s: float = 2.0) -> bool:
+        if self.client is None or not hasattr(self.client, "read_from_tail"):
+            return False
+        if not (self.client.connected and self.client.setup_done):
+            return False
+        try:
+            qr = self.client.read_from_tail("st3215/inference", offset=b"\x00", limit=1, step=1, buf_size=4)
+            latest_entry = None
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                rem = max(0.05, deadline - time.monotonic())
+                entry = await asyncio.wait_for(qr.data.get(), timeout=rem)
+                if entry is None:
+                    break
+                latest_entry = entry
+            if latest_entry is not None and self._ingest_inference_bytes(latest_entry.Data):
+                self._last_rx_mono = time.monotonic()
+                return True
+        except Exception as exc:
+            log.debug("tail inference poll failed: %s", exc)
+        return False
+
     async def _consume_inference(self, q: asyncio.Queue) -> None:
         while True:
             entry = await q.get()
@@ -481,35 +567,7 @@ class LiveStationBridge:
                 break
             self._last_rx_mono = time.monotonic()
             try:
-                reader = self._st3215.InferenceStateReader(memoryview(bytes(entry.Data)))
-                for bus in reader.get_buses():
-                    info = bus.get_bus()
-                    serial = info.get_serial_number() if info else ""
-                    if not serial:
-                        continue
-                    slot = self._motor_state.setdefault(serial, {})
-                    volts: list[float] = []
-                    for m in bus.get_motors():
-                        sb = bytes(m.get_state())
-                        if len(sb) < FULL_STATE_LEN:
-                            continue
-                        if sb[RAM_PRESENT_VOLTAGE] > 0:
-                            volts.append(sb[RAM_PRESENT_VOLTAGE] / 10.0)
-                        mid = m.get_id()
-                        if mid in slot:
-                            slot[mid].range_min = m.get_range_min()
-                            slot[mid].range_max = m.get_range_max()
-                        else:
-                            slot[mid] = MotorState(
-                                mid,
-                                _norm_pos(_u16(sb, RAM_PRESENT_POSITION)),
-                                _u16(sb, RAM_PRESENT_CURRENT),
-                                m.get_range_min(),
-                                m.get_range_max(),
-                                sb[RAM_STATUS],
-                            )
-                    if volts:
-                        self._bus_voltage[serial] = sum(volts) / len(volts)
+                self._ingest_inference_bytes(entry.Data)
             except Exception as exc:
                 log.debug("inference parse skip: %s", exc)
 
@@ -542,26 +600,71 @@ class LiveStationBridge:
             except Exception as exc:
                 log.debug("rx parse skip: %s", exc)
 
+    def _extract_jpeg(self, entry) -> tuple[str, bytes] | None:
+        env = self._usbvideo.RxEnvelopeReader(memoryview(bytes(entry.Data)))
+        if env.get_type() != self.ET_FRAMES:
+            return None
+        cam = env.get_camera()
+        key = cam.get_unique_id() or cam.get_serial_number() or cam.get_product() or "cam0"
+        frames = env.get_frames().get_frames_data()
+        if not frames:
+            return None
+        jpeg = next(
+            (bytes(b) for b in reversed(frames) if len(bytes(b)) > 4 and bytes(b)[:2] == b"\xff\xd8" and bytes(b)[-2:] == b"\xff\xd9"),
+            None,
+        )
+        return (key, jpeg) if jpeg is not None else None
+
+    async def _fetch_tail_frames(self, qid: str, count: int = 1, timeout_s: float = 3.0) -> list[tuple[str, bytes]]:
+        if self.client is None or not hasattr(self.client, "read_from_tail"):
+            return []
+        offset = (count - 1).to_bytes(8, "little") if count > 1 else b"\x00"
+        qr = self.client.read_from_tail(qid, offset=offset, limit=count, step=1, buf_size=max(4, count + 2))
+        out: list[tuple[str, bytes]] = []
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            rem = max(0.05, deadline - time.monotonic())
+            try:
+                entry = await asyncio.wait_for(qr.data.get(), timeout=rem)
+            except asyncio.TimeoutError:
+                break
+            if entry is None:
+                break
+            try:
+                parsed = self._extract_jpeg(entry)
+                if parsed is not None:
+                    out.append(parsed)
+            except Exception as exc:
+                log.debug("tail video parse skip: %s", exc)
+        return out
+
+    async def _probe_video_queue(self, qid: str) -> None:
+        try:
+            items = await self._fetch_tail_frames(qid, count=1, timeout_s=3.0)
+            if not items:
+                return
+            key, jpeg = items[-1]
+            self._key_to_qid[key] = qid
+            self._frames[key] = jpeg
+            self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
+            if key not in self._frame_order:
+                self._frame_order.append(key)
+                log.info("Camera discovered: %s (%s)", key, qid)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("camera probe failed for %s: %s", qid, exc)
+
     async def _consume_video(self, q: asyncio.Queue) -> None:
         while True:
             entry = await q.get()
             if entry is None:
                 break
             try:
-                env = self._usbvideo.RxEnvelopeReader(memoryview(bytes(entry.Data)))
-                if env.get_type() != self.ET_FRAMES:
+                parsed = self._extract_jpeg(entry)
+                if parsed is None:
                     continue
-                cam = env.get_camera()
-                key = cam.get_unique_id() or cam.get_serial_number() or cam.get_product() or "cam0"
-                frames = env.get_frames().get_frames_data()
-                if not frames:
-                    continue
-                jpeg = next(
-                    (bytes(b) for b in reversed(frames) if len(bytes(b)) > 4 and bytes(b)[:2] == b"\xff\xd8" and bytes(b)[-2:] == b"\xff\xd9"),
-                    None,
-                )
-                if jpeg is None:
-                    continue
+                key, jpeg = parsed
                 self._frames[key] = jpeg
                 self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
                 if key not in self._frame_order:
@@ -574,7 +677,10 @@ class LiveStationBridge:
         want_cams = 2 if (self._cam_map.get("top") and self._cam_map.get("wrist")) else 1
         settled_since: float | None = None
         for _ in range(int(max_s / 0.1)):
-            if self._motor_state and len(self._frames) >= want_cams:
+            if not self._motor_state and hasattr(self.client, "read_from_tail"):
+                await self._poll_inference_tail(timeout_s=1.0)
+            probes_done = all(t.done() for t in self._probe_tasks.values()) if self._probe_tasks else False
+            if self._motor_state and len(self._frames) >= want_cams and probes_done:
                 break
             if self._motor_state and self._frames:
                 settled_since = settled_since or time.monotonic()
@@ -600,6 +706,8 @@ class LiveStationBridge:
 
     async def get_state(self) -> RobotState:
         for _ in range(50):
+            if hasattr(self.client, "read_from_tail"):
+                await self._poll_inference_tail(timeout_s=1.5)
             if self._motor_state:
                 serial = self._select_bus()
                 motors = sorted(self._motor_state[serial].values(), key=lambda m: m.id)
@@ -631,10 +739,24 @@ class LiveStationBridge:
         if not self._frames:
             raise RuntimeError("No USB video frames received from Station yet.")
         key = self._resolve_cam_key(camera)
+        qid = self._key_to_qid.get(key)
+        if qid:
+            try:
+                items = await self._fetch_tail_frames(qid, count=4 if denoise else 1, timeout_s=3.0)
+                jpegs = [jb for _k, jb in items]
+                if jpegs:
+                    self._frames[key] = jpegs[-1]
+                    buf = self._frame_buf.setdefault(key, deque(maxlen=7))
+                    buf.extend(jpegs)
+                    if denoise and len(jpegs) >= 3:
+                        return await asyncio.to_thread(_cleanest_frame, jpegs[-4:])
+                    return jpegs[-1]
+            except Exception as exc:
+                log.debug("on-demand camera fetch failed for %s: %s", key, exc)
         if denoise:
             buf = list(self._frame_buf.get(key, ()))
             if len(buf) >= 3:
-                return _cleanest_frame(buf)
+                return await asyncio.to_thread(_cleanest_frame, buf)
         return self._frames[key]
 
     def _sync_write(self, bus_serial: str, address: int, values: dict[int, bytes]):
@@ -651,6 +773,8 @@ class LiveStationBridge:
 
     async def set_torque(self, enable: bool, motor_ids: list[int] | None = None) -> bool:
         if enable:
+            if hasattr(self.client, "read_from_tail"):
+                await self._poll_inference_tail(timeout_s=1.0)
             # Safe-start writes Goal=Present; both must come from live telemetry.
             self._require_fresh()
         st = await self.get_state()
@@ -670,6 +794,8 @@ class LiveStationBridge:
         return True
 
     async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP) -> dict[int, int]:
+        if hasattr(self.client, "read_from_tail"):
+            await self._poll_inference_tail(timeout_s=1.0)
         self._require_fresh()
         st = await self.get_state()
         by_id = {m.id: m for m in st.motors}
@@ -729,6 +855,8 @@ class LiveStationBridge:
         # Hold Position uses live PresentPosition when fresh (prevents jumping
         # by unseen drift); if telemetry is stale, drop torque safely instead
         # of refusing an emergency stop.
+        if hasattr(self.client, "read_from_tail"):
+            await self._poll_inference_tail(timeout_s=1.0)
         try:
             self._require_fresh()
         except RuntimeError as exc:

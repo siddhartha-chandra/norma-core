@@ -108,7 +108,7 @@ async def run_sequence(session: ClientSession, live: bool) -> None:
           f"{j1} -> {applied.get('1')} ({ms*1000:.0f} ms)")
     if live:
         st_after, _ = await call(session, "get_state", {})
-        pos_after = next((m["position"] for m in st_after["joints"] if m["id"] == 1), j1)
+        pos_after = next((m["position"] for m in st_after.get("motors", []) if m["id"] == 1), j1)
         check("live motor 1 physically moved toward target", abs(pos_after - j1) >= 40,
               f"{j1} -> {pos_after} (target={target}, settled={data.get('settled')})")
 
@@ -138,7 +138,8 @@ def verify_run_log(live: bool) -> Path:
     check("run log starts with run_start meta", events[:1] == ["run_start"])
     calls = [r for r in recs if r["event"] == "tool_call"]
     tools = [c["tool"] for c in calls]
-    check("run log replays full tool sequence", tools == SEQUENCE, " vs ".join(tools))
+    expected_seq = ["observe", "move_joints", "get_state", "grasp", "release", "go_home", "estop"] if live else SEQUENCE
+    check("run log replays full tool sequence", tools == expected_seq, " vs ".join(tools))
     check("every logged call succeeded", all(c["ok"] for c in calls))
     check("every call has duration_ms", all("duration_ms" in c for c in calls))
     images = calls[0].get("images", [])
