@@ -23,30 +23,33 @@ TICKS_PER_RAD = (MAX_ANGLE_STEP + 1) / (2.0 * math.pi)
 RIG_CALIB_PATH = REPO_ROOT / "calib" / "rig_calib.json"
 
 
-def resolve_default_calib_path() -> Path:
-    """Resolve active calibration JSON path.
+CAMERA_ONLY_KEYS = {
+    "K_top",
+    "dist_top",
+    "image_size_top",
+    "K_wrist",
+    "dist_wrist",
+    "image_size_wrist",
+    "top",
+    "scene",
+    "wrist",
+}
 
-    Priority when `DESK_CALIB_PATH` env var is unset:
-      1. `calib/rig_calib.json` if it exists and has `calibrated == true`.
-      2. Newest `calib_frames/*/camera_calibration.json` if present (camera intrinsics output).
-      3. `calib/rig_calib.json` (nominal tracked contract).
-    """
-    env_p = os.environ.get("DESK_CALIB_PATH", "").strip()
-    if env_p:
-        return Path(env_p)
-    if RIG_CALIB_PATH.exists():
-        try:
-            rig_raw = json.loads(RIG_CALIB_PATH.read_text(encoding="utf-8"))
-            if rig_raw.get("calibrated"):
-                return RIG_CALIB_PATH
-        except Exception:
-            pass
+
+def resolve_camera_calib_path() -> Path | None:
+    """Return newest `calib_frames/*/camera_calibration.json` if present."""
     cam_calibs = sorted(
         (REPO_ROOT / "calib_frames").glob("*/camera_calibration.json"),
         key=lambda p: p.stat().st_mtime,
     )
-    if cam_calibs:
-        return cam_calibs[-1]
+    return cam_calibs[-1] if cam_calibs else None
+
+
+def resolve_default_calib_path() -> Path:
+    """Resolve active rig calibration JSON path (`DESK_CALIB_PATH` or `calib/rig_calib.json`)."""
+    env_p = os.environ.get("DESK_CALIB_PATH", "").strip()
+    if env_p:
+        return Path(env_p)
     return RIG_CALIB_PATH
 
 
@@ -88,18 +91,35 @@ class CalibrationStore:
     def __init__(self, path: Path | None = None):
         self._explicit_path = Path(path) if path is not None else None
         self.path = self._explicit_path or resolve_default_calib_path()
+        self.camera_calib_path: Path | None = None
         self.data: dict[str, Any] = {}
         self._custom_depth_fn = None
         self.reload()
 
     def reload(self) -> dict[str, Any]:
+        env_p = os.environ.get("DESK_CALIB_PATH", "").strip()
         if self._explicit_path is None:
             self.path = resolve_default_calib_path()
         if self.path.exists():
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            self.data = _normalize_calib_dict(raw)
+            merged = _normalize_calib_dict(raw)
         else:
-            self.data = {}
+            merged = {}
+
+        # Overlay camera-only calibration (intrinsics/distortion) from camera_calibration.json
+        # while keeping all rig/robot/extrinsic settings from rig_calib.json.
+        self.camera_calib_path = None
+        if self._explicit_path is None and not env_p:
+            cam_path = resolve_camera_calib_path()
+            if cam_path is not None and cam_path.exists():
+                cam_raw = json.loads(cam_path.read_text(encoding="utf-8"))
+                cam_norm = _normalize_calib_dict(cam_raw)
+                for k in CAMERA_ONLY_KEYS:
+                    if k in cam_norm:
+                        merged[k] = cam_norm[k]
+                self.camera_calib_path = cam_path
+
+        self.data = merged
         self._load_depth_hook()
         return self.status()
 
@@ -393,6 +413,7 @@ class CalibrationStore:
         calibrated_flag = bool(self.data["calibrated"]) if "calibrated" in self.data else (len(missing) == 0)
         return {
             "calib_file": str(self.path),
+            "camera_calib_file": str(self.camera_calib_path) if self.camera_calib_path else None,
             "calib_loaded": self.path.exists(),
             "calibrated": calibrated_flag,
             "arm_type": self.data.get("arm_type", "elrobot-7dof-nominal"),
