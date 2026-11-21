@@ -94,7 +94,7 @@ async def main() -> int:
                 for req in [
                     "move_joint", "get_frame", "solve_ik", "get_joint_angles", "get_metric_depth",
                     "move_to_pose", "pick_at", "place_at", "pick_pixel", "execute_sequence",
-                    "pixel_to_world", "update_scene_obstacle", "get_calib_status", "reload_config",
+                    "pixel_to_world", "localize_3d", "update_scene_obstacle", "get_calib_status", "reload_config",
                 ]:
                     check(f"tool exposed: {req}", req in tools)
 
@@ -167,6 +167,62 @@ async def main() -> int:
 
                 pix_res = _parse(await session.call_tool("pick_pixel", {"x": 180.0, "y": 310.0, "camera": "top"}))
                 check("pick_pixel composite passes", pix_res.get("ok") is True and "world" in pix_res, str(pix_res.get("world")))
+
+                # 7. localize_3d MCP tool (OpenCV fallback when GEMINI_API_KEY unset)
+                loc_mcp = _parse(await session.call_tool("localize_3d", {"query": "keys", "camera": "top", "use_gemini": False}))
+                check(
+                    "localize_3d MCP tool returns 6D pose + box_2d",
+                    loc_mcp.get("backend") == "opencv-fallback" and "world" in loc_mcp and "pose_6d" in loc_mcp and len(loc_mcp.get("box_2d", [])) == 4,
+                    str(loc_mcp.get("world")),
+                )
+
+        # 8. Direct vision_3d unit tests: orange servo horn masking + Gemini response schema
+        import cv2
+        from unittest.mock import patch
+        from desk_core.calib_store import CalibrationStore
+        from desk_core.vision_3d import localize_object_3d
+
+        cs_vis = CalibrationStore(calib_path)
+        canvas = np.full((480, 640, 3), 230, dtype=np.uint8)
+        # Draw big orange servo horn on left (should be masked!)
+        cv2.rectangle(canvas, (60, 120), (200, 340), (20, 120, 250), -1)  # BGR orange
+        # Draw smaller blue key fob on right (should be detected!)
+        cv2.rectangle(canvas, (440, 200), (540, 280), (210, 70, 20), -1)  # BGR blue
+        ok_enc, buf = cv2.imencode(".jpg", canvas)
+        assert ok_enc
+        scene_jpeg = buf.tobytes()
+
+        res_cv = await localize_object_3d(scene_jpeg, "keys", cs_vis, use_gemini=False)
+        check(
+            "opencv fallback masks orange servo horn & finds target",
+            res_cv["found"] and res_cv["backend"] == "opencv-fallback" and 440 <= res_cv["pixel"][0] <= 540,
+            f"pixel={res_cv['pixel']} world={res_cv['world']}",
+        )
+
+        class _FakeInteraction:
+            output_text = json.dumps({
+                "found": True,
+                "label": "silicone key fob",
+                "point": [500, 765],
+                "box_2d": [416, 687, 583, 843],
+                "yaw_deg": 15.0,
+                "confidence": 0.96,
+            })
+
+        with patch("desk_core.vision_3d._call_gemini_interactions_sync", return_value={
+            "found": True,
+            "label": "silicone key fob",
+            "point": [500, 765],
+            "box_2d": [416, 687, 583, 843],
+            "yaw_deg": 15.0,
+            "confidence": 0.96,
+        }):
+            res_gem = await localize_object_3d(scene_jpeg, "keys", cs_vis, use_gemini=True)
+            check(
+                "gemini-4-hydrogen path maps [y,x] 0-1000 to metric 6D pose",
+                res_gem["found"] and res_gem["backend"] == "gemini-4-hydrogen" and abs(res_gem["pixel"][0] - 489.6) < 1.0 and abs(res_gem["yaw_rad"] - np.deg2rad(15.0)) < 1e-3,
+                f"pixel={res_gem['pixel']} pose_6d={res_gem['pose_6d']}",
+            )
 
     print("\nPRIMITIVES & COMPOSITE MCP PASS")
     return 0
