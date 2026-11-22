@@ -1,7 +1,8 @@
 """DESK-CORE FastMCP Server — connects Claude Code and Codex to NormaCore Station.
 
 Exposes:
-  1. Bare-bone hardware primitives: observe, get_state, set_torque, move_joints, grasp, release, go_home, estop
+  1. Bare-bone hardware primitives: observe, get_state, set_torque, move_joints, grasp, release, go_home,
+     move_to_home, estop
   2. Core robotics primitives: move_joint, get_frame, solve_ik, get_joint_angles, get_metric_depth
   3. Calibration & scene tools: pixel_to_world, update_scene_obstacle, get_calib_status, reload_config
   4. Composite execution tools: move_to_pose, move_flange, pick_at, place_at, pick_pixel, execute_sequence
@@ -55,6 +56,7 @@ _robo_jev = RoboJevGatekeeper()
 _tts = SpeakerTTS()
 
 RUNS_DIR = Path(os.environ.get("DESK_RUNS_DIR") or (REPO_ROOT / "runs"))
+FIXED_POSITIONS_PATH = REPO_ROOT / "calib" / "fixed_positions.json"
 _logger: RunLogger | None = None
 _frame_seq = 0
 
@@ -244,6 +246,39 @@ async def go_home() -> dict:
     if hasattr(bridge, "set_mock_ee_pose"):
         bridge.set_mock_ee_pose(0.28, 0.0, 0.25)
     return {"home": applied, "settled": settled}
+
+
+@mcp.tool()
+@_traced
+async def move_to_home(max_step: int = DEFAULT_MAX_STEP, timeout_s: float = 30.0) -> dict:
+    """Move the arm straight to the saved "home" joint ticks in calib/fixed_positions.json.
+
+    No IK and no trajectory planning: arm joints are stepped toward the stored ticks, at most ``max_step``
+    ticks per command, until every joint is within 40 ticks of home or ``timeout_s`` runs out. Joints move
+    independently, so the path between poses is not collision-checked. The gripper is left as it is.
+    """
+    home = json.loads(FIXED_POSITIONS_PATH.read_text())["home"]
+    bridge = await _get_bridge()
+    motors = {m.id: m for m in (await bridge.get_state()).motors}
+    targets, clamped = {}, {}
+    for mid, ticks in ((int(k), int(v)) for k, v in home["joint_ticks"].items()):
+        m = motors.get(mid)
+        lo, hi = (m.range_min, m.range_max) if m is not None and m.range_max > m.range_min else (ticks, ticks)
+        targets[mid] = max(lo, min(hi, ticks))
+        if targets[mid] != ticks:
+            clamped[mid] = ticks
+    deadline = time.monotonic() + timeout_s
+    settled = False
+    while time.monotonic() < deadline:
+        positions = (await bridge.get_state()).positions()
+        if all(abs(positions.get(mid, tgt) - tgt) <= 40 for mid, tgt in targets.items()):
+            settled = True
+            break
+        applied = await bridge.send_joint_targets(targets, max_step=max_step)
+        await bridge.wait_settle(applied, tol_ticks=40, timeout_s=min(3.0, max(0.1, deadline - time.monotonic())))
+    final = (await bridge.get_state()).positions()
+    return {"settled": settled, "home_ticks": targets, "clamped_from": clamped,
+            "final_ticks": {mid: final.get(mid) for mid in targets}}
 
 
 @mcp.tool()
@@ -853,6 +888,7 @@ _SEQ_TOOLS = {
     "grasp": grasp,
     "release": release,
     "go_home": go_home,
+    "move_to_home": move_to_home,
     "estop": estop,
     "move_to_pose": move_to_pose,
     "move_flange": move_flange,
