@@ -290,9 +290,10 @@ async def release() -> dict:
         if abs(motor.position - target_open) <= 25:
             released = bridge.release_mock_object() if hasattr(bridge, "release_mock_object") else None
             return {**result, "ok": True, "released": True, "released_object": released}
+        before = motor.position
         applied = await bridge.send_joint_targets({gripper_id: target_open}, max_step=DEFAULT_MAX_STEP)
         step = applied.get(gripper_id)
-        if step is None or step == motor.position or not await bridge.wait_settle({gripper_id: step}, timeout_s=2.0):
+        if step is None or step == before or not await bridge.wait_settle({gripper_id: step}, timeout_s=2.0):
             return {**result, "reason": "Gripper did not settle at the commanded open step"}
     return {**result, "reason": "Gripper did not reach the open target"}
 

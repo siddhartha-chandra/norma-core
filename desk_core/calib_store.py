@@ -174,14 +174,20 @@ class CalibrationStore:
 
     def bounds_rad(self, motors: list[MotorState]) -> list[tuple[float, float]]:
         n_arm = self.num_arm_joints(len(motors))
+        urdf_limits = self._urdf_angle_limits(n_arm)
         out: list[tuple[float, float]] = []
-        for m in motors[:n_arm]:
+        for index, m in enumerate(motors[:n_arm]):
             lo_t, hi_t = (m.range_min, m.range_max) if m.range_max > m.range_min else (0, MAX_ANGLE_STEP)
             z = self._zero_tick(m)
             s = self._sign(m.id)
             a = s * (lo_t - z) / TICKS_PER_RAD
             b = s * (hi_t - z) / TICKS_PER_RAD
-            out.append((min(a, b), max(a, b)))
+            lo, hi = min(a, b), max(a, b)
+            # validate_joint_limits also enforces the URDF limits, so planners must not propose targets beyond them.
+            urdf_lo, urdf_hi = urdf_limits[index]
+            if urdf_lo is not None and urdf_hi is not None and max(lo, urdf_lo) < min(hi, urdf_hi):
+                lo, hi = max(lo, urdf_lo), min(hi, urdf_hi)
+            out.append((lo, hi))
         return out
 
     def rad_to_ticks(self, joints_rad: list[float], motors: list[MotorState]) -> dict[int, int]:
