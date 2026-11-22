@@ -35,7 +35,7 @@ DEFAULT_PROVIDER_MODELS: dict[str, str] = {
     "anthropic": "claude-sonnet-5-5",
     "openai": "gpt-6.1-terra",
     "qwen": "qwen4-max",
-    "deepseek": "deepseek-vl2",
+    "deepseek": "deepseek-flash",
 }
 
 VISION_MODELS_BY_PROVIDER: dict[str, list[str]] = {
@@ -63,7 +63,7 @@ VISION_MODELS_BY_PROVIDER: dict[str, list[str]] = {
         "gpt-4.1",
     ],
     "qwen": ["qwen4-max", "qwen3.8-max", "qwen3-vl-plus", "qwen-vl-max", "qwen2.5-vl-72b-instruct"],
-    "deepseek": ["deepseek-vl2", "deepseek-vl2-small"],
+    "deepseek": ["deepseek-flash", "deepseek-vl2", "deepseek-vl2-small"],
 }
 
 # Documented capability tiers (no fabricated benchmark percentages; use /api/vision/verify for live measured accuracy)
@@ -90,6 +90,7 @@ MODEL_RATINGS: dict[str, dict[str, Any]] = {
     "qwen3-vl-plus": {"tier": "Balanced Vision", "color": "green", "note": "Qwen3 VL spatial grounding"},
     "qwen-vl-max": {"tier": "Balanced Vision", "color": "amber", "note": "High-res Qwen VL"},
     "qwen2.5-vl-72b-instruct": {"tier": "Open-Weight VL", "color": "amber", "note": "Qwen 2.5 VL 72B"},
+    "deepseek-flash": {"tier": "Frontier Vision", "color": "green", "note": "DeepSeek-V4.1-Flash-1017 (Multimodal, 1M)"},
     "deepseek-vl2": {"tier": "VL2 Endpoint", "color": "amber", "note": "Requires VL2-compatible host"},
     "deepseek-vl2-small": {"tier": "Compact VL2", "color": "amber", "note": "Requires VL2-compatible host"},
     "opencv-fallback": {"tier": "Offline Heuristic", "color": "red", "note": "No semantic understanding"},
@@ -367,7 +368,7 @@ def _call_anthropic_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str,
     b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
     payload = {
         "model": model,
-        "max_tokens": 300,
+        "max_tokens": 2048,
         "messages": [
             {
                 "role": "user",
@@ -414,7 +415,7 @@ def _call_openai_compat_sync(
     b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
     payload = {
         "model": model,
-        "max_tokens": 300,
+        "max_tokens": 2048,
         "messages": [
             {
                 "role": "user",
@@ -470,10 +471,12 @@ def _call_vlm_sync(jpeg_bytes: bytes, query: str, provider: str, model: str) -> 
         return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "OpenAI")
     if provider == "qwen":
         key = _get_api_key("qwen")
-        url = os.environ.get(
-            "QWEN_BASE_URL",
-            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-        ).rstrip("/") + "/chat/completions"
+        default_qwen_url = (
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+            if key.startswith("sk-sp-")
+            else "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        )
+        url = os.environ.get("QWEN_BASE_URL", default_qwen_url).rstrip("/") + "/chat/completions"
         return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "Qwen")
     if provider == "deepseek":
         key = _get_api_key("deepseek")
@@ -565,3 +568,157 @@ async def localize_object_3d(
         "size_m": [w_m, h_m],
         "confidence": round(float(det.get("confidence", 0.0)), 3),
     }
+
+
+def triangulate_two_rays(
+    calib: CalibrationStore,
+    px_top: float,
+    py_top: float,
+    px_wrist: float,
+    py_wrist: float,
+    q_rad: list[float] | np.ndarray | None = None,
+) -> tuple[tuple[float, float, float] | None, float | None]:
+    """Triangulate 3D world point from simultaneous `top` and `wrist` (gripper) pixel detections."""
+    T_top = calib.T_world_cam("top")
+    T_wrist = calib.T_world_cam("wrist", q_rad=q_rad)
+    if T_top is None or T_wrist is None:
+        return None, None
+
+    r1 = T_top[:3, :3] @ calib._ray_cam(px_top, py_top, "top")
+    r2 = T_wrist[:3, :3] @ calib._ray_cam(px_wrist, py_wrist, "wrist")
+    n1 = float(np.linalg.norm(r1))
+    n2 = float(np.linalg.norm(r2))
+    if n1 < 1e-8 or n2 < 1e-8:
+        return None, None
+    d1 = r1 / n1
+    d2 = r2 / n2
+    o1 = T_top[:3, 3]
+    o2 = T_wrist[:3, 3]
+
+    b = float(np.dot(d1, d2))
+    denom = 1.0 - b * b
+    if denom < 1e-4:
+        return None, None
+
+    r = o1 - o2
+    d = float(np.dot(d1, r))
+    e = float(np.dot(d2, r))
+    s1 = (b * e - d) / denom
+    s2 = (e - b * d) / denom
+    if s1 <= 0.05 or s2 <= 0.02:
+        return None, None
+
+    p1 = o1 + s1 * d1
+    p2 = o2 + s2 * d2
+    gap = float(np.linalg.norm(p1 - p2))
+    mid = 0.5 * (p1 + p2)
+    if gap > 0.25 or abs(float(mid[2]) - calib.z_table()) > 0.6:
+        return None, None
+
+    return (round(float(mid[0]), 5), round(float(mid[1]), 5), round(float(mid[2]), 5)), round(gap, 5)
+
+
+async def localize_object_3d_dual(
+    top_jpeg: bytes,
+    wrist_jpeg: bytes,
+    query: str,
+    calib: CalibrationStore,
+    q_rad: list[float] | None = None,
+    z_m: float | None = None,
+    use_gemini: bool = True,
+    timeout_s: float = 12.0,
+    model: str | None = None,
+    provider: str = "auto",
+) -> dict[str, Any]:
+    """Localize `query` using both `top` and `wrist` (gripper eye-in-hand) views and fuse into 3D."""
+    det_top, det_wrist = await asyncio.gather(
+        localize_object_3d(
+            jpeg_bytes=top_jpeg,
+            query=query,
+            calib=calib,
+            camera="top",
+            q_rad=q_rad,
+            z_m=z_m,
+            use_gemini=use_gemini,
+            timeout_s=timeout_s,
+            model=model,
+            provider=provider,
+        ),
+        localize_object_3d(
+            jpeg_bytes=wrist_jpeg,
+            query=query,
+            calib=calib,
+            camera="wrist",
+            q_rad=q_rad,
+            z_m=z_m,
+            use_gemini=use_gemini,
+            timeout_s=timeout_s,
+            model=model,
+            provider=provider,
+        ),
+    )
+
+    found_top = bool(det_top.get("found"))
+    found_wrist = bool(det_wrist.get("found"))
+    ray_gap_m: float | None = None
+
+    if found_top and found_wrist:
+        primary = det_top
+        tri_xyz, ray_gap_m = (
+            triangulate_two_rays(
+                calib,
+                det_top["pixel"][0],
+                det_top["pixel"][1],
+                det_wrist["pixel"][0],
+                det_wrist["pixel"][1],
+                q_rad=q_rad,
+            )
+            if z_m is None
+            else (None, None)
+        )
+        if tri_xyz is not None:
+            wx, wy, wz = tri_xyz
+            fusion_mode = "triangulated"
+        else:
+            w_top = max(0.1, float(det_top.get("confidence", 0.5)))
+            w_wrist = max(0.1, float(det_wrist.get("confidence", 0.5)))
+            if "T_ee_cam_wrist" not in calib.data and "T_world_cam_wrist" not in calib.data:
+                w_wrist *= 0.25
+            tot = w_top + w_wrist
+            wt, ww = det_top["world"], det_wrist["world"]
+            wx = round((w_top * wt["x"] + w_wrist * ww["x"]) / tot, 5)
+            wy = round((w_top * wt["y"] + w_wrist * ww["y"]) / tot, 5)
+            wz = round((w_top * wt["z"] + w_wrist * ww["z"]) / tot, 5)
+            fusion_mode = "confidence_weighted"
+        conf = round(max(float(det_top.get("confidence", 0.0)), float(det_wrist.get("confidence", 0.0))), 3)
+    elif found_top:
+        primary = det_top
+        wx, wy, wz = det_top["world"]["x"], det_top["world"]["y"], det_top["world"]["z"]
+        fusion_mode = "single_view_top"
+        conf = float(det_top.get("confidence", 0.0))
+    elif found_wrist:
+        primary = det_wrist
+        wx, wy, wz = det_wrist["world"]["x"], det_wrist["world"]["y"], det_wrist["world"]["z"]
+        fusion_mode = "single_view_wrist"
+        conf = float(det_wrist.get("confidence", 0.0))
+    else:
+        primary = det_top
+        wx, wy, wz = det_top["world"]["x"], det_top["world"]["y"], det_top["world"]["z"]
+        fusion_mode = "none"
+        conf = 0.0
+
+    out = dict(primary)
+    out["camera"] = "both"
+    out["found"] = found_top or found_wrist
+    out["fusion_mode"] = fusion_mode
+    out["ray_gap_m"] = ray_gap_m
+    out["confidence"] = conf
+    out["world"] = {"x": wx, "y": wy, "z": wz}
+    out["pose_6d"] = {
+        **primary["pose_6d"],
+        "x": wx,
+        "y": wy,
+        "z": wz,
+    }
+    out["views"] = {"top": det_top, "wrist": det_wrist}
+    return out

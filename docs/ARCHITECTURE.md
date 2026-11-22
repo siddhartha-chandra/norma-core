@@ -12,7 +12,7 @@ Only **one laptop** (the Rig Host) connects by USB to the robot and cameras. Eve
 flowchart TD
     subgraph RIG["1. Rig Host Laptop (USB Connected)"]
         Robot["ElRobot Arm (ST3215 Motors 1..7 + Gripper 8)"]
-        Cams["Top Cam ('scene') + Wrist Cam ('wrist')"]
+        Cams["Top Cam ('scene') + Gripper Eye-in-Hand Cam ('wrist' view id)"]
         Station["NormaCore Station (./scripts/run_station.sh, TCP :8888)"]
         Robot <--> Station
         Cams --> Station
@@ -80,7 +80,7 @@ Check `.env` first:
 
 #### 1. "Check the robot, show me what's on the desk, and tell me the current joint angles."
 Claude calls:
-1. `observe()` -> returns top + wrist camera images, link freshness (`rx_age_ms`), and all 8 servo positions.
+1. `observe()` -> returns top + gripper eye-in-hand (`wrist` view) images, link freshness (`rx_age_ms`), and all 8 servo positions.
 2. `get_joint_angles()` -> converts ST3215 ticks to radians `[j_1, ..., j_7]` via `calib_store.py`.
 3. `get_calib_status()` -> confirms whether `rig_calib.json` / `camera_calibration.json`, Pink IK, and `urdf_fk` are loaded.
 

@@ -1,7 +1,7 @@
 """DESK-CORE Mission Control FastAPI Dashboard (issue #14).
 
 Serves a high-contrast Mission Control web UI on http://127.0.0.1:8765 with:
-  - Live Top (with optional localize_3d / Robo-Jev ROI overlay) & Wrist camera feeds
+  - Live Top (with optional localize_3d / Robo-Jev ROI overlay) & gripper eye-in-hand feeds (the "wrist" view; there is no dedicated wrist camera)
   - Prominent red E-STOP button (`POST /api/estop`)
   - Robo-Jev <150 ms reflex meters (`target_shifted`, `path_clear`, `will_tip`, `grasp_secure`)
   - Live ST3215 joint telemetry & link health
@@ -31,7 +31,15 @@ from pydantic import BaseModel
 
 from . import mcp_server as srv
 from .robo_jev import check_reflex_and_abort, guarded_recover
-from .vision_3d import DEFAULT_PROVIDER_MODELS, MODEL_RATINGS, VISION_MODELS_BY_PROVIDER, _get_api_key, _load_keystore, localize_object_3d
+from .vision_3d import (
+    DEFAULT_PROVIDER_MODELS,
+    MODEL_RATINGS,
+    VISION_MODELS_BY_PROVIDER,
+    _get_api_key,
+    _load_keystore,
+    localize_object_3d,
+    localize_object_3d_dual,
+)
 
 app = FastAPI(title="DESK-CORE Mission Control")
 
@@ -51,7 +59,7 @@ def _log_event(kind: str, detail: str, ok: bool = True) -> None:
 
 class LocalizeReq(BaseModel):
     query: str = "keys"
-    camera: str = "top"
+    camera: str = "both"
     use_gemini: bool = True
     provider: str = "auto"
     model: str | None = None
@@ -122,23 +130,32 @@ async def api_frame(camera: str) -> Response:
     bridge = await srv._get_bridge()
     jpeg = await bridge.get_frame(camera, denoise=False)
 
-    if camera == "top" and (_last_detection or srv._robo_jev.watch):
+    view_det = None
+    if _last_detection:
+        views = _last_detection.get("views")
+        if isinstance(views, dict) and camera in views:
+            view_det = views[camera]
+        elif _last_detection.get("camera") == camera:
+            view_det = _last_detection
+
+    if (view_det and view_det.get("found")) or (camera == "top" and srv._robo_jev.watch):
         arr = np.frombuffer(jpeg, dtype=np.uint8)
         bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if bgr is not None:
             h, w = bgr.shape[:2]
-            if _last_detection and _last_detection.get("found"):
-                ymin, xmin, ymax, xmax = _last_detection["box_2d"]
+            if view_det and view_det.get("found"):
+                ymin, xmin, ymax, xmax = view_det["box_2d"]
                 p1 = (int(xmin / 1000.0 * w), int(ymin / 1000.0 * h))
                 p2 = (int(xmax / 1000.0 * w), int(ymax / 1000.0 * h))
-                px = int(round(_last_detection["pixel"][0]))
-                py = int(round(_last_detection["pixel"][1]))
+                px = int(round(view_det["pixel"][0]))
+                py = int(round(view_det["pixel"][1]))
                 cv2.rectangle(bgr, p1, p2, (0, 230, 118), 2)
                 cv2.circle(bgr, (px, py), 6, (0, 230, 118), -1)
-                lbl = f"{_last_detection['label']} [{_last_detection.get('backend', '?')}] ({_last_detection['world']['x']:.2f}, {_last_detection['world']['y']:.2f}m)"
+                world_src = _last_detection if _last_detection.get("camera") == "both" else view_det
+                lbl = f"{view_det['label']} [{view_det.get('backend', '?')}] ({world_src['world']['x']:.2f}, {world_src['world']['y']:.2f}m)"
                 cv2.putText(bgr, lbl, (p1[0], max(20, p1[1] - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 118), 2)
 
-            if srv._robo_jev.watch is not None:
+            if camera == "top" and srv._robo_jev.watch is not None:
                 wx1, wy1, wx2, wy2 = srv._robo_jev.watch.box_px
                 col = (0, 60, 255) if srv._robo_jev.last_report.get("target_shifted") else (0, 200, 255)
                 cv2.rectangle(bgr, (wx1, wy1), (wx2, wy2), col, 2)
@@ -164,19 +181,39 @@ async def api_estop() -> dict[str, Any]:
 async def api_localize(req: LocalizeReq) -> dict[str, Any]:
     global _last_detection
     bridge = await srv._get_bridge()
-    jpeg = await bridge.get_frame(req.camera, denoise=True)
-    det = await localize_object_3d(
-        jpeg_bytes=jpeg,
-        query=req.query,
-        calib=srv._calib,
-        camera=req.camera,
-        use_gemini=req.use_gemini,
-        model=req.model,
-        provider=req.provider,
-    )
+    if req.camera in ("both", "dual"):
+        top_jpeg, wrist_jpeg = await asyncio.gather(
+            bridge.get_frame("top", denoise=True),
+            bridge.get_frame("wrist", denoise=True),
+        )
+        q = await srv._live_arm_q(None, "wrist")
+        det = await localize_object_3d_dual(
+            top_jpeg=top_jpeg,
+            wrist_jpeg=wrist_jpeg,
+            query=req.query,
+            calib=srv._calib,
+            q_rad=q,
+            use_gemini=req.use_gemini,
+            model=req.model,
+            provider=req.provider,
+        )
+    else:
+        jpeg = await bridge.get_frame(req.camera, denoise=True)
+        q = await srv._live_arm_q(None, req.camera)
+        det = await localize_object_3d(
+            jpeg_bytes=jpeg,
+            query=req.query,
+            calib=srv._calib,
+            camera=req.camera,
+            q_rad=q,
+            use_gemini=req.use_gemini,
+            model=req.model,
+            provider=req.provider,
+        )
     _last_detection = det
     fb = f" ({det['fallback_reason']})" if det.get("fallback_reason") else ""
-    _log_event("LOCALIZE", f"{req.query} via {det['backend']}{fb} -> {det['world']}", ok=det["found"])
+    mode = f" [{det['fusion_mode']}]" if det.get("fusion_mode") else ""
+    _log_event("LOCALIZE", f"{req.query} via {det['backend']}{mode}{fb} -> {det['world']}", ok=det["found"])
     return det
 
 
@@ -589,12 +626,17 @@ DASHBOARD_HTML = """<!doctype html>
           <img id="cam-top" src="/api/frame/top.jpg" alt="top" />
         </div>
         <div class="cam-box">
-          <div class="cam-label">WRIST EYE-IN-HAND</div>
+          <div class="cam-label">GRIPPER EYE-IN-HAND (camera id: wrist)</div>
           <img id="cam-wrist" src="/api/frame/wrist.jpg" alt="wrist" />
         </div>
       </div>
       <div class="row">
         <input id="loc-query" type="text" value="keys" placeholder="Object query (keys, mug, marker...)" />
+        <select id="loc-camera" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;">
+          <option value="both">Both Views (Top + Gripper)</option>
+          <option value="top">Top View</option>
+          <option value="wrist">Gripper View (wrist)</option>
+        </select>
         <select id="loc-provider" onchange="syncVisionModels()" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;">
           <option value="auto">Auto (Env/Keystore)</option>
           <option value="gemini">Gemini</option>
@@ -689,6 +731,7 @@ DASHBOARD_HTML = """<!doctype html>
         ['qwen2.5-vl-72b-instruct', 'qwen2.5-vl-72b-instruct', 'Open-Weight VL', 'amber', 'Qwen 2.5 VL 72B']
       ],
       deepseek: [
+        ['deepseek-flash', 'deepseek-flash', 'Frontier Vision', 'green', 'DeepSeek-V4.1-Flash-1017 (Multimodal, 1M)'],
         ['deepseek-vl2', 'deepseek-vl2', 'VL2 Endpoint', 'amber', 'Requires VL2-compatible host'],
         ['deepseek-vl2-small', 'deepseek-vl2-small', 'Compact VL2', 'amber', 'Requires VL2-compatible host']
       ],
@@ -773,10 +816,12 @@ DASHBOARD_HTML = """<!doctype html>
     refreshKeys();
 
     async function runLocalize() {
+      const cam = document.getElementById('loc-camera').value || 'both';
       const prov = document.getElementById('loc-provider').value || 'auto';
       const model = document.getElementById('loc-model').value || null;
       await postJSON('/api/localize', {
         query: document.getElementById('loc-query').value || 'keys',
+        camera: cam,
         provider: prov,
         model: model
       });

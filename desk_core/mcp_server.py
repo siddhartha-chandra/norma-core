@@ -37,7 +37,7 @@ from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
 from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, StationBridge, create_bridge
 from .tts import SpeakerTTS
-from .vision_3d import localize_object_3d
+from .vision_3d import localize_object_3d, localize_object_3d_dual
 
 if os.environ.get("DESK_NO_DOTENV") != "1":
     for _k, _v in dotenv_values(REPO_ROOT / ".env").items():
@@ -122,7 +122,7 @@ mcp = FastMCP("desk-core")
 @mcp.tool()
 @_traced
 async def observe(views: list[str] | None = None, denoise: bool = True) -> list:
-    """Inspect camera feed(s) ('top', 'wrist') and live ST3215 joint telemetry in one round-trip."""
+    """Inspect camera feed(s) ('top', or 'wrist' = gripper eye-in-hand; there is no separate wrist camera) and live ST3215 joint telemetry in one round-trip."""
     bridge = await _get_bridge()
     want_views = views or ["top", "wrist"]
     st = await bridge.get_state()
@@ -393,7 +393,8 @@ async def solve_ik(
 async def _live_arm_q(q_rad: list[float] | None, camera: str) -> list[float] | None:
     if q_rad is not None:
         return [float(v) for v in q_rad]
-    if f"T_world_cam_{camera}" in _calib.data or f"T_ee_cam_{camera}" not in _calib.data:
+    cam_check = "wrist" if camera in ("both", "dual") else camera
+    if f"T_world_cam_{cam_check}" in _calib.data or f"T_ee_cam_{cam_check}" not in _calib.data:
         return None
     bridge = await _get_bridge()
     st = await bridge.get_state()
@@ -441,8 +442,26 @@ async def localize_3d(
     provider: str = "auto",
     model: str | None = None,
 ) -> dict:
-    """Zero-shot 3D object localization via Gemini/Anthropic/OpenAI/Qwen/DeepSeek with automatic OpenCV fallback."""
+    """Zero-shot 3D object localization via Gemini/Anthropic/OpenAI/Qwen/DeepSeek with automatic OpenCV fallback. Pass camera='both' to fuse top + gripper eye-in-hand ('wrist') views."""
     bridge = await _get_bridge()
+    if camera in ("both", "dual"):
+        top_jpeg, wrist_jpeg = await asyncio.gather(
+            bridge.get_frame("top", denoise=denoise),
+            bridge.get_frame("wrist", denoise=denoise),
+        )
+        q = await _live_arm_q(None, "wrist")
+        return await localize_object_3d_dual(
+            top_jpeg=top_jpeg,
+            wrist_jpeg=wrist_jpeg,
+            query=query,
+            calib=_calib,
+            q_rad=q,
+            z_m=z_m,
+            use_gemini=use_gemini,
+            timeout_s=float(timeout_s),
+            model=model,
+            provider=provider,
+        )
     jpeg = await bridge.get_frame(camera, denoise=denoise)
     q = await _live_arm_q(None, camera)
     return await localize_object_3d(
