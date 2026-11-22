@@ -96,10 +96,16 @@ def gravity_offset_rad(q, urdf_path: str | None = None, direction=None) -> np.nd
     return np.clip(offset, -GRAVITY_FF_MAX_RAD, GRAVITY_FF_MAX_RAD)
 
 
-def move_direction(path: np.ndarray, min_travel_rad: float = 0.005) -> np.ndarray:
-    """Per-joint direction of a move (-1, 0, +1); joints travelling less than ``min_travel_rad`` count as still."""
-    travel = path[-1] - path[0]
-    return np.where(np.abs(travel) >= min_travel_rad, np.sign(travel), 0.0)
+def path_directions(path: np.ndarray, window: int = 3, eps_rad: float = 0.003) -> np.ndarray:
+    """Per-waypoint, per-joint direction of travel in [-1, 1], from the change over +-``window`` waypoints.
+
+    tanh smoothing ramps the friction offset through reversals instead of stepping it, and keeps nearly still
+    joints near zero.
+    """
+    n = len(path)
+    idx = np.arange(n)
+    change = path[np.minimum(idx + window, n - 1)] - path[np.maximum(idx - window, 0)]
+    return np.tanh(change / eps_rad)
 
 
 def lowest_point_m(calib: CalibrationStore, q) -> float:
@@ -180,7 +186,8 @@ def plan_flange_move(calib: CalibrationStore, motors: list[MotorState], shift_m,
 
 
 async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path: np.ndarray, duration: float,
-                            limits: MotionLimits | None = None, gravity_ff: bool = True) -> dict:
+                            limits: MotionLimits | None = None, gravity_ff: bool = True,
+                            trace: list | None = None) -> dict:
     """Stream a joint path along a minimum-jerk profile; hold position on excessive tracking lag or error.
 
     Parameters
@@ -198,6 +205,8 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
     gravity_ff : bool
         Add the fitted gravity offsets (see `gravity_offset_rad`) to the commanded targets; lag is still
         measured against the uncompensated path.
+    trace : list, optional
+        If given, receives ``(t_s, measured_rad, expected_rad)`` for every streamed cycle.
 
     Returns
     -------
@@ -210,8 +219,9 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
     n_arm = calib.num_arm_joints(len(motors))
     arm_ids = [m.id for m in motors[:n_arm]]
     urdf = str(calib.urdf_path())
-    direction = move_direction(path)
-    commanded = np.array([q + gravity_offset_rad(q, urdf, direction) for q in path]) if gravity_ff else path
+    directions = path_directions(path)
+    commanded = (np.array([q + gravity_offset_rad(q, urdf, d) for q, d in zip(path, directions)])
+                 if gravity_ff else path)
 
     def ticks_at(s: float, along=path) -> dict[int, int]:
         return calib.rad_to_ticks(list(_sample(along, s)), motors)
@@ -221,8 +231,11 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
         while (t := time.monotonic() - start) <= duration + period:
             await bridge.send_joint_targets(ticks_at(min_jerk((t + period) / duration), commanded),
                                             max_step=limits.max_step_ticks)
-            present = (await bridge.get_state()).positions()
+            state = await bridge.get_state()
+            present = state.positions()
             expected = ticks_at(min_jerk(t / duration))
+            if trace is not None:
+                trace.append((t, calib.ticks_to_rad(state.motors), _sample(path, min_jerk(t / duration)).tolist()))
             lag = {mid: present[mid] - expected[mid] for mid in arm_ids}
             worst_lag = max(worst_lag, max(abs(v) for v in lag.values()))
             if max(abs(v) for v in lag.values()) > limits.lag_limit_ticks:
@@ -270,7 +283,7 @@ async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, pat
     n_arm = calib.num_arm_joints(len(motors))
     arm = motors[:n_arm]
     goal = calib.rad_to_ticks(list(path[-1]), motors)
-    offset = gravity_offset_rad(path[-1], str(calib.urdf_path()), move_direction(path))
+    offset = gravity_offset_rad(path[-1], str(calib.urdf_path()), path_directions(path)[-1])
     start = calib.rad_to_ticks(list(path[-1] + offset), motors)
     command = {m.id: start[m.id] for m in arm}
     history = []
