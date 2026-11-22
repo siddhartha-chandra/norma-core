@@ -6,11 +6,30 @@ For an offline check of a capture_wrist_mount.py session, run
 """
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
 from numpy.typing import ArrayLike
+
+
+DEFAULT_WRIST_INTRINSICS = Path(__file__).resolve().parents[1] / "calib_frames/session1/camera_calibration.json"
+
+
+@dataclass(frozen=True)
+class WristPair:
+    """Original wrist frames with measured optical poses and intrinsics."""
+
+    frame_a: np.ndarray
+    frame_b: np.ndarray
+    camera_matrix: np.ndarray
+    distortion: np.ndarray | None
+    T_base_cam_a: np.ndarray
+    T_base_cam_b: np.ndarray
+    table_z_m: float | None
 
 
 @dataclass(frozen=True)
@@ -248,67 +267,102 @@ def estimate_wrist_depth(
     )
 
 
-def _main() -> int:
-    import argparse
-    import json
-    from pathlib import Path
-
+def load_wrist_pair(
+    samples_path: str | Path,
+    rig_path: str | Path,
+    intrinsics_path: str | Path = DEFAULT_WRIST_INTRINSICS,
+    pair: tuple[int, int] = (0, 1),
+) -> WristPair:
+    """Load two saved captures and compute their camera poses from measured calibration."""
     from .calib_store import CalibrationStore
     from .station_bridge import MAX_ANGLE_STEP, MotorState
 
-    default_intrinsics = Path(__file__).resolve().parents[1] / "calib_frames/session1/camera_calibration.json"
+    samples_path, rig_path, intrinsics_path = Path(samples_path), Path(rig_path), Path(intrinsics_path)
+    if not rig_path.is_file():
+        raise ValueError(f"Missing measured rig calibration: {rig_path}")
+    try:
+        rig = CalibrationStore(rig_path)
+    except (ValueError, TypeError, OverflowError) as error:
+        raise ValueError(f"Invalid measured rig calibration {rig_path}: {error}") from error
+    if rig.data.get("calibrated") is False:
+        raise ValueError("Supply a measured rig calibration or wrist mount, not the nominal rig.")
+    mount = _camera_pose(rig.data["T_ee_cam_wrist"])
+    count = len(rig.joint_names())
+    if rig.data.setdefault("num_arm_joints", count) != count:
+        raise ValueError("Arm joint count does not match the rig's joint names.")
+    for field in ("joint_zero_ticks", "joint_signs"):
+        mapping = rig.data[field]
+        entries = [mapping[str(i)] for i in range(1, count + 1)] if isinstance(mapping, dict) else mapping
+        values = np.asarray(entries, dtype=float)
+        if field == "joint_zero_ticks":
+            valid = (values >= 0) & (values <= MAX_ANGLE_STEP)
+        else:
+            valid = np.isin(values, [-1, 1])
+        if values.shape != (count,) or not valid.all():
+            raise ValueError(f"{field} must have a valid entry for every arm motor.")
+
+    table_z_m = None
+    if "z_table" in rig.data:
+        value = rig.data["z_table"]
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError("z_table must be a finite height in meters.")
+        table_z_m = float(value)
+
+    wrist = json.loads(intrinsics_path.read_text(encoding="utf-8"))["wrist"]
+    samples = json.loads(samples_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(samples, list)
+        or len(pair) != 2
+        or not all(isinstance(i, (int, np.integer)) and 0 <= i < len(samples) for i in pair)
+        or pair[0] == pair[1]
+    ):
+        raise ValueError("Choose two distinct indices in the capture manifest.")
+    capture_a, capture_b = (samples[i] for i in pair)
+    if not isinstance(capture_a, dict) or not isinstance(capture_b, dict):
+        raise ValueError("Both capture entries must be JSON objects.")
+    if any(capture_a.get(key) != capture_b.get(key) for key in ("camera", "bus")):
+        raise ValueError("Both captures must use the same wrist camera and follower bus.")
+    frames, poses = [], []
+    for capture in (capture_a, capture_b):
+        image = samples_path.parent / capture["image"]
+        frame = cv2.imread(str(image))
+        if frame is None or list(frame.shape[1::-1]) != wrist["image_size"]:
+            raise ValueError(f"{image}: expected a readable image at the calibrated resolution.")
+        ticks = capture["joint_ticks"]
+        if len(ticks) != count or not all(type(tick) is int and 0 <= tick <= MAX_ANGLE_STEP for tick in ticks):
+            raise ValueError(f"{image}: expected {count} raw encoder ticks.")
+        motors = [MotorState(i, tick, 0, 0, MAX_ANGLE_STEP) for i, tick in enumerate(ticks, 1)]
+        poses.append(rig.fk_ee_pose(rig.ticks_to_rad(motors)) @ mount)
+        frames.append(frame)
+
+    distortion = wrist["distortion_coefficients"]
+    return WristPair(
+        frame_a=frames[0],
+        frame_b=frames[1],
+        camera_matrix=np.asarray(wrist["camera_matrix"], dtype=float),
+        distortion=None if distortion is None else np.asarray(distortion, dtype=float),
+        T_base_cam_a=poses[0],
+        T_base_cam_b=poses[1],
+        table_z_m=table_z_m,
+    )
+
+
+def _main() -> int:
+    import argparse
+
     parser = argparse.ArgumentParser(description="Estimate wrist stereo depth from two saved Station captures.")
     parser.add_argument("samples", type=Path, help="samples.json from scripts/capture_wrist_mount.py")
     parser.add_argument("--rig", required=True, type=Path, help="Measured wrist mount and encoder mapping JSON")
-    parser.add_argument("--intrinsics", type=Path, default=default_intrinsics, help="Wrist camera calibration JSON")
+    parser.add_argument("--intrinsics", type=Path, default=DEFAULT_WRIST_INTRINSICS, help="Wrist camera calibration JSON")
     parser.add_argument("--pair", type=int, nargs=2, default=(0, 1), metavar=("A", "B"), help="Zero-based sample indices")
     parser.add_argument("--roi", type=int, nargs=4, required=True, metavar=("X", "Y", "W", "H"))
     args = parser.parse_args()
 
     try:
-        if not args.rig.is_file():
-            raise ValueError(f"Missing measured rig calibration: {args.rig}")
-        rig = CalibrationStore(args.rig)
-        if rig.data.get("calibrated") is False:
-            raise ValueError("Supply a measured rig calibration or wrist mount, not the nominal rig.")
-        mount = _camera_pose(rig.data["T_ee_cam_wrist"])
-        count = len(rig.joint_names())
-        if rig.data.setdefault("num_arm_joints", count) != count:
-            raise ValueError("Arm joint count does not match the rig's joint names.")
-        for field in ("joint_zero_ticks", "joint_signs"):
-            mapping = rig.data[field]
-            entries = [mapping[str(i)] for i in range(1, count + 1)] if isinstance(mapping, dict) else mapping
-            values = np.asarray(entries, dtype=float)
-            if field == "joint_zero_ticks":
-                valid = (values >= 0) & (values <= MAX_ANGLE_STEP)
-            else:
-                valid = np.isin(values, [-1, 1])
-            if values.shape != (count,) or not valid.all():
-                raise ValueError(f"{field} must have a valid entry for every arm motor.")
-
-        wrist = json.loads(args.intrinsics.read_text(encoding="utf-8"))["wrist"]
-        samples = json.loads(args.samples.read_text(encoding="utf-8"))
-        if not isinstance(samples, list) or len(set(args.pair)) != 2 or not all(0 <= i < len(samples) for i in args.pair):
-            raise ValueError("Choose two distinct indices in the capture manifest.")
-        capture_a, capture_b = (samples[i] for i in args.pair)
-        if any(capture_a.get(key) != capture_b.get(key) for key in ("camera", "bus")):
-            raise ValueError("Both captures must use the same wrist camera and follower bus.")
-        frames, poses = [], []
-        for capture in (capture_a, capture_b):
-            image = args.samples.parent / capture["image"]
-            frame = cv2.imread(str(image))
-            if frame is None or list(frame.shape[1::-1]) != wrist["image_size"]:
-                raise ValueError(f"{image}: expected a readable image at the calibrated resolution.")
-            ticks = capture["joint_ticks"]
-            if len(ticks) != count or not all(type(tick) is int and 0 <= tick <= MAX_ANGLE_STEP for tick in ticks):
-                raise ValueError(f"{image}: expected {count} raw encoder ticks.")
-            motors = [MotorState(i, tick, 0, 0, MAX_ANGLE_STEP) for i, tick in enumerate(ticks, 1)]
-            poses.append(rig.fk_ee_pose(rig.ticks_to_rad(motors)) @ mount)
-            frames.append(frame)
-
+        pair = load_wrist_pair(args.samples, args.rig, args.intrinsics, tuple(args.pair))
         result = estimate_wrist_depth(
-            frames[0], frames[1], wrist["camera_matrix"], wrist["distortion_coefficients"],
-            poses[0], poses[1], tuple(args.roi),
+            pair.frame_a, pair.frame_b, pair.camera_matrix, pair.distortion,
+            pair.T_base_cam_a, pair.T_base_cam_b, tuple(args.roi),
         )
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.error(str(error))
