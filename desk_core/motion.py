@@ -15,7 +15,7 @@ from scipy.spatial.transform import Rotation
 
 from .calib_store import TICKS_PER_RAD, CalibrationStore
 from .ik_tracik import TOOL_FRAME, get_solver
-from .station_bridge import MotorState, StationBridge
+from .station_bridge import ELROBOT_MOTOR_RANGES, MAX_ANGLE_STEP, MotorState, StationBridge
 from .urdf_fk import load_urdf
 
 log = logging.getLogger(__name__)
@@ -131,11 +131,23 @@ def lowest_point_m(calib: CalibrationStore, q) -> float:
                      + [tip_z]))
 
 
+def calibrated_range(m: MotorState) -> tuple[int, int]:
+    """The motor's range, or the known ElRobot range when Station reports an uncalibrated full span."""
+    if m.range_min <= 0 and m.range_max >= MAX_ANGLE_STEP and m.id in ELROBOT_MOTOR_RANGES:
+        return ELROBOT_MOTOR_RANGES[m.id]
+    return m.range_min, m.range_max
+
+
 def allowed_bounds_rad(calib: CalibrationStore, motors: list[MotorState], margin: int = RANGE_MARGIN_TICKS):
-    """Motor ranges shrunk by a margin, widened to include the current pose so joints may move away from a limit."""
+    """Motor ranges shrunk by a margin, widened to include the current pose so joints may move away from a limit.
+
+    A full 0..4095 range (Station without range calibration) would let the planner drive joints into their
+    mechanical stops, so :func:`calibrated_range` substitutes the known ElRobot ranges.
+    """
     n_arm = calib.num_arm_joints(len(motors))
     arm = motors[:n_arm]
-    shrunk = [MotorState(m.id, m.position, m.current_ma, m.range_min + margin, m.range_max - margin) for m in arm]
+    shrunk = [MotorState(m.id, m.position, m.current_ma, calibrated_range(m)[0] + margin, calibrated_range(m)[1] - margin)
+              for m in arm]
     bounds = calib.bounds_rad(shrunk)
     q_now = calib.ticks_to_rad(arm)
     lower = np.minimum([b[0] for b in bounds], q_now)
