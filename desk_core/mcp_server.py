@@ -7,7 +7,8 @@ Exposes:
   3. Calibration & scene tools: pixel_to_world, update_scene_obstacle, get_calib_status, reload_config
   4. Composite execution tools: move_to_pose, move_flange, pick_at, place_at, pick_pixel, execute_sequence
   5. Numbered wrist stereo workflow: detect_requested_object, aim_wrist, capture_wrist_stereo, estimate_wrist_depth,
-     measure_graspability, estimate_grasp_pose, master_pick_place
+     measure_graspability, estimate_grasp_pose, plan_tolerant_grasp, retract_to_hover, move_to_drop,
+     master_pick_place
   6. Prompt skills (@mcp.prompt): desk_operator_skill, pick_and_place_skill
 
 Every tool call is recorded under runs/<UTC timestamp>/ (calls.jsonl + frames/*.jpg)
@@ -1107,6 +1108,51 @@ async def estimate_grasp_pose(
     )
 
 
+### 6. Plan a tolerant top-down grasp from the measured 3D pose and planar yaw
+@mcp.tool()
+@_traced
+async def plan_tolerant_grasp(capture_id: str, tool: dict[str, Any] | None = None) -> dict:
+    """Plan grasp and hover joints for a captured object after estimate_wrist_depth. Used by master_pick_place.
+
+    The wide jaws self-centre the object, so the jaw tips may sit off-centre along the closing axis and the jaw
+    heading may deviate within the slack the measured footprint allows. Returns ``q_hover`` and ``q_contact``
+    joint angles plus the flange ``ik_target``. Planning only, the arm does not move.
+    """
+    controller = await _get_main_control()
+    selected_tool = _calib.data.get("grasp_tool") if tool is None else tool
+    if not isinstance(selected_tool, dict):
+        return {"ok": False, "reason": "Provide measured tool calibration or configure grasp_tool in the active rig."}
+    return await controller.plan_tolerant_grasp(capture_id, tool=selected_tool)
+
+
+### 7. Retract the closed gripper to the planned pickup hover
+@mcp.tool()
+@_traced
+@_motion_tool
+async def retract_to_hover() -> dict:
+    """After closing the jaws on the object, move back to the hover from the last plan_tolerant_grasp.
+
+    Runs through the controller's checked joint path (table clearance for the jaw geometry) and then verifies
+    the gripper still holds. Call before move_to_drop.
+    """
+    controller = await _get_main_control()
+    return await controller.retract_to_hover()
+
+
+### 8. Move to the saved drop X with stored joint ticks
+@mcp.tool()
+@_traced
+@_motion_tool
+async def move_to_drop() -> dict:
+    """Move to the drop pose above the saved X using joint_ticks in calib/drop_location.json (no IK).
+
+    The joint path is checked against the table for the jaw geometry before streaming. The gripper is not
+    opened; call release() afterwards to drop the object.
+    """
+    controller = await _get_main_control()
+    return await controller.move_to_drop()
+
+
 ### 10. Run the complete request-to-pick-and-place workflow
 ## added by Abhi
 @mcp.tool()
@@ -1165,6 +1211,9 @@ _SEQ_TOOLS = {
     "estimate_wrist_depth": estimate_wrist_depth,
     "measure_graspability": measure_graspability,
     "estimate_grasp_pose": estimate_grasp_pose,
+    "plan_tolerant_grasp": plan_tolerant_grasp,
+    "retract_to_hover": retract_to_hover,
+    "move_to_drop": move_to_drop,
     "master_pick_place": master_pick_place,
 }
 

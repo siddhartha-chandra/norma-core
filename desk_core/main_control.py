@@ -27,12 +27,17 @@ from .station_bridge import DEFAULT_MAX_STEP, GRIPPER_SLACK_STEPS, REPO_ROOT
 from .stereo_sweep import aim_wrist as plan_wrist_aim
 from .stereo_sweep import capture_wrist_stereo as run_wrist_sweep
 from .stereo_sweep import dense_cloud, joint_path, project, registered_obstacle_path_problem, write_ply
+from .tolerant_grasp import plan_tolerant_grasp as plan_tolerant_top_grasp
 from .urdf_fk import load_urdf
 from .wrist_stereo import StereoResult, WristPair
 from .wrist_stereo import estimate_wrist_depth as triangulate_wrist
 
 
 TABLE_CLEARANCE_M = 0.005
+JAW_SAG_MARGIN_M = 0.003
+FAST_LIMITS = MotionLimits(speed_cm_s=3.0, rot_speed_deg_s=30.0, joint_speed_deg_s=45.0, min_duration_s=1.0,
+                           lag_limit_ticks=120, max_step_ticks=300)
+SETTLE_TICKS = 25
 HOVER_M = 0.06
 
 
@@ -111,6 +116,7 @@ class MainControl:
         self.tools = tools
         self.obstacles = obstacles
         self.captures: dict[str, WristMeasurement] = {}
+        self.pick_plan: dict | None = None
 
     ### 1. Observe and validate the intended follower.
     async def observe(self) -> dict:
@@ -187,7 +193,9 @@ class MainControl:
             raise ValueError("Wrist detection returned an empty box.")
         x, y, w, h = record.roi
         cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-        if not (x <= cx <= x + w and y <= cy <= y + h):
+        # The scene camera target is about 2 cm off, so allow the wrist box centre outside the projected ROI.
+        pad = 80
+        if not (x - pad <= cx <= x + w + pad and y - pad <= cy <= y + h + pad):
             raise ValueError("Wrist detection disagrees with the scene target projection.")
         # Leave a background band for GrabCut around the detected box.
         x0, x1 = max(0, x0 - 5), min(width, x1 + 5)
@@ -356,6 +364,35 @@ class MainControl:
                 "object_rpy_rad": [0.0, 0.0, pose.object_yaw_rad],
                 "height_mm": measurement["height_mm"], "jaw_yaw_rad": pose.jaw_yaw_rad}
 
+    ### 6. Plan a tolerant top-down grasp from the measured 3D pose and planar yaw.
+    async def plan_tolerant_grasp(self, capture_id, tool) -> dict:
+        self.pick_plan = None
+        params = _tool_parameters(tool)
+        measurement = self.measure_graspability(capture_id, params["jaw_opening_mm"])
+        state = await self._motor_state()
+        plan = await asyncio.to_thread(
+            plan_tolerant_top_grasp, self.calib, state.motors, np.array(measurement["centre_base_mm"][:2]) / 1000,
+            float(np.deg2rad(measurement["yaw_deg"])), measurement["width_mm"], measurement["length_mm"],
+            measurement["height_mm"], tcp_in_flange=params["tcp_offset_m"], opening_mm=params["jaw_opening_mm"],
+            jaw_points_in_tool=_jaw_bounds(self.calib.urdf_path()),
+            jaw_floor_clearance_m=TABLE_CLEARANCE_M + JAW_SAG_MARGIN_M,
+        )
+        summary = {k: plan[k] for k in ("ik_solutions", "seeds", "jaw_tolerance_mm", "heading_tolerance_deg",
+                                        "rejected", "elapsed_s") if k in plan}
+        if not plan["ok"]:
+            return {"ok": False, "capture_id": capture_id, "reason": plan["reason"], "measurement": measurement,
+                    **summary}
+        best = plan["options"][0]
+        T = np.asarray(best["flange_pose"])
+        quat = Rotation.from_matrix(T[:3, :3]).as_quat()
+        ik_target = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), map(float, (*T[:3, 3], *quat))))
+        self.pick_plan = {"capture_id": capture_id, "q_hover": best["q_hover"], "q_contact": best["q_grasp"]}
+        return {"ok": True, "capture_id": capture_id, "measurement": measurement, "ik_target": ik_target,
+                "grasp_point_base_m": best["tip_base_m"], "q_hover": best["q_hover"], "q_contact": best["q_grasp"],
+                "jaw_yaw_rad": float(np.deg2rad(best["jaw_yaw_deg"])), "jaw_offset_mm": best["jaw_offset_mm"],
+                "long_offset_mm": best["long_offset_mm"], "hover_m": best["hover_m"],
+                "jaw_lowest_above_table_m": best["jaw_lowest_above_table_m"], **summary}
+
     def _checked_path(self, q0, q1, carried=None, lift_from_table=False):
         a, b = np.asarray(q0, dtype=float), np.asarray(q1, dtype=float)
         if a.shape != (7,) or b.shape != (7,) or not np.isfinite([a, b]).all():
@@ -409,9 +446,14 @@ class MainControl:
             raise ValueError("The follower moved while this path was being checked.")
         _require(await stream_joint_path(self.bridge, self.calib, path, duration, operator_limits, gravity_ff=False))
         targets = self.calib.rad_to_ticks(list(goal), state.motors)
-        final = (await self._motor_state()).positions()
-        if any(abs(final[mid] - tick) > 15 for mid, tick in targets.items()):
-            raise ValueError("Follower did not settle at the checked waypoint.")
+        for _ in range(15):
+            final = (await self._motor_state()).positions()
+            if all(abs(final[mid] - tick) <= SETTLE_TICKS for mid, tick in targets.items()):
+                break
+            await asyncio.sleep(0.2)
+        else:
+            off = {mid: final[mid] - tick for mid, tick in targets.items() if abs(final[mid] - tick) > SETTLE_TICKS}
+            raise ValueError(f"Follower did not settle at the checked waypoint (ticks off: {off}).")
 
     ### 7. Pick, then lift and recheck the gripper.
     async def _require_held(self):
@@ -427,19 +469,38 @@ class MainControl:
         grip = _require(await self.tools["grasp"]())
         if not grip.get("holding"):
             raise ValueError("Gripper did not verify contact.")
-        await self._move_checked(hover, limits, carried, lift_from_table=True)
-        await self._require_held()
+        await self.retract_to_hover(limits, carried)
         return grip
 
-    ### 8. Carry to the saved X, release and retract.
-    async def _place(self, hover, release, limits, carried):
-        await self._move_checked(hover, limits, carried)
+    ### 7. Retract the closed gripper straight back to the planned pickup hover before carrying.
+    async def retract_to_hover(self, limits=None, carried=None) -> dict:
+        if not getattr(self, "pick_plan", None):
+            raise ValueError("Plan a tolerant grasp before retracting to its hover.")
+        await self._move_checked(self.pick_plan["q_hover"], limits or FAST_LIMITS, carried,
+                                 lift_from_table=True)
         await self._require_held()
-        await self._move_checked(release, limits, carried)
+        return {"ok": True, "q_hover": self.pick_plan["q_hover"]}
+
+    ### 8. Carry to the saved X with its stored joint ticks (no IK) through a checked joint path.
+    async def _drop_goal(self):
+        drop = json.loads((REPO_ROOT / "calib" / "drop_location.json").read_text())
+        if "joint_ticks" not in drop:
+            raise ValueError("calib/drop_location.json has no joint_ticks for the drop pose.")
+        state = await self._motor_state()
+        arm = [replace(m, position=int(drop["joint_ticks"][str(m.id)])) for m in state.motors[:7]]
+        return self.calib.ticks_to_rad(arm)
+
+    async def move_to_drop(self, limits=None, carried=None) -> dict:
+        goal = await self._drop_goal()
+        state = await self._motor_state()
+        self._validate_goal(goal, state)
+        await self._move_checked(goal, limits or FAST_LIMITS, carried)
+        return {"ok": True, "q_drop": list(goal)}
+
+    async def _place(self, limits, carried):
+        await self.move_to_drop(limits, carried)
         await self._require_held()
-        result = _require(await self.tools["release"]())
-        await self._move_checked(hover, limits)
-        return result
+        return _require(await self.tools["release"]())
 
     ### 9. Return to the saved home through a checked joint path.
     async def _home_goal(self):
@@ -520,42 +581,28 @@ class MainControl:
                 raise ValueError("The segmented target is too wide for the measured jaws.")
             complete(stage)
 
-            stage = "estimate_grasp_pose"
-            pick = self.estimate_grasp_pose(capture_id, tool)
+            stage = "plan_tolerant_grasp"
+            pick = _require(await self.plan_tolerant_grasp(capture_id, tool))
             contact = pick["ik_target"]
-            hover = {**contact, "z": contact["z"] + HOVER_M}
-            drop_point = json.loads((REPO_ROOT / "calib" / "drop_location.json").read_text())["position_base_m"]
             tcp_at_pick = np.asarray(pick["grasp_point_base_m"])
-            tcp_drop = np.asarray(drop_point, dtype=float)
-            tcp_drop[2] += tcp_at_pick[2] - self.calib.z_table() + 2 * TABLE_CLEARANCE_M
-            drop = {**contact, "x": contact["x"] + tcp_drop[0] - tcp_at_pick[0],
-                    "y": contact["y"] + tcp_drop[1] - tcp_at_pick[1],
-                    "z": contact["z"] + tcp_drop[2] - tcp_at_pick[2]}
-            drop_hover = {**drop, "z": drop["z"] + HOVER_M}
             rotation = Rotation.from_quat([contact[key] for key in ("qx", "qy", "qz", "qw")])
             bottom = np.asarray(measurement["corners_base_m"])[:4]
             carried = params["tcp_offset_m"] + rotation.inv().apply(bottom - tcp_at_pick)
             complete(stage)
 
-            stage = "solve_ik"
+            stage = "check_motion_paths"
             state = await self._motor_state()
             current = self.calib.ticks_to_rad(state.motors)
-            solve = self.tools["solve_ik"]
-            q_hover = await solve(**hover, seed_joints_rad=current)
-            q_contact = await solve(**contact, seed_joints_rad=q_hover)
-            q_drop_hover = await solve(**drop_hover, seed_joints_rad=q_hover)
-            q_drop = await solve(**drop, seed_joints_rad=q_drop_hover)
-            complete(stage)
-
-            stage = "check_motion_paths"
+            q_hover, q_contact = pick["q_hover"], pick["q_contact"]
+            q_drop = await self._drop_goal()
             home, home_gripper = await self._home_goal() if return_home else (None, None)
-            for q in [q_hover, q_contact, q_drop_hover, q_drop] + ([] if home is None else [home]):
+            for q in [q_hover, q_contact, q_drop] + ([] if home is None else [home]):
                 self._validate_goal(q, state)
-            limits = MotionLimits(lag_limit_ticks=15)
+            limits = FAST_LIMITS
             routes = [(current, q_hover, None), (q_hover, q_contact, None), (q_contact, q_hover, carried, True),
-                      (q_hover, q_drop_hover, carried), (q_drop_hover, q_drop, carried), (q_drop, q_drop_hover, None)]
+                      (q_hover, q_drop, carried)]
             if home is not None:
-                routes.append((q_drop_hover, home, None))
+                routes.append((q_drop, home, None))
             for route in routes:
                 await asyncio.to_thread(self._checked_path, *route)
             complete(stage)
@@ -564,7 +611,7 @@ class MainControl:
             grip = await self._pick(q_hover, q_contact, limits, carried)
             complete(stage)
             stage = "place"
-            release = await self._place(q_drop_hover, q_drop, limits, carried)
+            release = await self._place(limits, carried)
             complete(stage)
             if home is not None:
                 stage = "home"
@@ -574,7 +621,7 @@ class MainControl:
             result = {"ok": True, "executed": True, "found": True, "capture_id": capture_id, "depth": depth,
                       "aim": aim, "stereo_capture": capture,
                       "measurement": measurement, "pick": pick, "grasp": grip, "release": release,
-                      "drop_tcp_base_m": tcp_drop.tolist(), "home": return_home, "trace": trace}
+                      "home": return_home, "trace": trace}
             if build_cloud:
                 stage = "cloud"
                 result["cloud"] = await asyncio.to_thread(self._cloud, capture_id)

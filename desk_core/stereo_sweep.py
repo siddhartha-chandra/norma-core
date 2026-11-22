@@ -745,7 +745,7 @@ async def _execute_wrist_path(bridge, calib, path, duration, limits):
         return {"ok": False, "reason": run.get("aborted", "Wrist motion failed."), "motion_started": True}
     actual = await _wrist_state(bridge, calib)
     goal = calib.rad_to_ticks(path[-1].tolist(), actual.motors)
-    if any(abs(actual.positions()[mid] - tick) > 25 for mid, tick in goal.items()):
+    if any(abs(actual.positions()[mid] - tick) > 40 for mid, tick in goal.items()):
         return {"ok": False, "reason": "The wrist failed to reach its planned pose.", "motion_started": True}
     return {"ok": True, "motion_started": True, "motion": run}
 

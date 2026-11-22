@@ -37,10 +37,11 @@ def workflow(calib, mock_bridge, monkeypatch):
     monkeypatch.setattr(control, "measure_graspability", Mock(return_value={
         "fits": {"across": True, "along": False}, "corners_base_m": [[0.2, 0, calib.z_table()]] * 8,
     }))
-    monkeypatch.setattr(control, "estimate_grasp_pose", Mock(return_value={
-        "ik_target": {"x": 0.2, "y": 0, "z": 0.14, "qx": 0, "qy": 0, "qz": 0, "qw": 1},
-        "grasp_point_base_m": [0.2, 0, 0.02],
+    monkeypatch.setattr(control, "plan_tolerant_grasp", AsyncMock(return_value={
+        "ok": True, "ik_target": {"x": 0.2, "y": 0, "z": 0.14, "qx": 0, "qy": 0, "qz": 0, "qw": 1},
+        "grasp_point_base_m": [0.2, 0, 0.02], "q_hover": [0.0] * 7, "q_contact": [0.01] * 7,
     }))
+    control.pick_plan = {"capture_id": "pair", "q_hover": [0.0] * 7, "q_contact": [0.01] * 7}
     monkeypatch.setattr(control, "_validate_goal", Mock())
     monkeypatch.setattr(control, "_checked_path", Mock())
     monkeypatch.setattr(control, "_move_checked", AsyncMock())
@@ -69,9 +70,11 @@ def test_full_workflow_passes_capture_and_ik_results_to_motion(workflow):
     assert result["ok"], result
     assert result["capture_id"] == "pair" and result["home"]
     workflow.estimate_wrist_depth.assert_awaited_once_with("pair", roi=(10, 20, 30, 40))
-    assert workflow.tools["solve_ik"].await_count == 4
-    assert workflow.tools["solve_ik"].await_args_list[1].kwargs["seed_joints_rad"] == [0.0] * 7
-    assert workflow._move_checked.await_args_list[1].args[0] == [0.01] * 7
+    workflow.plan_tolerant_grasp.assert_awaited_once_with("pair", TOOL)
+    workflow.tools["solve_ik"].assert_not_awaited()
+    moves = [call.args[0] for call in workflow._move_checked.await_args_list]
+    assert moves[1] == [0.01] * 7 and moves[2] == [0.0] * 7
+    assert np.allclose(moves[3], asyncio.run(workflow._drop_goal()))
     assert workflow.tools["release"].await_count == 2
     workflow._home_gripper.assert_awaited_once_with(1256)
 
