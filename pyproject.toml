@@ -16,4 +16,6 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "textual>=8.2.8",
+    "textual-image>=0.14.4",
+    "edge-tts>=7.3.1",
 ]
