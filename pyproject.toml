@@ -19,3 +19,13 @@ dependencies = [
     "pytracik>=0.0.4",
     "pin>=3.0",
 ]
+
+[dependency-groups]
+dev = [
+    "matplotlib>=3.11.2",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
