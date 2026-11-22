@@ -1081,6 +1081,9 @@ class RobotAgentTUI(App):
 
     async def action_trigger_estop(self) -> None:
         log = self.query_one("#chat-log", RichLog)
+        cancelled = self.workers.cancel_group(self, "agent")
+        if cancelled:
+            log.write("[bold red]Agent stopped.[/bold red]")
         if self.session is None:
             log.write("[red]Not connected.[/red]")
             return
@@ -1128,7 +1131,7 @@ class RobotAgentTUI(App):
         if not cmd:
             return
         inp.value = ""
-        await self._execute_command(cmd)
+        self._start_agent(cmd)
 
     @on(Button.Pressed, "#btn-voice")
     async def _on_voice_btn(self) -> None:
@@ -1145,9 +1148,18 @@ class RobotAgentTUI(App):
                 log.write("[yellow]No speech detected.[/yellow]")
                 return
             log.write(f"[b]Voice:[/b] {transcript}")
-            await self._execute_command(transcript)
+            self._start_agent(transcript)
         except Exception as exc:
             log.write(f"[red]Voice error:[/red] {exc}")
+
+    def _agent_running(self) -> bool:
+        return any(w.group == "agent" and w.is_running for w in self.workers)
+
+    def _start_agent(self, cmd: str) -> None:
+        if self._agent_running():
+            self.query_one("#chat-log", RichLog).write("[yellow]Agent busy; press Ctrl+E to stop it first.[/yellow]")
+            return
+        self.run_worker(self._execute_command(cmd), group="agent", exclusive=False, name="agent")
 
     async def _execute_command(self, cmd: str) -> None:
         log = self.query_one("#chat-log", RichLog)

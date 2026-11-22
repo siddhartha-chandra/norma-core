@@ -124,6 +124,7 @@ mcp = FastMCP("desk-core")
 async def observe(views: list[str] | None = None, denoise: bool = True) -> list:
     """Inspect camera feed(s) ('top', or 'wrist' = gripper eye-in-hand; there is no separate wrist camera) and live ST3215 joint telemetry in one round-trip."""
     bridge = await _get_bridge()
+    bridge.rearm()
     want_views = views or ["top", "wrist"]
     st = await bridge.get_state()
     summary = {

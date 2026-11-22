@@ -141,6 +141,10 @@ class RobotState:
         return {m.id: m.position for m in self.motors}
 
 
+class EStopLatched(RuntimeError):
+    """A motion command was issued while E-STOP is latched; call `rearm()` (via `observe()`) first."""
+
+
 @runtime_checkable
 class StationBridge(Protocol):
     async def connect(self) -> None: ...
@@ -152,6 +156,7 @@ class StationBridge(Protocol):
     async def wait_settle(self, targets: dict[int, int], tol_ticks: int = 25, timeout_s: float = 3.0) -> bool: ...
     async def grasp_with_verify(self, close_ticks: int | None = None, open_ticks: int | None = None) -> dict: ...
     async def abort(self) -> dict: ...
+    def rearm(self) -> None: ...
 
 
 class MockStationBridge:
@@ -394,7 +399,8 @@ class MockStationBridge:
         return buf.getvalue()
 
     async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP) -> dict[int, int]:
-        self._aborted = False
+        if self._aborted:
+            raise EStopLatched("E-STOP latched: call observe() before moving")
         applied: dict[int, int] = {}
         for mid, raw_tgt in targets.items():
             if mid not in self._motors:
@@ -454,6 +460,9 @@ class MockStationBridge:
         self._aborted = True
         return {"aborted": True, "positions": {k: v.position for k, v in self._motors.items()}}
 
+    def rearm(self) -> None:
+        self._aborted = False
+
     def link_status(self) -> dict:
         return {"bridge": "mock", "station": None, "socket_up": True, "resyncing": False, "rx_age_ms": None}
 
@@ -493,6 +502,7 @@ class LiveStationBridge:
         self._motor_state: dict[str, dict[int, MotorState]] = {}
         self._bus_voltage: dict[str, float] = {}
         self._torque_started: set[int] = set()
+        self._aborted = False
         self.rx_received_at: dict[tuple[str, int], float] = {}
         self.frame_received_at: dict[str, float] = {}
         self._frames: dict[str, bytes] = {}
@@ -1033,6 +1043,8 @@ class LiveStationBridge:
         return True
 
     async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP) -> dict[int, int]:
+        if self._aborted:
+            raise EStopLatched("E-STOP latched: call observe() before moving")
         if hasattr(self.client, "read_from_tail"):
             await self._poll_inference_tail(timeout_s=1.0)
         self._require_fresh()
@@ -1092,6 +1104,8 @@ class LiveStationBridge:
         }
 
     async def abort(self) -> dict:
+        # Latch first so in-flight motion loops cannot send another target while the hold is applied.
+        self._aborted = True
         # Hold Position uses live PresentPosition when fresh (prevents jumping
         # by unseen drift); if telemetry is stale, drop torque safely instead
         # of refusing an emergency stop.
@@ -1107,6 +1121,9 @@ class LiveStationBridge:
         cmd = self._sync_write(st.bus_serial, RAM_GOAL_POSITION, hold)
         await self._send_commands(self.client, [cmd])
         return {"aborted": True, "mode": "hold", "positions": st.positions()}
+
+    def rearm(self) -> None:
+        self._aborted = False
 
 
 def _load_hardware_fallback() -> dict[str, str]:
