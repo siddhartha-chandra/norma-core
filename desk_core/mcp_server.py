@@ -17,7 +17,6 @@ import atexit
 import functools
 import io
 import json
-import math
 import os
 import time
 from pathlib import Path
@@ -33,9 +32,11 @@ from PIL import Image as PILImage
 from .calib_store import CalibrationStore, TICKS_PER_RAD
 from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
+from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
 from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, StationBridge, create_bridge
-from .vision_3d import localize_object_3d
+from .tts import SpeakerTTS
+from .vision_3d import localize_object_3d, localize_object_3d_dual
 
 if os.environ.get("DESK_NO_DOTENV") != "1":
     for _k, _v in dotenv_values(REPO_ROOT / ".env").items():
@@ -49,6 +50,8 @@ _connect_cooldown_until = 0.0
 _calib = CalibrationStore()
 _ik = IKAdapter()
 _obstacles: dict[str, SceneObstacle] = {}
+_robo_jev = RoboJevGatekeeper()
+_tts = SpeakerTTS()
 
 RUNS_DIR = Path(os.environ.get("DESK_RUNS_DIR") or (REPO_ROOT / "runs"))
 _logger: RunLogger | None = None
@@ -118,7 +121,7 @@ mcp = FastMCP("desk-core")
 @mcp.tool()
 @_traced
 async def observe(views: list[str] | None = None, denoise: bool = True) -> list:
-    """Inspect camera feed(s) ('top', 'wrist') and live ST3215 joint telemetry in one round-trip."""
+    """Inspect camera feed(s) ('top', or 'wrist' = gripper eye-in-hand; there is no separate wrist camera) and live ST3215 joint telemetry in one round-trip."""
     bridge = await _get_bridge()
     want_views = views or ["top", "wrist"]
     st = await bridge.get_state()
@@ -363,33 +366,35 @@ async def solve_ik(
     x: float,
     y: float,
     z: float,
-    alpha: float = 0.0,
-    beta: float = 0.0,
-    gamma: float = 0.0,
+    qx: float = 0.0,
+    qy: float = 0.0,
+    qz: float = 0.0,
+    qw: float = 1.0,
 ) -> list[float]:
-    """Solve IK for metric target pose (x, y, z [m], alpha, beta, gamma [rad]) -> [j_1, ..., j_7] (rad)."""
+    """Solve IK for a metric target pose with an xyzw quaternion."""
     bridge = await _get_bridge()
     st = await bridge.get_state()
-    q_curr = _calib.ticks_to_rad(st.motors)
+    seed_joints_rad = _calib.ticks_to_rad(st.motors)
     n_arm = _calib.num_arm_joints(len(st.motors))
     return _ik.solve_ik(
         x=float(x),
         y=float(y),
         z=float(z),
-        alpha=float(alpha),
-        beta=float(beta),
-        gamma=float(gamma),
-        q_curr_rad=q_curr,
+        qx=float(qx),
+        qy=float(qy),
+        qz=float(qz),
+        qw=float(qw),
+        seed_joints_rad=seed_joints_rad,
         obstacles=list(_obstacles.values()),
         n_arm=n_arm,
-        bounds_rad=_calib.bounds_rad(st.motors),
     )
 
 
 async def _live_arm_q(q_rad: list[float] | None, camera: str) -> list[float] | None:
     if q_rad is not None:
         return [float(v) for v in q_rad]
-    if f"T_world_cam_{camera}" in _calib.data or f"T_ee_cam_{camera}" not in _calib.data:
+    cam_check = "wrist" if camera in ("both", "dual") else camera
+    if f"T_world_cam_{cam_check}" in _calib.data or f"T_ee_cam_{cam_check}" not in _calib.data:
         return None
     bridge = await _get_bridge()
     st = await bridge.get_state()
@@ -399,7 +404,7 @@ async def _live_arm_q(q_rad: list[float] | None, camera: str) -> list[float] | N
 @mcp.tool()
 @_traced
 async def get_metric_depth(x: float, y: float, camera: str = "top", q_rad: list[float] | None = None) -> float:
-    """Estimate metric depth z (meters) at 2D pixel coordinate (x, y) in the specified camera."""
+    """Estimate metric depth z (meters) at a 2D pixel coordinate in the specified camera."""
     q = await _live_arm_q(q_rad, camera)
     return _calib.get_metric_depth(float(x), float(y), camera=camera, q_rad=q)
 
@@ -434,9 +439,29 @@ async def localize_3d(
     use_gemini: bool = True,
     denoise: bool = True,
     timeout_s: float = 6.0,
+    provider: str = "auto",
+    model: str | None = None,
 ) -> dict:
-    """Zero-shot 3D object localization via Gemini 4 Hydrogen with automatic OpenCV HSV/contour fallback."""
+    """Zero-shot 3D object localization via Gemini/Anthropic/OpenAI/Qwen/DeepSeek with automatic OpenCV fallback. Pass camera='both' to fuse top + gripper eye-in-hand ('wrist') views."""
     bridge = await _get_bridge()
+    if camera in ("both", "dual"):
+        top_jpeg, wrist_jpeg = await asyncio.gather(
+            bridge.get_frame("top", denoise=denoise),
+            bridge.get_frame("wrist", denoise=denoise),
+        )
+        q = await _live_arm_q(None, "wrist")
+        return await localize_object_3d_dual(
+            top_jpeg=top_jpeg,
+            wrist_jpeg=wrist_jpeg,
+            query=query,
+            calib=_calib,
+            q_rad=q,
+            z_m=z_m,
+            use_gemini=use_gemini,
+            timeout_s=float(timeout_s),
+            model=model,
+            provider=provider,
+        )
     jpeg = await bridge.get_frame(camera, denoise=denoise)
     q = await _live_arm_q(None, camera)
     return await localize_object_3d(
@@ -448,7 +473,89 @@ async def localize_3d(
         z_m=z_m,
         use_gemini=use_gemini,
         timeout_s=float(timeout_s),
+        model=model,
+        provider=provider,
     )
+
+
+@mcp.tool()
+@_traced
+async def robo_jev_arm_watch(
+    x: float,
+    y: float,
+    query: str = "target",
+    camera: str = "top",
+    depth_m: float | None = None,
+) -> dict:
+    """Arm Robo-Jev's <150 ms visual reflex watch on pixel (x, y) before a reach."""
+    bridge = await _get_bridge()
+    jpeg = await bridge.get_frame(camera, denoise=False)
+    d_m = float(depth_m) if depth_m is not None else _calib.get_metric_depth(float(x), float(y), camera=camera)
+    return _robo_jev.arm_watch(jpeg_bytes=jpeg, pixel=(float(x), float(y)), query=query, depth_m=d_m)
+
+
+@mcp.tool()
+@_traced
+async def robo_jev_check(
+    camera: str = "top",
+    target_x: float | None = None,
+    target_y: float | None = None,
+    abort_on_hazard: bool = True,
+) -> dict:
+    """Run Robo-Jev <150 ms reflex checks (`target_shifted`, `path_clear`, `will_tip`, `grasp_secure`)."""
+    bridge = await _get_bridge()
+    target_xy = (float(target_x), float(target_y)) if (target_x is not None and target_y is not None) else None
+    if abort_on_hazard:
+        return await check_reflex_and_abort(
+            gatekeeper=_robo_jev,
+            bridge=bridge,
+            calib=_calib,
+            obstacles=list(_obstacles.values()),
+            target_xy=target_xy,
+            camera=camera,
+        )
+    jpeg = await bridge.get_frame(camera, denoise=False)
+    return _robo_jev.evaluate(
+        curr_jpeg=jpeg,
+        calib=_calib,
+        obstacles=list(_obstacles.values()),
+        target_xy=target_xy,
+        camera=camera,
+    )
+
+
+@mcp.tool()
+@_traced
+async def robo_jev_guard(
+    query: str = "keys",
+    target_x: float | None = None,
+    target_y: float | None = None,
+    camera: str = "top",
+    obstacle_wait_timeout_s: float = 8.0,
+    use_gemini: bool = False,
+) -> dict:
+    """Pause on obstacle until clear & resume; recalibrate on target shift if inside safe bounds."""
+    bridge = await _get_bridge()
+    target_xy = (float(target_x), float(target_y)) if (target_x is not None and target_y is not None) else None
+    return await guarded_recover(
+        gatekeeper=_robo_jev,
+        bridge=bridge,
+        calib=_calib,
+        query=query,
+        obstacles_fn=lambda: list(_obstacles.values()),
+        target_xy=target_xy,
+        camera=camera,
+        obstacle_wait_timeout_s=float(obstacle_wait_timeout_s),
+        use_gemini=use_gemini,
+    )
+
+
+@mcp.tool()
+@_traced
+async def speak_status(text: str) -> dict:
+    """Speak a short status cue over the portable speaker (non-blocking TTS)."""
+    queued = _tts.speak(text)
+    return {"queued": queued, "tts": _tts.status()}
 
 
 @mcp.tool()
@@ -477,7 +584,7 @@ async def update_scene_obstacle(
 @mcp.tool()
 @_traced
 async def get_calib_status() -> dict:
-    """Inspect active calibration files, IK backend (Pink vs fallback), and registered obstacles."""
+    """Inspect active calibration files, Pink IK backend availability, and registered obstacles."""
     return {
         "calibration": _calib.status(),
         "ik_backend": _ik.backend_name(),
@@ -512,14 +619,15 @@ async def move_to_pose(
     x: float,
     y: float,
     z: float,
-    alpha: float = 0.0,
-    beta: float = 0.0,
-    gamma: float = 0.0,
+    qx: float = 0.0,
+    qy: float = 0.0,
+    qz: float = 0.0,
+    qw: float = 1.0,
 ) -> dict:
-    """Composite move: get_joint_angles -> solve_ik -> move_joint."""
-    angles = await solve_ik(x=x, y=y, z=z, alpha=alpha, beta=beta, gamma=gamma)
+    """Move to a metric target position and xyzw orientation quaternion."""
+    angles = await solve_ik(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
     ok = await move_joint(joints=angles, wait=True)
-    return {"ok": ok, "pose": [x, y, z, alpha, beta, gamma], "joints_rad": angles}
+    return {"ok": ok, "pose": [x, y, z, qx, qy, qz, qw], "joints_rad": angles}
 
 
 @mcp.tool()
@@ -528,19 +636,22 @@ async def pick_at(
     x: float,
     y: float,
     z: float,
-    yaw: float = 0.0,
+    qx: float = 0.0,
+    qy: float = 0.7071067811865476,
+    qz: float = 0.0,
+    qw: float = 0.7071067811865476,
     approach_dz: float = 0.06,
 ) -> dict:
     """Composite pick: open jaws -> hover above -> descend -> grasp_with_verify -> retract cleanly."""
     await release()
-    hover = await move_to_pose(x=x, y=y, z=z + approach_dz, beta=math.pi / 2, gamma=yaw)
+    hover = await move_to_pose(x=x, y=y, z=z + approach_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     if not hover["ok"]:
         return {"ok": False, "stage": "hover", **hover}
-    descend = await move_to_pose(x=x, y=y, z=z, beta=math.pi / 2, gamma=yaw)
+    descend = await move_to_pose(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
     if not descend["ok"]:
         return {"ok": False, "stage": "descend", **descend}
     grip = await grasp()
-    retract = await move_to_pose(x=x, y=y, z=z + approach_dz, beta=math.pi / 2, gamma=yaw)
+    retract = await move_to_pose(x=x, y=y, z=z + approach_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     return {"ok": bool(grip.get("ok")) and bool(retract.get("ok")), "grasp": grip, "retract_ok": retract["ok"]}
 
 
@@ -550,28 +661,41 @@ async def place_at(
     x: float,
     y: float,
     z: float,
-    yaw: float = 0.0,
+    qx: float = 0.0,
+    qy: float = 0.7071067811865476,
+    qz: float = 0.0,
+    qw: float = 0.7071067811865476,
     retract_dz: float = 0.06,
 ) -> dict:
     """Composite place: hover above tray/drop -> lower -> release jaws -> retract."""
-    hover = await move_to_pose(x=x, y=y, z=z + retract_dz, beta=math.pi / 2, gamma=yaw)
+    hover = await move_to_pose(x=x, y=y, z=z + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     if not hover["ok"]:
         return {"ok": False, "stage": "hover", **hover}
-    lower = await move_to_pose(x=x, y=y, z=z, beta=math.pi / 2, gamma=yaw)
+    lower = await move_to_pose(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
     if not lower["ok"]:
         return {"ok": False, "stage": "lower", **lower}
     rel = await release()
-    retract = await move_to_pose(x=x, y=y, z=z + retract_dz, beta=math.pi / 2, gamma=yaw)
+    retract = await move_to_pose(x=x, y=y, z=z + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     return {"ok": bool(rel.get("released")) and bool(retract.get("ok")), "release": rel, "retract_ok": retract["ok"]}
 
 
 @mcp.tool()
 @_traced
-async def pick_pixel(x: float, y: float, camera: str = "top", yaw: float = 0.0) -> dict:
+async def pick_pixel(
+    x: float,
+    y: float,
+    camera: str = "top",
+    qx: float = 0.0,
+    qy: float = 0.7071067811865476,
+    qz: float = 0.0,
+    qw: float = 0.7071067811865476,
+) -> dict:
     """Composite vision-to-grasp: pixel (x, y) -> get_metric_depth -> pixel_to_world -> pick_at."""
     depth_z = await get_metric_depth(x=x, y=y, camera=camera)
     world = await pixel_to_world(x=x, y=y, camera=camera)
-    res = await pick_at(x=world["x"], y=world["y"], z=world["z"], yaw=yaw)
+    res = await pick_at(
+        x=world["x"], y=world["y"], z=world["z"], qx=qx, qy=qy, qz=qz, qw=qw
+    )
     return {"pixel": [x, y], "depth_z": depth_z, "world": world, **res}
 
 
@@ -599,6 +723,10 @@ _SEQ_TOOLS = {
     "get_metric_depth": get_metric_depth,
     "pixel_to_world": pixel_to_world,
     "localize_3d": localize_3d,
+    "robo_jev_arm_watch": robo_jev_arm_watch,
+    "robo_jev_check": robo_jev_check,
+    "robo_jev_guard": robo_jev_guard,
+    "speak_status": speak_status,
     "update_scene_obstacle": update_scene_obstacle,
     "get_calib_status": get_calib_status,
     "reload_config": reload_config,

@@ -23,30 +23,33 @@ TICKS_PER_RAD = (MAX_ANGLE_STEP + 1) / (2.0 * math.pi)
 RIG_CALIB_PATH = REPO_ROOT / "calib" / "rig_calib.json"
 
 
-def resolve_default_calib_path() -> Path:
-    """Resolve active calibration JSON path.
+CAMERA_ONLY_KEYS = {
+    "K_top",
+    "dist_top",
+    "image_size_top",
+    "K_wrist",
+    "dist_wrist",
+    "image_size_wrist",
+    "top",
+    "scene",
+    "wrist",
+}
 
-    Priority when `DESK_CALIB_PATH` env var is unset:
-      1. `calib/rig_calib.json` if it exists and has `calibrated == true`.
-      2. Newest `calib_frames/*/camera_calibration.json` if present (camera intrinsics output).
-      3. `calib/rig_calib.json` (nominal tracked contract).
-    """
-    env_p = os.environ.get("DESK_CALIB_PATH", "").strip()
-    if env_p:
-        return Path(env_p)
-    if RIG_CALIB_PATH.exists():
-        try:
-            rig_raw = json.loads(RIG_CALIB_PATH.read_text(encoding="utf-8"))
-            if rig_raw.get("calibrated"):
-                return RIG_CALIB_PATH
-        except Exception:
-            pass
+
+def resolve_camera_calib_path() -> Path | None:
+    """Return newest `calib_frames/*/camera_calibration.json` if present."""
     cam_calibs = sorted(
         (REPO_ROOT / "calib_frames").glob("*/camera_calibration.json"),
         key=lambda p: p.stat().st_mtime,
     )
-    if cam_calibs:
-        return cam_calibs[-1]
+    return cam_calibs[-1] if cam_calibs else None
+
+
+def resolve_default_calib_path() -> Path:
+    """Resolve active rig calibration JSON path (`DESK_CALIB_PATH` or `calib/rig_calib.json`)."""
+    env_p = os.environ.get("DESK_CALIB_PATH", "").strip()
+    if env_p:
+        return Path(env_p)
     return RIG_CALIB_PATH
 
 
@@ -88,18 +91,35 @@ class CalibrationStore:
     def __init__(self, path: Path | None = None):
         self._explicit_path = Path(path) if path is not None else None
         self.path = self._explicit_path or resolve_default_calib_path()
+        self.camera_calib_path: Path | None = None
         self.data: dict[str, Any] = {}
         self._custom_depth_fn = None
         self.reload()
 
     def reload(self) -> dict[str, Any]:
+        env_p = os.environ.get("DESK_CALIB_PATH", "").strip()
         if self._explicit_path is None:
             self.path = resolve_default_calib_path()
         if self.path.exists():
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            self.data = _normalize_calib_dict(raw)
+            merged = _normalize_calib_dict(raw)
         else:
-            self.data = {}
+            merged = {}
+
+        # Overlay camera-only calibration (intrinsics/distortion) from camera_calibration.json
+        # while keeping all rig/robot/extrinsic settings from rig_calib.json.
+        self.camera_calib_path = None
+        if self._explicit_path is None and not env_p:
+            cam_path = resolve_camera_calib_path()
+            if cam_path is not None and cam_path.exists():
+                cam_raw = json.loads(cam_path.read_text(encoding="utf-8"))
+                cam_norm = _normalize_calib_dict(cam_raw)
+                for k in CAMERA_ONLY_KEYS:
+                    if k in cam_norm:
+                        merged[k] = cam_norm[k]
+                self.camera_calib_path = cam_path
+
+        self.data = merged
         self._load_depth_hook()
         return self.status()
 
@@ -176,13 +196,37 @@ class CalibrationStore:
             out[m.id] = max(lo, min(hi, tick))
         return out
 
+    def joint_angles_to_ticks(self, joints_rad: list[float], motors: list[MotorState]) -> dict[int, int]:
+        """Convert URDF/MCP arm angles (radians) to ST3215 encoder ticks."""
+        return self.rad_to_ticks(joints_rad, motors)
+
+    def ticks_to_joint_angles(self, motors: list[MotorState]) -> list[float]:
+        """Convert ST3215 encoder ticks to URDF/MCP arm angles (radians)."""
+        return self.ticks_to_rad(motors)
+
+    def _urdf_angle_limits(self, n_arm: int) -> list[tuple[float | None, float | None]]:
+        try:
+            urdf = load_urdf(DEFAULT_ELROBOT_URDF)
+            limits = urdf.joint_limits(DEFAULT_ARM_JOINTS)
+            return limits[:n_arm]
+        except Exception:
+            return [(None, None)] * n_arm
+
     def validate_joint_limits(self, joints_rad: list[float], motors: list[MotorState]) -> tuple[bool, str | None]:
         n_arm = self.num_arm_joints(len(motors))
         if len(joints_rad) != n_arm:
             return False, f"expected {n_arm} angles, got {len(joints_rad)}"
-        for m, angle in zip(motors[:n_arm], joints_rad):
+        urdf_limits = self._urdf_angle_limits(n_arm)
+        for index, (m, angle) in enumerate(zip(motors[:n_arm], joints_rad)):
             if not math.isfinite(angle):
                 return False, f"non-finite angle for motor {m.id}"
+            urdf_lo, urdf_hi = urdf_limits[index]
+            if urdf_lo is not None and urdf_hi is not None:
+                if angle < urdf_lo - 1e-6 or angle > urdf_hi + 1e-6:
+                    return False, (
+                        f"motor {m.id} angle {angle:.6f} rad outside URDF limits "
+                        f"[{urdf_lo:.6f}, {urdf_hi:.6f}]"
+                    )
             raw = self._zero_tick(m) + self._sign(m.id) * float(angle) * TICKS_PER_RAD
             lo, hi = (m.range_min, m.range_max) if m.range_max > m.range_min else (0, MAX_ANGLE_STEP)
             if raw < lo - 40 or raw > hi + 40:
@@ -393,6 +437,7 @@ class CalibrationStore:
         calibrated_flag = bool(self.data["calibrated"]) if "calibrated" in self.data else (len(missing) == 0)
         return {
             "calib_file": str(self.path),
+            "camera_calib_file": str(self.camera_calib_path) if self.camera_calib_path else None,
             "calib_loaded": self.path.exists(),
             "calibrated": calibrated_flag,
             "arm_type": self.data.get("arm_type", "elrobot-7dof-nominal"),

@@ -13,8 +13,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import math
 import os
+import re
+import urllib.error
+import urllib.request
+from pathlib import Path
 from typing import Any
 
 import cv2
@@ -25,10 +30,76 @@ from .calib_store import CalibrationStore
 
 GEMINI_VISION_MODEL = os.environ.get("DESK_VISION_MODEL", "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
 
+DEFAULT_PROVIDER_MODELS: dict[str, str] = {
+    "gemini": GEMINI_VISION_MODEL,
+    "anthropic": "claude-sonnet-5-5",
+    "openai": "gpt-6.1-terra",
+    "qwen": "qwen4-max",
+    "deepseek": "deepseek-flash",
+}
+
+VISION_MODELS_BY_PROVIDER: dict[str, list[str]] = {
+    "gemini": [
+        "gemini-4-hydrogen",
+        "gemini-4-argon",
+        "gemini-robotics-er-2-preview",
+        "gemini-3.8-pro",
+        "gemini-3.8-flash",
+    ],
+    "anthropic": [
+        "claude-fable-5-2",
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-haiku-5-5",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+    ],
+    "openai": [
+        "gpt-6.2-astra",
+        "gpt-6.2-sol",
+        "gpt-6.1-terra",
+        "gpt-6-luna",
+        "gpt-5",
+        "gpt-4.1",
+    ],
+    "qwen": ["qwen4-max", "qwen3.8-max", "qwen3-vl-plus", "qwen-vl-max", "qwen2.5-vl-72b-instruct"],
+    "deepseek": ["deepseek-flash", "deepseek-vl2", "deepseek-vl2-small"],
+}
+
+# Documented capability tiers (no fabricated benchmark percentages; use /api/vision/verify for live measured accuracy)
+MODEL_RATINGS: dict[str, dict[str, Any]] = {
+    "gemini-4-hydrogen": {"tier": "Robotics Pointing", "color": "green", "note": "Gemini 4 frontier vision"},
+    "gemini-4-argon": {"tier": "Frontier Vision", "color": "green", "note": "Gemini 4 Argon multimodal"},
+    "gemini-robotics-er-2-preview": {"tier": "Robotics Pointing", "color": "green", "note": "Embodied [y,x] pointing"},
+    "gemini-3.8-pro": {"tier": "Frontier Vision", "color": "green", "note": "High-accuracy multimodal"},
+    "gemini-3.8-flash": {"tier": "Fast Vision", "color": "amber", "note": "Low-latency multimodal"},
+    "claude-fable-5-2": {"tier": "Frontier Vision", "color": "green", "note": "Flagship agentic vision"},
+    "claude-opus-5-5": {"tier": "Frontier Vision", "color": "green", "note": "Strongest Claude 5.5"},
+    "claude-sonnet-5-5": {"tier": "Balanced Vision", "color": "green", "note": "Speed + accuracy (5.5)"},
+    "claude-haiku-5-5": {"tier": "Fast Vision", "color": "amber", "note": "Low-latency (5.5)"},
+    "claude-opus-4-6": {"tier": "Legacy Vision", "color": "amber", "note": "Legacy 4.6 series"},
+    "claude-sonnet-4-6": {"tier": "Legacy Vision", "color": "amber", "note": "Legacy 4.6 series"},
+    "gpt-6.2-astra": {"tier": "Frontier Vision", "color": "green", "note": "Flagship reasoning + vision"},
+    "gpt-6.2-sol": {"tier": "Balanced Vision", "color": "green", "note": "High efficiency (6.2)"},
+    "gpt-6.1-terra": {"tier": "Visual Grounding", "color": "green", "note": "Computer-use & visual reasoning"},
+    "gpt-6-luna": {"tier": "Fast Vision", "color": "amber", "note": "High-volume fast vision"},
+    "gpt-5": {"tier": "Legacy Vision", "color": "amber", "note": "Retiring Dec 2026"},
+    "gpt-4.1": {"tier": "Legacy Vision", "color": "amber", "note": "Deprecated 4.1 series"},
+    "qwen4-max": {"tier": "Frontier Vision", "color": "green", "note": "Qwen 4 Max (GA Nov 2026)"},
+    "qwen3.8-max": {"tier": "Frontier Vision", "color": "green", "note": "Top ERQA Qwen3.8 VL"},
+    "qwen3-vl-plus": {"tier": "Balanced Vision", "color": "green", "note": "Qwen3 VL spatial grounding"},
+    "qwen-vl-max": {"tier": "Balanced Vision", "color": "amber", "note": "High-res Qwen VL"},
+    "qwen2.5-vl-72b-instruct": {"tier": "Open-Weight VL", "color": "amber", "note": "Qwen 2.5 VL 72B"},
+    "deepseek-flash": {"tier": "Frontier Vision", "color": "green", "note": "DeepSeek-V4.1-Flash-1017 (Multimodal, 1M)"},
+    "deepseek-vl2": {"tier": "VL2 Endpoint", "color": "amber", "note": "Requires VL2-compatible host"},
+    "deepseek-vl2-small": {"tier": "Compact VL2", "color": "amber", "note": "Requires VL2-compatible host"},
+    "opencv-fallback": {"tier": "Offline Heuristic", "color": "red", "note": "No semantic understanding"},
+}
+
 # Explicit HSV bounds for ElRobot 3D-printed / anodized orange & coral servo horns
-ORANGE_HORN_LOWER_1 = np.array([2, 85, 65], dtype=np.uint8)
-ORANGE_HORN_UPPER_1 = np.array([24, 255, 255], dtype=np.uint8)
-ORANGE_HORN_LOWER_2 = np.array([168, 85, 65], dtype=np.uint8)
+ORANGE_HORN_LOWER_1 = np.array([5, 95, 70], dtype=np.uint8)
+ORANGE_HORN_UPPER_1 = np.array([22, 255, 255], dtype=np.uint8)
+ORANGE_HORN_LOWER_2 = np.array([170, 95, 70], dtype=np.uint8)
 ORANGE_HORN_UPPER_2 = np.array([180, 255, 255], dtype=np.uint8)
 
 COLOR_HINTS: dict[str, tuple[np.ndarray, np.ndarray]] = {
@@ -38,6 +109,21 @@ COLOR_HINTS: dict[str, tuple[np.ndarray, np.ndarray]] = {
     "yellow": (np.array([22, 80, 80], dtype=np.uint8), np.array([36, 255, 255], dtype=np.uint8)),
     "purple": (np.array([130, 50, 50], dtype=np.uint8), np.array([165, 255, 255], dtype=np.uint8)),
     "pink": (np.array([145, 50, 80], dtype=np.uint8), np.array([175, 255, 255], dtype=np.uint8)),
+    "brown": (np.array([8, 60, 30], dtype=np.uint8), np.array([24, 220, 160], dtype=np.uint8)),
+}
+
+# Semantic keyword -> color hint fallback for offline OpenCV detection
+QUERY_COLOR_ALIASES: dict[str, str] = {
+    "key": "blue",
+    "fob": "blue",
+    "marker": "red",
+    "pen": "red",
+    "mug": "brown",
+    "cup": "brown",
+    "coffee": "brown",
+    "note": "yellow",
+    "sticky": "yellow",
+    "cube": "green",
 }
 
 
@@ -91,15 +177,25 @@ def localize_opencv(bgr: np.ndarray, query: str) -> dict[str, Any]:
     orange_mask = build_orange_horn_mask(hsv)
     q_low = query.lower()
 
-    # Optional explicit color hint if query specifies a non-orange color
+    # Optional explicit color hint (or semantic prop alias) if query specifies a target
     hint_mask: np.ndarray | None = None
     for cname, (lo, hi) in COLOR_HINTS.items():
         if cname in q_low:
             hint_mask = cv2.inRange(hsv, lo, hi)
             break
+    if hint_mask is None:
+        for kw, cname in QUERY_COLOR_ALIASES.items():
+            if kw in q_low and cname in COLOR_HINTS:
+                lo, hi = COLOR_HINTS[cname]
+                hint_mask = cv2.inRange(hsv, lo, hi)
+                break
 
     if hint_mask is not None:
-        fg_mask = cv2.bitwise_and(hint_mask, cv2.bitwise_not(orange_mask))
+        # Don't strip brown mugs or red marker caps when explicitly queried
+        if any(k in q_low for k in ("mug", "cup", "brown", "red", "marker", "pen")):
+            fg_mask = hint_mask
+        else:
+            fg_mask = cv2.bitwise_and(hint_mask, cv2.bitwise_not(orange_mask))
     else:
         # Estimate desk background from median Lab color & find salient foreground objects
         lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -174,36 +270,25 @@ def localize_opencv(bgr: np.ndarray, query: str) -> dict[str, Any]:
     }
 
 
-def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str, Any]:
-    from google import genai
-
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip() or os.environ.get("GOOGLE_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set")
-
-    client = genai.Client(api_key=api_key)
-    b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
-    prompt = (
+def _vision_prompt(query: str) -> str:
+    return (
         f"Locate the desk item matching '{query}' in this robot workspace image. "
         "Ignore orange/coral robot arm links, servo horns, and gripper fingers unless explicitly queried. "
-        "Return JSON with: found (bool), label (str), point ([y, x] grasp center normalized 0-1000), "
+        "Return ONLY valid JSON with keys: found (bool), label (str), point ([y, x] grasp center normalized 0-1000), "
         "box_2d ([ymin, xmin, ymax, xmax] normalized 0-1000), yaw_deg (principal axis angle -90..90), "
         "and confidence (0.0..1.0). If not visible, set found=false."
     )
-    interaction = client.interactions.create(
-        model=model,
-        input=[
-            {"type": "image", "data": b64_jpeg, "mime_type": "image/jpeg"},
-            {"type": "text", "text": prompt},
-        ],
-        response_format={
-            "type": "text",
-            "mime_type": "application/json",
-            "schema": GeminiPoint2DResult.model_json_schema(),
-        },
-        store=False,
-    )
-    parsed = GeminiPoint2DResult.model_validate_json(interaction.output_text)
+
+
+def _parse_vlm_json(raw_text: str, query: str) -> dict[str, Any]:
+    txt = raw_text.strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```(?:json)?\s*", "", txt)
+        txt = re.sub(r"\s*```$", "", txt)
+    m = re.search(r"\{.*\}", txt, re.DOTALL)
+    if m:
+        txt = m.group(0)
+    parsed = GeminiPoint2DResult.model_validate_json(txt)
     pt = parsed.point if len(parsed.point) == 2 else [500, 500]
     box = parsed.box_2d if len(parsed.box_2d) == 4 else [0, 0, 0, 0]
     return {
@@ -216,6 +301,190 @@ def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str, model: str) ->
     }
 
 
+def _load_keystore() -> dict[str, str]:
+    env_path = os.environ.get("DESK_KEYS_PATH", "").strip()
+    path = Path(env_path) if env_path else (Path.home() / ".config" / "desk-core" / "keys.json")
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        out: dict[str, str] = {}
+        for k, v in raw.items():
+            val = str(v).strip()
+            if not val:
+                continue
+            norm_k = "anthropic" if k == "claude" else k.strip().lower()
+            out[norm_k] = val
+        return out
+    except Exception:
+        return {}
+
+
+def _get_api_key(provider: str) -> str:
+    p = "anthropic" if provider == "claude" else provider.strip().lower()
+    env_map = {
+        "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        "anthropic": ("ANTHROPIC_API_KEY",),
+        "openai": ("OPENAI_API_KEY",),
+        "qwen": ("QWEN_API_KEY", "DASHSCOPE_API_KEY"),
+        "deepseek": ("DEEPSEEK_API_KEY",),
+    }
+    for var in env_map.get(p, ()):
+        val = os.environ.get(var, "").strip()
+        if val:
+            return val
+    return _load_keystore().get(p, "")
+
+
+def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str, Any]:
+    from google import genai
+
+    api_key = _get_api_key("gemini")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    client = genai.Client(api_key=api_key)
+    b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
+    interaction = client.interactions.create(
+        model=model,
+        input=[
+            {"type": "image", "data": b64_jpeg, "mime_type": "image/jpeg"},
+            {"type": "text", "text": _vision_prompt(query)},
+        ],
+        response_format={
+            "type": "text",
+            "mime_type": "application/json",
+            "schema": GeminiPoint2DResult.model_json_schema(),
+        },
+        store=False,
+    )
+    return _parse_vlm_json(interaction.output_text, query)
+
+
+def _call_anthropic_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str, Any]:
+    api_key = _get_api_key("anthropic")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set")
+    b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "max_tokens": 2048,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": "image/jpeg", "data": b64_jpeg},
+                    },
+                    {"type": "text", "text": _vision_prompt(query)},
+                ],
+            }
+        ],
+    }
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Anthropic HTTP {exc.code}: {body[:200]}") from exc
+    text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
+    return _parse_vlm_json(text, query)
+
+
+def _call_openai_compat_sync(
+    jpeg_bytes: bytes,
+    query: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    provider_label: str,
+) -> dict[str, Any]:
+    if not api_key:
+        raise RuntimeError(f"{provider_label} API key not set")
+    b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
+    payload = {
+        "model": model,
+        "max_tokens": 2048,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_jpeg}"}},
+                    {"type": "text", "text": _vision_prompt(query)},
+                ],
+            }
+        ],
+    }
+    req = urllib.request.Request(
+        base_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{provider_label} HTTP {exc.code}: {body[:200]}") from exc
+    text = data["choices"][0]["message"]["content"]
+    return _parse_vlm_json(text, query)
+
+
+def _resolve_provider(provider: str) -> str:
+    p = (provider or "auto").strip().lower()
+    if p == "claude":
+        return "anthropic"
+    if p != "auto":
+        return p
+    env_p = os.environ.get("DESK_VISION_PROVIDER", "").strip().lower()
+    if env_p:
+        return "anthropic" if env_p == "claude" else env_p
+    for cand in ("gemini", "anthropic", "openai", "qwen", "deepseek"):
+        if _get_api_key(cand):
+            return cand
+    return "gemini"
+
+
+def _call_vlm_sync(jpeg_bytes: bytes, query: str, provider: str, model: str) -> dict[str, Any]:
+    if provider == "gemini":
+        return _call_gemini_interactions_sync(jpeg_bytes, query, model)
+    if provider == "anthropic":
+        return _call_anthropic_sync(jpeg_bytes, query, model)
+    if provider == "openai":
+        key = _get_api_key("openai")
+        url = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/") + "/chat/completions"
+        return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "OpenAI")
+    if provider == "qwen":
+        key = _get_api_key("qwen")
+        default_qwen_url = (
+            "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+            if key.startswith("sk-sp-")
+            else "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        )
+        url = os.environ.get("QWEN_BASE_URL", default_qwen_url).rstrip("/") + "/chat/completions"
+        return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "Qwen")
+    if provider == "deepseek":
+        key = _get_api_key("deepseek")
+        url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1").rstrip("/") + "/chat/completions"
+        return _call_openai_compat_sync(jpeg_bytes, query, model, key, url, "DeepSeek")
+    raise ValueError(f"Unsupported vision provider: {provider!r}")
+
+
 async def localize_object_3d(
     jpeg_bytes: bytes,
     query: str,
@@ -224,10 +493,11 @@ async def localize_object_3d(
     q_rad: list[float] | None = None,
     z_m: float | None = None,
     use_gemini: bool = True,
-    timeout_s: float = 6.0,
+    timeout_s: float = 12.0,
     model: str | None = None,
+    provider: str = "auto",
 ) -> dict[str, Any]:
-    """Localize `query` in `jpeg_bytes` via Gemini 4 Hydrogen (with OpenCV fallback) and project to 3D."""
+    """Localize `query` in `jpeg_bytes` via Gemini/Anthropic/OpenAI/Qwen/DeepSeek (with OpenCV fallback) and project to 3D."""
     bgr = _decode_bgr(jpeg_bytes)
     h, w = bgr.shape[:2]
 
@@ -235,19 +505,23 @@ async def localize_object_3d(
     fallback_reason: str | None = None
     det: dict[str, Any] | None = None
 
-    if use_gemini:
-        chosen_model = model or GEMINI_VISION_MODEL
+    resolved_provider = _resolve_provider(provider)
+    if use_gemini and resolved_provider != "opencv":
+        chosen_model = model or DEFAULT_PROVIDER_MODELS.get(resolved_provider, GEMINI_VISION_MODEL)
+        allowed = VISION_MODELS_BY_PROVIDER.get(resolved_provider)
+        if allowed and model and model not in allowed:
+            raise ValueError(f"Model {model!r} is not in vision-capable list for {resolved_provider}: {allowed}")
         try:
             det = await asyncio.wait_for(
-                asyncio.to_thread(_call_gemini_interactions_sync, jpeg_bytes, query, chosen_model),
+                asyncio.to_thread(_call_vlm_sync, jpeg_bytes, query, resolved_provider, chosen_model),
                 timeout=timeout_s,
             )
-            backend = chosen_model
+            backend = chosen_model if resolved_provider == "gemini" else f"{resolved_provider}:{chosen_model}"
         except Exception as exc:
             fallback_reason = str(exc) or exc.__class__.__name__
             det = None
     else:
-        fallback_reason = "use_gemini=False"
+        fallback_reason = "opencv_only" if resolved_provider == "opencv" else "use_gemini=False"
 
     if det is None:
         det = await asyncio.to_thread(localize_opencv, bgr, query)
@@ -267,7 +541,15 @@ async def localize_object_3d(
     w_m = round((box_w_px / max(1.0, float(K[0, 0]))) * depth_m, 4)
     h_m = round((box_h_px / max(1.0, float(K[1, 1]))) * depth_m, 4)
 
-    yaw_rad = math.radians(float(det.get("yaw_deg", 0.0)))
+    yaw_deg = float(det.get("yaw_deg", 0.0))
+    half_yaw = math.radians(yaw_deg) * 0.5
+    half_pitch = math.pi / 4.0
+    cy, sy = math.cos(half_yaw), math.sin(half_yaw)
+    cp, sp = math.cos(half_pitch), math.sin(half_pitch)
+    qx = -sp * sy
+    qy = sp * cy
+    qz = cp * sy
+    qw = cp * cy
 
     return {
         "query": query,
@@ -285,12 +567,166 @@ async def localize_object_3d(
             "x": wx,
             "y": wy,
             "z": wz,
-            "alpha": 0.0,
-            "beta": round(math.pi / 2, 5),
-            "gamma": round(yaw_rad, 4),
+            "qx": round(qx, 8),
+            "qy": round(qy, 8),
+            "qz": round(qz, 8),
+            "qw": round(qw, 8),
         },
-        "yaw_rad": round(yaw_rad, 4),
         "depth_m": depth_m,
         "size_m": [w_m, h_m],
         "confidence": round(float(det.get("confidence", 0.0)), 3),
     }
+
+
+def triangulate_two_rays(
+    calib: CalibrationStore,
+    px_top: float,
+    py_top: float,
+    px_wrist: float,
+    py_wrist: float,
+    q_rad: list[float] | np.ndarray | None = None,
+) -> tuple[tuple[float, float, float] | None, float | None]:
+    """Triangulate 3D world point from simultaneous `top` and `wrist` (gripper) pixel detections."""
+    T_top = calib.T_world_cam("top")
+    T_wrist = calib.T_world_cam("wrist", q_rad=q_rad)
+    if T_top is None or T_wrist is None:
+        return None, None
+
+    r1 = T_top[:3, :3] @ calib._ray_cam(px_top, py_top, "top")
+    r2 = T_wrist[:3, :3] @ calib._ray_cam(px_wrist, py_wrist, "wrist")
+    n1 = float(np.linalg.norm(r1))
+    n2 = float(np.linalg.norm(r2))
+    if n1 < 1e-8 or n2 < 1e-8:
+        return None, None
+    d1 = r1 / n1
+    d2 = r2 / n2
+    o1 = T_top[:3, 3]
+    o2 = T_wrist[:3, 3]
+
+    b = float(np.dot(d1, d2))
+    denom = 1.0 - b * b
+    if denom < 1e-4:
+        return None, None
+
+    r = o1 - o2
+    d = float(np.dot(d1, r))
+    e = float(np.dot(d2, r))
+    s1 = (b * e - d) / denom
+    s2 = (e - b * d) / denom
+    if s1 <= 0.05 or s2 <= 0.02:
+        return None, None
+
+    p1 = o1 + s1 * d1
+    p2 = o2 + s2 * d2
+    gap = float(np.linalg.norm(p1 - p2))
+    mid = 0.5 * (p1 + p2)
+    if gap > 0.25 or abs(float(mid[2]) - calib.z_table()) > 0.6:
+        return None, None
+
+    return (round(float(mid[0]), 5), round(float(mid[1]), 5), round(float(mid[2]), 5)), round(gap, 5)
+
+
+async def localize_object_3d_dual(
+    top_jpeg: bytes,
+    wrist_jpeg: bytes,
+    query: str,
+    calib: CalibrationStore,
+    q_rad: list[float] | None = None,
+    z_m: float | None = None,
+    use_gemini: bool = True,
+    timeout_s: float = 12.0,
+    model: str | None = None,
+    provider: str = "auto",
+) -> dict[str, Any]:
+    """Localize `query` using both `top` and `wrist` (gripper eye-in-hand) views and fuse into 3D."""
+    det_top, det_wrist = await asyncio.gather(
+        localize_object_3d(
+            jpeg_bytes=top_jpeg,
+            query=query,
+            calib=calib,
+            camera="top",
+            q_rad=q_rad,
+            z_m=z_m,
+            use_gemini=use_gemini,
+            timeout_s=timeout_s,
+            model=model,
+            provider=provider,
+        ),
+        localize_object_3d(
+            jpeg_bytes=wrist_jpeg,
+            query=query,
+            calib=calib,
+            camera="wrist",
+            q_rad=q_rad,
+            z_m=z_m,
+            use_gemini=use_gemini,
+            timeout_s=timeout_s,
+            model=model,
+            provider=provider,
+        ),
+    )
+
+    found_top = bool(det_top.get("found"))
+    found_wrist = bool(det_wrist.get("found"))
+    ray_gap_m: float | None = None
+
+    if found_top and found_wrist:
+        primary = det_top
+        tri_xyz, ray_gap_m = (
+            triangulate_two_rays(
+                calib,
+                det_top["pixel"][0],
+                det_top["pixel"][1],
+                det_wrist["pixel"][0],
+                det_wrist["pixel"][1],
+                q_rad=q_rad,
+            )
+            if z_m is None
+            else (None, None)
+        )
+        if tri_xyz is not None:
+            wx, wy, wz = tri_xyz
+            fusion_mode = "triangulated"
+        else:
+            w_top = max(0.1, float(det_top.get("confidence", 0.5)))
+            w_wrist = max(0.1, float(det_wrist.get("confidence", 0.5)))
+            if "T_ee_cam_wrist" not in calib.data and "T_world_cam_wrist" not in calib.data:
+                w_wrist *= 0.25
+            tot = w_top + w_wrist
+            wt, ww = det_top["world"], det_wrist["world"]
+            wx = round((w_top * wt["x"] + w_wrist * ww["x"]) / tot, 5)
+            wy = round((w_top * wt["y"] + w_wrist * ww["y"]) / tot, 5)
+            wz = round((w_top * wt["z"] + w_wrist * ww["z"]) / tot, 5)
+            fusion_mode = "confidence_weighted"
+        conf = round(max(float(det_top.get("confidence", 0.0)), float(det_wrist.get("confidence", 0.0))), 3)
+    elif found_top:
+        primary = det_top
+        wx, wy, wz = det_top["world"]["x"], det_top["world"]["y"], det_top["world"]["z"]
+        fusion_mode = "single_view_top"
+        conf = float(det_top.get("confidence", 0.0))
+    elif found_wrist:
+        primary = det_wrist
+        wx, wy, wz = det_wrist["world"]["x"], det_wrist["world"]["y"], det_wrist["world"]["z"]
+        fusion_mode = "single_view_wrist"
+        conf = float(det_wrist.get("confidence", 0.0))
+    else:
+        primary = det_top
+        wx, wy, wz = det_top["world"]["x"], det_top["world"]["y"], det_top["world"]["z"]
+        fusion_mode = "none"
+        conf = 0.0
+
+    out = dict(primary)
+    out["camera"] = "both"
+    out["found"] = found_top or found_wrist
+    out["fusion_mode"] = fusion_mode
+    out["ray_gap_m"] = ray_gap_m
+    out["confidence"] = conf
+    out["world"] = {"x": wx, "y": wy, "z": wz}
+    out["pose_6d"] = {
+        **primary["pose_6d"],
+        "x": wx,
+        "y": wy,
+        "z": wz,
+    }
+    out["views"] = {"top": det_top, "wrist": det_wrist}
+    return out

@@ -26,15 +26,18 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
     Checkbox,
     Footer,
     Header,
+    Input,
     Label,
     ListItem,
     ListView,
     RichLog,
+    Select,
     Static,
     TextArea,
 )
@@ -49,6 +52,10 @@ SAFETY_GROUPS: dict[str, tuple[str, str]] = {
     "get_calib_status": ("READ", "green"),
     "reload_config": ("READ", "green"),
     "localize_3d": ("VISION", "cyan"),
+    "robo_jev_arm_watch": ("SAFETY", "yellow"),
+    "robo_jev_check": ("SAFETY", "yellow"),
+    "robo_jev_guard": ("SAFETY", "yellow"),
+    "speak_status": ("AUDIO", "cyan"),
     "pixel_to_world": ("GEOM", "cyan"),
     "get_metric_depth": ("GEOM", "cyan"),
     "solve_ik": ("PLAN", "cyan"),
@@ -75,9 +82,13 @@ DEFAULT_ARGS: dict[str, dict[str, Any]] = {
     "get_calib_status": {},
     "reload_config": {},
     "localize_3d": {"query": "keys", "camera": "top", "use_gemini": True, "timeout_s": 6.0},
+    "robo_jev_arm_watch": {"x": 640.0, "y": 360.0, "query": "keys", "camera": "top"},
+    "robo_jev_check": {"camera": "top", "abort_on_hazard": True},
+    "robo_jev_guard": {"query": "keys", "camera": "top", "obstacle_wait_timeout_s": 5.0, "use_gemini": False},
+    "speak_status": {"text": "Desk core standing by."},
     "pixel_to_world": {"x": 640.0, "y": 360.0, "camera": "top"},
     "get_metric_depth": {"x": 640.0, "y": 360.0, "camera": "top"},
-    "solve_ik": {"x": 0.25, "y": 0.0, "z": 0.10, "alpha": 0.0, "beta": 1.2, "gamma": 0.0},
+    "solve_ik": {"x": 0.25, "y": 0.0, "z": 0.10, "qx": 0.0, "qy": 0.564687767, "qz": 0.0, "qw": 0.825335614},
     "update_scene_obstacle": {
         "name": "mug",
         "x": 0.25,
@@ -95,10 +106,10 @@ DEFAULT_ARGS: dict[str, dict[str, Any]] = {
     "move_joints": {"targets": {"1": 2048}, "max_step": 150, "wait": True},
     "move_joint": {"joints": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "max_step_rad": 0.2, "wait": True},
     "go_home": {},
-    "move_to_pose": {"x": 0.25, "y": 0.0, "z": 0.12, "alpha": 0.0, "beta": 1.2, "gamma": 0.0},
-    "pick_at": {"x": 0.25, "y": 0.0, "z": 0.05, "yaw": 0.0, "approach_dz": 0.06},
-    "place_at": {"x": 0.25, "y": 0.12, "z": 0.05, "yaw": 0.0, "retract_dz": 0.06},
-    "pick_pixel": {"x": 640.0, "y": 360.0, "camera": "top", "yaw": 0.0},
+    "move_to_pose": {"x": 0.25, "y": 0.0, "z": 0.12, "qx": 0.0, "qy": 0.564687767, "qz": 0.0, "qw": 0.825335614},
+    "pick_at": {"x": 0.25, "y": 0.0, "z": 0.05, "qx": 0.0, "qy": 0.707106781, "qz": 0.0, "qw": 0.707106781, "approach_dz": 0.06},
+    "place_at": {"x": 0.25, "y": 0.12, "z": 0.05, "qx": 0.0, "qy": 0.707106781, "qz": 0.0, "qw": 0.707106781, "retract_dz": 0.06},
+    "pick_pixel": {"x": 640.0, "y": 360.0, "camera": "top", "qx": 0.0, "qy": 0.707106781, "qz": 0.0, "qw": 0.707106781},
     "execute_sequence": {
         "steps": [
             {"tool": "get_calib_status", "args": {}, "save_as": "cal"},
@@ -117,6 +128,10 @@ LIVE_SAFETY_NOTES: dict[str, str] = {
     "get_calib_status": "Safe (read-only): inspects calibration JSON, missing fields & IK backend.",
     "reload_config": "Safe (read-only): reloads calibration JSON & IK module without moving.",
     "localize_3d": "Safe (vision only): runs Gemini 4 Hydrogen or OpenCV fallback; no motor motion.",
+    "robo_jev_arm_watch": "Safe (vision only): arms <150 ms shift tracking on pixel (x, y).",
+    "robo_jev_check": "Safe (reflex check): checks target_shifted/path_clear; calls estop() on hazard.",
+    "robo_jev_guard": "Safe (pause/recover): waits for obstacle to clear; recalibrates shift if in safe bounds.",
+    "speak_status": "Safe (audio only): speaks status cue via portable speaker TTS.",
     "pixel_to_world": "Safe (math only): projects pixel to 3D (nominal height until #4/#6 extrinsics land).",
     "get_metric_depth": "Safe (math only): estimates depth (nominal height until #4/#6 extrinsics land).",
     "solve_ik": "Safe (math only): solves [j1..j7] without moving (fallback IK until #5/#7 land).",
@@ -145,19 +160,122 @@ def _server_params(live: bool) -> StdioServerParameters:
         env["DESK_MOCK"] = "1"
         env["DESK_NO_DOTENV"] = "1"
         env["STATION_HOST"] = ""
-    cmd = "uv" if shutil.which("uv") else sys.executable
-    args = (
-        ["run", "--offline", "--managed-python", "python", "-m", "desk_core.mcp_server"]
-        if cmd == "uv"
-        else ["-m", "desk_core.mcp_server"]
+    return StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "desk_core.mcp_server"],
+        env=env,
+        cwd=str(REPO_ROOT),
     )
-    return StdioServerParameters(command=cmd, args=args, env=env, cwd=str(REPO_ROOT))
 
 
 class ToolItem(ListItem):
     def __init__(self, tool_name: str, badge: str, color: str) -> None:
         super().__init__(Label(f"[{color}][{badge:6s}][/{color}] {tool_name}"))
         self.tool_name = tool_name
+
+
+KEY_PROVIDERS = ["gemini", "anthropic", "openai", "qwen", "deepseek"]
+
+
+def _keystore_path() -> Path:
+    env_p = os.environ.get("DESK_KEYS_PATH", "").strip()
+    return Path(env_p) if env_p else (Path.home() / ".config" / "desk-core" / "keys.json")
+
+
+def _read_keystore() -> dict[str, str]:
+    p = _keystore_path()
+    if not p.exists():
+        return {}
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        return {str(k).strip().lower(): str(v).strip() for k, v in raw.items() if str(v).strip()}
+    except Exception:
+        return {}
+
+
+def _write_keystore(data: dict[str, str]) -> Path:
+    p = _keystore_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(p.parent, 0o700)
+    except OSError:
+        pass
+    payload = json.dumps(data, indent=2) + "\n"
+    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, payload.encode("utf-8"))
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(p, 0o600)
+    except OSError:
+        pass
+    return p
+
+
+class KeysModal(ModalScreen[None]):
+    CSS = """
+    KeysModal {
+        align: center middle;
+    }
+    #keys-dialog {
+        width: 64;
+        height: auto;
+        border: solid $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #keys-btns {
+        height: 3;
+        margin-top: 1;
+    }
+    #keys-btns Button {
+        margin-right: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="keys-dialog"):
+            yield Label("[b]Secure Vision API Key Store (0600)[/b]")
+            yield Static("", id="keys-status")
+            yield Select([(p.title(), p) for p in KEY_PROVIDERS], value="gemini", id="key-provider")
+            yield Input(placeholder="Paste API key (masked)...", password=True, id="key-input")
+            with Horizontal(id="keys-btns"):
+                yield Button("Save (0600)", id="btn-key-save", variant="primary")
+                yield Button("Unset", id="btn-key-unset", variant="warning")
+                yield Button("Close", id="btn-key-close")
+
+    def on_mount(self) -> None:
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        store = _read_keystore()
+        parts = [f"{p}:{'SET' if p in store else 'unset'}" for p in KEY_PROVIDERS]
+        self.query_one("#keys-status", Static).update("Stored: " + " | ".join(parts))
+
+    @on(Button.Pressed, "#btn-key-save")
+    def on_save(self) -> None:
+        prov = str(self.query_one("#key-provider", Select).value or "gemini")
+        val = self.query_one("#key-input", Input).value.strip()
+        if not val:
+            return
+        store = _read_keystore()
+        store[prov] = val
+        _write_keystore(store)
+        self.query_one("#key-input", Input).value = ""
+        self._refresh_status()
+
+    @on(Button.Pressed, "#btn-key-unset")
+    def on_unset(self) -> None:
+        prov = str(self.query_one("#key-provider", Select).value or "gemini")
+        store = _read_keystore()
+        store.pop(prov, None)
+        _write_keystore(store)
+        self._refresh_status()
+
+    @on(Button.Pressed, "#btn-key-close")
+    def on_close(self) -> None:
+        self.dismiss(None)
 
 
 class DeskCoreTUI(App):
@@ -210,6 +328,7 @@ class DeskCoreTUI(App):
 
     BINDINGS = [
         Binding("ctrl+r", "run_selected", "Run Tool"),
+        Binding("ctrl+k", "open_keys", "API Keys"),
         Binding("ctrl+e", "trigger_estop", "E-STOP"),
         Binding("f12", "trigger_estop", "E-STOP"),
         Binding("q", "quit", "Quit"),
@@ -237,6 +356,7 @@ class DeskCoreTUI(App):
                 yield TextArea("{}", language="json", id="args-editor")
                 with Horizontal(id="controls"):
                     yield Button("Run Tool (Ctrl+R)", id="btn-run", variant="primary")
+                    yield Button("API Keys (Ctrl+K)", id="btn-keys", variant="default")
                     yield Button("E-STOP (Ctrl+E)", id="btn-estop", variant="error")
                     yield Checkbox("Arm Motion", value=(not self.live), id="arm-motion")
                 yield RichLog(id="output-log", highlight=True, markup=True, wrap=True)
@@ -250,8 +370,9 @@ class DeskCoreTUI(App):
 
     async def _mcp_runner(self) -> None:
         log = self.query_one("#output-log", RichLog)
+        devnull = open(os.devnull, "w", encoding="utf-8")
         try:
-            async with stdio_client(_server_params(self.live)) as (read, write):
+            async with stdio_client(_server_params(self.live), errlog=devnull) as (read, write):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     self.session = session
@@ -280,6 +401,7 @@ class DeskCoreTUI(App):
             log.write(f"[bold red]MCP connect failed:[/bold red] {exc}")
         finally:
             self.session = None
+            devnull.close()
 
     async def on_unmount(self) -> None:
         self._stop_event.set()
@@ -324,6 +446,13 @@ class DeskCoreTUI(App):
     @on(Button.Pressed, "#btn-estop")
     async def _on_estop_btn(self) -> None:
         await self.action_trigger_estop()
+
+    @on(Button.Pressed, "#btn-keys")
+    def _on_keys_btn(self) -> None:
+        self.action_open_keys()
+
+    def action_open_keys(self) -> None:
+        self.push_screen(KeysModal())
 
     async def action_trigger_estop(self) -> None:
         await self._call_tool("estop", {})
