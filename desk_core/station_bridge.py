@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import glob
 import io
+import json
 import logging
 import math
 import os
@@ -54,6 +55,8 @@ RANGES_REFRESH_S = 5.0
 SIGN_BIT_MASK = 0x8000
 FULL_STATE_LEN = 0x47
 GRIPPER_SLACK_STEPS = 120
+GRIPPER_CONTACT_CURRENT_MA = 20
+RAW_RX_MAX_AGE_S = 0.5
 DEFAULT_MAX_STEP = int(os.environ.get("ROBOT_MAX_STEP_TICKS", "250"))
 DEFAULT_SPEED = int(os.environ.get("ROBOT_GOAL_SPEED", "600"))
 DEFAULT_ACCEL = int(os.environ.get("ROBOT_GOAL_ACCEL", "20"))
@@ -68,6 +71,20 @@ ELROBOT_MOTOR_RANGES: dict[int, tuple[int, int]] = {
     7: (125, 3971),
     8: (1232, 2864),
 }
+
+## added by Abhi
+def _calibrated_elrobot_bus() -> str:
+    """Return the serial tied to the measured ElRobot limits."""
+    from .calib_store import resolve_default_calib_path
+
+    try:
+        rig = json.loads(resolve_default_calib_path().read_text())
+        if rig.get("calibrated") and rig.get("arm_type") == "elrobot" and rig.get("num_arm_joints") == 7:
+            return rig.get("hardware", {}).get("bus_serial", "").strip()
+    except (OSError, ValueError, AttributeError):
+        pass
+    return ""
+
 
 # Auto-reconnect (issue #3): a live NormFS subscription should see motor
 # traffic many times per second; silence this long means the subscription died
@@ -486,6 +503,7 @@ class LiveStationBridge:
         self.host = host
         self.port = port
         self.target_bus = (target_bus or "").strip() or None
+        self._elrobot_range_bus = _calibrated_elrobot_bus()
         self.client = None
         self._st3215 = None
         self._usbvideo = None
@@ -520,6 +538,7 @@ class LiveStationBridge:
         }
 
     def apply_hardware_config(self, bus_serial: str | None = None, cam_top: str | None = None, cam_wrist: str | None = None) -> None:
+        self._elrobot_range_bus = _calibrated_elrobot_bus()
         if bus_serial is not None:
             self.target_bus = bus_serial.strip() or None
         if cam_top is not None:
@@ -804,6 +823,8 @@ class LiveStationBridge:
                 return False
         if not (self.client.connected and self.client.setup_done):
             return False
+        if self._follow_motor_rx:
+            self._ranges_polled_mono = time.monotonic()
         try:
             qr = self.client.read_from_tail("st3215/inference", offset=b"\x00", limit=1, step=1, buf_size=4)
             latest_entry = None
@@ -815,7 +836,6 @@ class LiveStationBridge:
                     break
                 latest_entry = entry
             if latest_entry is not None and self._follow_motor_rx:
-                self._ranges_polled_mono = time.monotonic()
                 self._ingest_inference_bytes(latest_entry.Data, ranges_only=True)
                 return False
             if latest_entry is not None and self._ingest_inference_bytes(latest_entry.Data):
@@ -1062,9 +1082,12 @@ class LiveStationBridge:
             # Safe-start writes Goal=Present; both must come from live telemetry.
             self._require_fresh()
         st = await self.get_state()
+        if self.target_bus and st.bus_serial != self.target_bus:
+            raise RuntimeError(f"Expected follower bus {self.target_bus}, found {st.bus_serial}")
         mids = motor_ids or [m.id for m in st.motors]
         pack = []
         if enable:
+            self._require_fresh_motor_rx(st, mids)
             present = {m.id: m.position.to_bytes(2, "little") for m in st.motors if m.id in mids}
             pack.append(self._sync_write(st.bus_serial, RAM_GOAL_POSITION, present))
             pack.append(self._sync_write(st.bus_serial, RAM_GOAL_SPEED, {m: DEFAULT_SPEED.to_bytes(2, "little") for m in mids}))
@@ -1077,28 +1100,59 @@ class LiveStationBridge:
         await self._send_commands(self.client, pack)
         return True
 
+    ## added by Abhi
+    def _require_fresh_motor_rx(self, state: RobotState, motor_ids) -> None:
+        if not self._follow_motor_rx:
+            return
+        now = time.monotonic()
+        for mid in motor_ids:
+            if not 0 <= now - self.rx_received_at.get((state.bus_serial, int(mid)), -math.inf) <= RAW_RX_MAX_AGE_S:
+                raise RuntimeError(f"Motor {mid} raw telemetry is stale")
+
+    ## added by Abhi
+    def _effective_motor_range(self, bus_serial: str, motor: MotorState) -> tuple[int, int]:
+        lo, hi = motor.range_min, motor.range_max
+        if 0 <= lo < hi <= MAX_ANGLE_STEP and (lo, hi) != (0, MAX_ANGLE_STEP):
+            return lo, hi
+        if bus_serial == self._elrobot_range_bus and motor.id in ELROBOT_MOTOR_RANGES:
+            return ELROBOT_MOTOR_RANGES[motor.id]
+        return 0, MAX_ANGLE_STEP
+
     async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP) -> dict[int, int]:
         if hasattr(self.client, "read_from_tail"):
             await self._poll_inference_tail(timeout_s=1.0)
         self._require_fresh()
         st = await self.get_state()
+        if self.target_bus and st.bus_serial != self.target_bus:
+            raise RuntimeError(f"Expected follower bus {self.target_bus}, found {st.bus_serial}")
+        if max_step <= 0:
+            raise ValueError("max_step must be positive")
+        step_limit = min(max_step, DEFAULT_MAX_STEP)
         by_id = {m.id: m for m in st.motors}
         applied: dict[int, int] = {}
-        need_start = [int(mid) for mid in targets if int(mid) in by_id and int(mid) not in self._torque_started]
-        if need_start:
-            await self.set_torque(True, need_start)
+        self._require_fresh_motor_rx(st, targets)
 
         for raw_mid, raw_tgt in targets.items():
             mid = int(raw_mid)
             if mid not in by_id:
+                if self._follow_motor_rx:
+                    raise RuntimeError(f"Missing follower telemetry for motor {mid}")
                 continue
             m = by_id[mid]
-            lo, hi = (m.range_min, m.range_max) if m.range_max > m.range_min else (0, MAX_ANGLE_STEP)
+            if m.error_status:
+                raise RuntimeError(f"Motor {mid} reports error status {m.error_status}")
+            lo, hi = self._effective_motor_range(st.bus_serial, m)
             clamped = max(lo, min(hi, int(raw_tgt)))
-            delta = max(-max_step, min(max_step, clamped - m.position))
-            applied[mid] = m.position + delta
+            delta = max(-step_limit, min(step_limit, clamped - m.position))
+            stepped = m.position + delta
+            if not lo <= stepped <= hi:
+                raise RuntimeError(f"Motor {mid} cannot enter its calibrated range within one safe step")
+            applied[mid] = stepped
 
         if applied:
+            need_start = [mid for mid in applied if mid not in self._torque_started]
+            if need_start:
+                await self.set_torque(True, need_start)
             cmd = self._sync_write(
                 st.bus_serial,
                 RAM_GOAL_POSITION,
@@ -1117,23 +1171,75 @@ class LiveStationBridge:
             await asyncio.sleep(0.08)
         return False
 
+    ### 7. Verify grip after bounded closing steps
+    ## added by Abhi
+    def _gripper_rx(self, state: RobotState, bus: str, mid: int) -> tuple[MotorState, float]:
+        if state.bus_serial != bus:
+            raise RuntimeError(f"Expected gripper bus {bus}, found {state.bus_serial}")
+        motor = next((m for m in state.motors if m.id == mid), None)
+        if motor is None or motor.error_status:
+            raise RuntimeError(f"Gripper motor {mid} is missing or reports an error")
+        stamp = self.rx_received_at.get((bus, mid), 0)
+        if not 0 <= time.monotonic() - stamp <= RAW_RX_MAX_AGE_S:
+            raise RuntimeError(f"Gripper motor {mid} requires fresh raw RX telemetry")
+        return motor, stamp
+
+    ### 7. Close and verify the grasp
     async def grasp_with_verify(self, close_ticks: int | None = None, open_ticks: int | None = None) -> dict:
-        st = await self.get_state()
-        gripper = st.motors[-1]
-        tgt = close_ticks if close_ticks is not None else gripper.range_min
-        applied = await self.send_joint_targets({gripper.id: tgt}, max_step=1200)
-        await asyncio.sleep(1.8)
-        st2 = await self.get_state()
-        g2 = next(m for m in st2.motors if m.id == gripper.id)
-        gap = abs(g2.position - gripper.range_min)
-        return {
-            "ok": True,
-            "holding": gap > GRIPPER_SLACK_STEPS,
-            "gripper_id": g2.id,
-            "position": g2.position,
-            "target": applied.get(gripper.id, tgt),
-            "current_ma": g2.current_ma,
-        }
+        result = {"ok": False, "holding": False}
+        try:
+            state = await self.get_state()
+            bus = self.target_bus or state.bus_serial
+            mid = 8 if bus == self._elrobot_range_bus else state.motors[-1].id
+            motor, stamp = self._gripper_rx(state, bus, mid)
+            lo, hi = self._effective_motor_range(bus, motor)
+            target = lo if close_ticks is None else int(close_ticks)
+            open_target = hi if open_ticks is None else int(open_ticks)
+            if not lo <= target <= hi or not lo <= open_target <= hi or open_target == target:
+                raise ValueError("Gripper targets must be distinct and inside the calibrated range")
+            direction = 1 if target > open_target else -1
+            initial_position = motor.position
+            min_current = max(GRIPPER_CONTACT_CURRENT_MA, motor.current_ma + 10)
+            result.update(gripper_id=mid, requested_close=target, position=initial_position, current_ma=motor.current_ma)
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                if abs(motor.position - target) <= 25:
+                    return {**result, "ok": True, "target": target, "reason": "closed without contact"}
+
+                commanded = (await self.send_joint_targets({mid: target})).get(mid)
+                if commanded is None:
+                    raise RuntimeError("The bridge did not send a gripper target")
+                stamp = max(stamp, self.rx_received_at.get((bus, mid), 0))
+                result["target"] = commanded
+                contact_since = None
+                contact_position = None
+                step_deadline = min(deadline, time.monotonic() + 1.8)
+                while time.monotonic() < step_deadline:
+                    sample, received = self._gripper_rx(await self.get_state(), bus, mid)
+                    if received > stamp:
+                        motor, stamp = sample, received
+                        result.update(position=motor.position, current_ma=motor.current_ma)
+                        if abs(motor.position - commanded) <= 25:
+                            # An intermediate creep setpoint is not an indication of contact.
+                            break
+                        under_load = (
+                            direction * (commanded - motor.position) > 25
+                            and direction * (target - motor.position) > GRIPPER_SLACK_STEPS
+                            and direction * (motor.position - initial_position) > 10
+                            and motor.current_ma >= min_current
+                        )
+                        if not under_load:
+                            contact_since = contact_position = None
+                        elif contact_since is None or abs(motor.position - contact_position) > 6:
+                            contact_since, contact_position = stamp, motor.position
+                        elif stamp - contact_since >= 0.3:
+                            return {**result, "ok": True, "holding": True}
+                    await asyncio.sleep(0.08)
+                else:
+                    raise RuntimeError("Gripper did not reach the step target or verify contact")
+            raise RuntimeError("Timed out closing the gripper")
+        except (RuntimeError, ValueError, IndexError) as exc:
+            return {**result, "reason": str(exc)}
 
     async def abort(self) -> dict:
         # Hold Position uses live PresentPosition when fresh (prevents jumping
@@ -1143,10 +1249,13 @@ class LiveStationBridge:
             await self._poll_inference_tail(timeout_s=1.0)
         try:
             self._require_fresh()
+            st = await self.get_state()
+            self._require_fresh_motor_rx(st, st.positions())
         except RuntimeError as exc:
             await self.set_torque(False)
             return {"aborted": True, "mode": "torque_off_stale", "reason": str(exc)}
-        st = await self.get_state()
+        if self.target_bus and st.bus_serial != self.target_bus:
+            raise RuntimeError(f"Expected follower bus {self.target_bus}, found {st.bus_serial}")
         hold = {m.id: m.position.to_bytes(2, "little") for m in st.motors}
         cmd = self._sync_write(st.bus_serial, RAM_GOAL_POSITION, hold)
         await self._send_commands(self.client, [cmd])
@@ -1162,7 +1271,7 @@ def _load_hardware_fallback() -> dict[str, str]:
         return {"bus_serial": "", "camera_top": "", "camera_wrist": ""}
 
 
-def create_bridge() -> StationBridge:
+def create_bridge(*, follow_motor_rx: bool = False) -> StationBridge:
     host = os.environ.get("STATION_HOST", "").strip()
     port = int(os.environ.get("STATION_PORT", "8888"))
     if os.environ.get("DESK_MOCK") == "1" or not host:
@@ -1171,4 +1280,7 @@ def create_bridge() -> StationBridge:
     bus = os.environ.get("STATION_BUS_SERIAL", "").strip() or hw.get("bus_serial") or None
     cam_top = os.environ.get("CAMERA_TOP", "").strip() or hw.get("camera_top") or ""
     cam_wrist = os.environ.get("CAMERA_WRIST", "").strip() or hw.get("camera_wrist") or ""
-    return LiveStationBridge(host=host, port=port, target_bus=bus, cam_top=cam_top, cam_wrist=cam_wrist)
+    return LiveStationBridge(
+        host=host, port=port, target_bus=bus, cam_top=cam_top, cam_wrist=cam_wrist,
+        follow_motor_rx=follow_motor_rx,
+    )

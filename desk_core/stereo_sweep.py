@@ -10,9 +10,12 @@ i.e. ``rel = inv(T_base_cam_b) @ T_base_cam_a``.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field, replace
 import itertools
+import json
 import math
+import time
 
 import cv2
 import numpy as np
@@ -20,7 +23,10 @@ from scipy.spatial.transform import Rotation
 
 from .calib_store import TICKS_PER_RAD, CalibrationStore
 from .ik_tracik import TracIKSolver
-from .motion import TCP_IN_FLANGE, MotionLimits, allowed_bounds_rad, lowest_point_m, plan_flange_move
+from .motion import (TCP_IN_FLANGE, MotionLimits, allowed_bounds_rad, calibrated_range,
+                     lowest_point_m, plan_flange_move, stream_joint_path)
+from .urdf_fk import load_urdf
+from .wrist_stereo import DEFAULT_WRIST_INTRINSICS, WristPair
 
 
 @dataclass
@@ -616,3 +622,247 @@ def write_ply(path, points, colors) -> None:
     with open(path, "wb") as stream:
         stream.write(header.encode())
         stream.write(vertex.tobytes())
+
+
+## added by Abhi
+_RX_FRESH_S = 0.35
+_STILL_S = 0.7
+_ARM_IDS = tuple(range(1, 8))
+
+
+def registered_obstacle_path_problem(calib, path, obstacles, *, points_in_flange=None):
+    """Check sampled arm segments, jaw tips and wrist camera against registered obstacles.
+
+    This is a conservative obstacle proxy. The caller checks the table floor and
+    retains the usual Station supervision, joint limits, and stop behavior.
+    """
+    if not obstacles:
+        return None
+    robot = load_urdf(calib.urdf_path())
+    world = calib.world_frame()
+    chain = robot.chain(calib.wrist_mount_link(), world)
+    links = [joint.child for joint in chain if joint.name in calib.joint_names()]
+    mount = np.asarray(calib.data["T_ee_cam_wrist"], dtype=float)
+    samples = []
+    for q in path:
+        centres = [calib.fk_ee_pose(q, target_link=link)[:3, 3] for link in links]
+        flange = calib.fk_ee_pose(q)
+        tip = flange[:3, :3] @ TCP_IN_FLANGE + flange[:3, 3]
+        centres.append(tip)
+        samples.append((flange @ mount)[:3, 3])
+        if points_in_flange is not None:
+            samples.extend(points_in_flange @ flange[:3, :3].T + flange[:3, 3])
+        for a, b in zip(centres[:-1], centres[1:]):
+            samples.extend(np.linspace(a, b, max(2, math.ceil(np.linalg.norm(b - a) / 0.01) + 1)))
+    points = np.asarray(samples)
+    for obstacle in obstacles:
+        obs = obstacle if isinstance(obstacle, dict) else vars(obstacle)
+        center = np.array([obs["x"], obs["y"], obs["z"]], dtype=float)
+        radius = float(obs.get("radius_m", 0.045))
+        height = float(obs.get("height_m", 0.10))
+        if not np.isfinite(center).all() or not 0 < radius < math.inf or not 0 < height < math.inf:
+            raise ValueError("Registered obstacles need finite positions and positive dimensions.")
+        if obs.get("shape") == "box":
+            size = obs.get("size_xyz")
+            half_size = np.asarray((2 * radius, 2 * radius, height) if size is None else size, dtype=float) / 2
+            if half_size.shape != (3,) or not np.isfinite(half_size).all() or np.any(half_size <= 0):
+                raise ValueError("Registered box obstacles need three positive dimensions.")
+            distances = np.linalg.norm(np.maximum(np.abs(points - center) - half_size, 0), axis=1)
+        else:
+            distances = cylinder_distance(points, center[:2], center[2] - height / 2, center[2] + height / 2, radius)
+        if float(distances.min()) < 0.04:
+            return f"path comes within 4 cm of registered obstacle {obs.get('name', 'unnamed')}"
+    return None
+
+
+def _wrist_calibration(calib):
+    data = calib.data
+    if (not data.get("calibrated") or data.get("arm_type") != "elrobot"
+            or calib.world_frame() != "base_link" or calib.num_arm_joints(8) != 7):
+        raise ValueError("Wrist sweep requires measured ElRobot calibration in base_link.")
+    if "K_wrist" not in data and "image_size_wrist" not in data:
+        # An explicit rig path can omit camera-only fields stored with the wrist calibration.
+        wrist = json.loads(DEFAULT_WRIST_INTRINSICS.read_text(encoding="utf-8"))["wrist"]
+        K = np.asarray(wrist["camera_matrix"], dtype=float)
+        size = np.asarray(wrist["image_size"])
+        dist = wrist.get("distortion_coefficients")
+        dist = None if dist is None else np.asarray(dist, dtype=float)
+    else:
+        K = np.asarray(data.get("K_wrist"), dtype=float)
+        size = np.asarray(data.get("image_size_wrist"))
+        dist = calib._dist("wrist")
+    if K.shape != (3, 3) or not np.isfinite(K).all() or min(K[0, 0], K[1, 1]) <= 0:
+        raise ValueError("Missing measured wrist intrinsics. Load the calibrated camera file.")
+    if size.shape != (2,) or not np.issubdtype(size.dtype, np.integer) or np.any(size < 240):
+        raise ValueError("Missing calibrated wrist image size.")
+    if dist is not None and (dist.size not in (4, 5, 8, 12, 14) or not np.isfinite(dist).all()):
+        raise ValueError("Invalid wrist camera distortion calibration.")
+    mount = np.asarray(data.get("T_ee_cam_wrist"), dtype=float)
+    if (mount.shape != (4, 4) or not np.isfinite(mount).all()
+            or "z_table" not in data or not np.isfinite(calib.z_table())):
+        raise ValueError("Missing measured wrist mount or table height.")
+    return K, dist, tuple(map(int, size))
+
+
+async def _wrist_state(bridge, calib):
+    state = await bridge.get_state()
+    if [m.id for m in state.motors] != [*_ARM_IDS, 8] or any(m.error_status for m in state.motors):
+        raise RuntimeError("Expected eight healthy follower motors in order M1–M8.")
+    if any(not calibrated_range(m)[0] <= m.position <= calibrated_range(m)[1] for m in state.motors):
+        raise RuntimeError("A follower motor is outside its calibrated range.")
+    link = bridge.link_status()
+    if link.get("bridge") != "mock":
+        expected = calib.hardware_config()["bus_serial"]
+        if not expected or state.bus_serial != expected or not link.get("socket_up") or link.get("resyncing"):
+            raise RuntimeError("The calibrated follower bus is unavailable.")
+        now = time.monotonic()
+        receipts = getattr(bridge, "rx_received_at", {})
+        if any(not 0 <= now - receipts.get((state.bus_serial, i), -math.inf) <= _RX_FRESH_S for i in _ARM_IDS):
+            raise RuntimeError("Fresh raw encoder telemetry is required for all seven arm motors.")
+    # Live updates mutate the motor records. Keep the captured ticks fixed while planning.
+    return replace(state, motors=[replace(m) for m in state.motors])
+
+
+def _target_roi(T_cam, K, dist, target, size):
+    depth = float((T_cam[:3, :3].T @ (target - T_cam[:3, 3]))[2])
+    if not 0.10 <= depth <= 0.8:
+        return None
+    pixel = project(T_cam, K, dist, target)
+    if not np.isfinite(pixel).all() or np.any(pixel < 120) or np.any(pixel > np.asarray(size) - 120):
+        return None
+    x, y = np.rint(pixel).astype(int)
+    return (int(x) - 80, int(y) - 80, 160, 160), pixel.tolist(), depth
+
+
+async def _execute_wrist_path(bridge, calib, path, duration, limits):
+    state = await _wrist_state(bridge, calib)
+    start = calib.rad_to_ticks(path[0].tolist(), state.motors)
+    if any(abs(state.positions()[mid] - tick) > 6 for mid, tick in start.items()):
+        return {"ok": False, "reason": "The arm moved while the wrist path was planned."}
+    # Validate and stream the same path without feed-forward offsets changing its geometry.
+    run = await stream_joint_path(bridge, calib, path, duration, limits, gravity_ff=False)
+    if not run["ok"]:
+        return {"ok": False, "reason": run.get("aborted", "Wrist motion failed."), "motion_started": True}
+    actual = await _wrist_state(bridge, calib)
+    goal = calib.rad_to_ticks(path[-1].tolist(), actual.motors)
+    if any(abs(actual.positions()[mid] - tick) > 25 for mid, tick in goal.items()):
+        return {"ok": False, "reason": "The wrist failed to reach its planned pose.", "motion_started": True}
+    return {"ok": True, "motion_started": True, "motion": run}
+
+
+### 3. Aim the wrist camera.
+async def aim_wrist(bridge, calib, target_base_m, *, execute=False, obstacles=()):
+    """Find a usable view of a metric target and optionally make one checked move."""
+    K, dist, size = _wrist_calibration(calib)
+    target = np.asarray(target_base_m, dtype=float).reshape(3)
+    if not np.isfinite(target).all():
+        raise ValueError("Target coordinates must be finite.")
+    state = await _wrist_state(bridge, calib)
+    T_now = camera_pose(calib, state.motors)
+    view = _target_roi(T_now, K, dist, target, size)
+    if view is not None:
+        return {"ok": True, "executed": False, "already_visible": True, "roi": view[0], "target_px": view[1]}
+
+    limits = MotionLimits()
+    grid = view_grid(T_now, target, standoffs_m=(0.22,), tilts_deg=(15, 30),
+                     azimuths_deg=(0, -15, 15), roll_offsets_deg=(0,))
+    views = await asyncio.to_thread(
+        plan_view_pose, calib, state.motors, target, K, dist, size,
+        limits=limits, max_move_deg=45.0, evaluate_top=3, grid=grid[:16],
+    )
+    selected = next((v for v in views if v.slide and not registered_obstacle_path_problem(calib, v.path, obstacles)
+                     and not registered_obstacle_path_problem(calib, v.slide.plan["path"], obstacles)), None)
+    if selected is None:
+        return {"ok": False, "reason": "No clear wrist viewing pose with room for a slide was found."}
+    flange_points = np.array([calib.fk_ee_pose(q)[:3, 3] for q in selected.path])
+    length_cm = 100 * np.linalg.norm(np.diff(flange_points, axis=0), axis=1).sum()
+    duration = float(max(limits.min_duration_s, 1.875 * length_cm / limits.speed_cm_s,
+                         1.875 * selected.move_deg / limits.joint_speed_deg_s))
+    result = {"ok": True, "executed": execute, "already_visible": False,
+              "plan": selected.describe(), "duration_s": duration}
+    if not execute:
+        return result
+    motion = await _execute_wrist_path(bridge, calib, selected.path, duration, limits)
+    if not motion["ok"]:
+        return motion
+    final = await _wrist_state(bridge, calib)
+    view = _target_roi(camera_pose(calib, final.motors), K, dist, target, size)
+    if view is None:
+        return {"ok": False, "reason": "The target is still outside the usable wrist view.", "motion_started": True}
+    return {**result, **motion, "roi": view[0], "target_px": view[1]}
+
+
+async def _capture_settled_wrist(bridge, calib, camera, size, *, after_stamp=None, timeout_s=6.0):
+    baseline, still_since = None, time.monotonic()
+    deadline = still_since + timeout_s
+    while time.monotonic() < deadline:
+        jpeg = await bridge.get_frame("wrist", denoise=False)
+        state = await _wrist_state(bridge, calib)
+        now = time.monotonic()
+        ticks = np.array([state.positions()[i] for i in _ARM_IDS])
+        stamp = now if bridge.link_status().get("bridge") == "mock" else bridge.frame_received_at.get(camera, -math.inf)
+        if baseline is None or np.max(np.abs(ticks - baseline)) > 3:
+            baseline, still_since = ticks, now
+        elif (now - still_since >= _STILL_S and stamp > still_since and 0 <= now - stamp <= _RX_FRESH_S
+              and (after_stamp is None or stamp > after_stamp)):
+            frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if frame is None or frame.shape[1::-1] != size:
+                raise RuntimeError("Wrist frame does not match the calibrated image size.")
+            return frame, state, ticks.tolist(), stamp
+        await asyncio.sleep(0.05)
+    raise RuntimeError("Timed out waiting for a new settled wrist frame.")
+
+
+### 4. Capture one epipolar stereo pair.
+async def capture_wrist_stereo(bridge, calib, target_base_m, *, execute=False, query=None, obstacles=()):
+    """Plan one clear lateral move and optionally capture both encoder-paired frames."""
+    K, dist, size = _wrist_calibration(calib)
+    target = np.asarray(target_base_m, dtype=float).reshape(3)
+    if not np.isfinite(target).all():
+        raise ValueError("Target coordinates must be finite.")
+    state = await _wrist_state(bridge, calib)
+    mock = bridge.link_status().get("bridge") == "mock"
+    camera_id = "mock-wrist" if mock else calib.hardware_config()["camera_wrist"]
+    cameras = [name for name in await bridge.list_cameras() if camera_id and camera_id in name]
+    if len(cameras) != 1:
+        return {"ok": False, "reason": "The calibrated wrist camera is missing or ambiguous."}
+    camera = cameras[0]
+    stamp_a = None
+    if execute:
+        frame_a, state, ticks_a, stamp_a = await _capture_settled_wrist(bridge, calib, camera, size)
+    T_a = camera_pose(calib, state.motors)
+    view = _target_roi(T_a, K, dist, target, size)
+    if view is None:
+        return {"ok": False, "reason": "The target is too close to the wrist image edge or outside stereo range."}
+    roi, pixel, depth = view
+    if execute and query and "coin" in query.casefold().split():
+        detected = detect_object(frame_a, pixel, mode="round", search_px=100)
+        if detected is not None:
+            pixel, roi = detected[0].tolist(), detected[1]
+
+    limits = MotionLimits()
+    candidates = await asyncio.to_thread(
+        plan_slides, calib, state.motors, T_a, roi, size, depth, K[0, 0],
+        min(0.04, depth * math.tan(math.radians(8))), angles_deg=(0, 180), limits=limits,
+    )
+    slide = next((c for c in rank_slides(candidates, 20.0)
+                  if not registered_obstacle_path_problem(calib, c.plan["path"], obstacles)), None)
+    if slide is None:
+        return {"ok": False, "reason": "No safe sideways stereo slide preserves the target view."}
+    result = {"ok": True, "executed": execute, "roi": roi, "target_px": pixel,
+              "plan": slide.plan["summary"], "camera_key": camera, "bus_serial": state.bus_serial}
+    if not execute:
+        return result
+    motion = await _execute_wrist_path(bridge, calib, slide.plan["path"], slide.plan["duration_s"], limits)
+    if not motion["ok"]:
+        return motion
+    frame_b, final, ticks_b, _ = await _capture_settled_wrist(bridge, calib, camera, size, after_stamp=stamp_a)
+    if final.bus_serial != state.bus_serial:
+        return {"ok": False, "reason": "The follower bus changed during the sweep.", "motion_started": True}
+    T_b = camera_pose(calib, final.motors)
+    baseline = float(np.linalg.norm(T_b[:3, 3] - T_a[:3, 3]))
+    if baseline < 0.008:
+        return {"ok": False, "reason": "The measured motion was too small for stereo.", "motion_started": True}
+    return {**result, **motion, "pair": WristPair(frame_a, frame_b, K, dist, T_a, T_b, calib.z_table()),
+            "baseline_m": baseline, "joint_ticks_a": ticks_a, "joint_ticks_b": ticks_b,
+            "joint_angles_a_rad": calib.ticks_to_rad(state.motors)}

@@ -33,6 +33,23 @@ Replace the example ROI with the target box in the original reference JPEG. The 
 
 The command prints JSON. `grasp_point_base_m` is the contact point and `ik_target` is the corresponding link pose with `x`, `y`, `z`, `qx`, `qy`, `qz`, and `qw`. `object_rpy_rad` reports `[0, 0, yaw]`, with a `null` yaw allowed when you supply a fixed heading. `jaw_yaw_rad`, `surface_z_m`, `surface_match_count`, and `baseline_m` help diagnose the estimate. The command works offline on saved captures. Downstream code can call `estimate_grasp_pose(...)` and pass its `ik_target` to whichever quaternion IK interface is deployed. [Python API](desk_core/pose_estimation.py)
 
+## Run the Station workflow
+
+Start with `master_pick_place(query="red block")` in MCP or run the same dry run from the repo root. The result reports object detection, the wrist aim plan, and the time spent in each stage. [MCP tools](desk_core/mcp_server.py) · [Controller](desk_core/main_control.py)
+
+```bash
+uv run --offline --managed-python python -m desk_core.main_control "red block"
+```
+
+On the Station, register tabletop obstacles and provide the measured tool calibration. Use `grasp_tool` in the active rig or pass `--tool` with a JSON object containing `tool_quaternion_xyzw`, `reference_jaw_yaw_deg`, `tcp_offset_m`, and `jaw_opening_mm`. The quaternion is the verified top-down approach for `Gripper_Base_v1_1`. `--obstacles` accepts a JSON array of `update_scene_obstacle` arguments for the CLI session. [Active rig](calib/rig_calib.json) · [Motor ranges](desk_core/station_bridge.py)
+
+```bash
+uv run --offline --managed-python python -m desk_core.main_control "red block" \
+  --execute --tool path/to/measured_grasp_tool.json --obstacles path/to/obstacles.json
+```
+
+`--execute` allows the wrist aim and sweep. The controller confirms the requested object in wrist view A, evaluates both jaw directions, and uses the across-object grasp. It checks IK paths against the table and registered obstacles before pickup, verifies the grip, releases at the saved X, and returns to the saved joint and gripper ticks. `--cloud` exports the dense PLY after placement and attempts an Open3D preview. `--no-home` ends after retracting at X. [Saved X](calib/drop_location.json) · [Saved home](calib/fixed_positions.json)
+
 ## Inputs and outputs
 
 | Input | Use |
