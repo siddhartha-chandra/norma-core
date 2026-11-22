@@ -163,6 +163,7 @@ class MockStationBridge:
         self.num_joints = num_joints
         self._torque_on = True
         self._aborted = False
+        self._frame_overrides: dict[str, bytes] = {}
         self._motors: dict[int, MotorState] = {
             mid: MotorState(
                 mid,
@@ -183,27 +184,66 @@ class MockStationBridge:
     async def list_cameras(self) -> list[str]:
         return ["mock-top", "mock-wrist"]
 
+    def set_frame_override(self, camera: str, jpeg_bytes: bytes | None) -> None:
+        if jpeg_bytes is None:
+            self._frame_overrides.pop(camera, None)
+        else:
+            self._frame_overrides[camera] = jpeg_bytes
+
     async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
-        img = Image.new("RGB", (640, 480), (235, 232, 224) if camera == "top" else (42, 44, 52))
+        if camera in self._frame_overrides:
+            return self._frame_overrides[camera]
+        # 1. Explicit realistic test image override via env var or repo `mock_frames/{top,wrist}.jpg`
+        env_key = "DESK_MOCK_TOP_IMAGE" if camera == "top" else "DESK_MOCK_WRIST_IMAGE"
+        candidates = []
+        if os.environ.get(env_key, "").strip():
+            candidates.append(Path(os.environ[env_key].strip()))
+        candidates.append(REPO_ROOT / "mock_frames" / f"{camera}.jpg")
+        if os.environ.get("DESK_MOCK_REAL_SNAPS") == "1":
+            candidates.append(REPO_ROOT / ("cam_1.jpg" if camera == "top" else "cam_0.jpg"))
+        for cand in candidates:
+            if cand.exists() and cand.is_file():
+                return cand.read_bytes()
+
+        # 2. Realistic 640x480 fallback desk scene (matches test_primitives shape expectation)
+        img = Image.new("RGB", (640, 480), (222, 220, 214) if camera == "top" else (36, 38, 44))
         d = ImageDraw.Draw(img)
         if camera == "top":
-            # Draw synthetic Desk-Core props: mug obstacle, blue silicone key fob, chunky marker, departure tray
-            d.rectangle([420, 40, 600, 210], fill=(210, 220, 230), outline=(70, 90, 120), width=3)
-            d.text((445, 50), "DEPARTURE TRAY", fill=(50, 65, 90))
-            d.ellipse([260, 180, 345, 265], fill=(165, 95, 55), outline=(90, 45, 20), width=3)
-            d.text((272, 215), "MUG", fill=(255, 255, 255))
-            d.polygon([(140, 310), (215, 285), (225, 315), (150, 340)], fill=(35, 115, 220))
-            d.text((145, 345), "KEYS FOB", fill=(20, 60, 140))
-            d.polygon([(90, 120), (195, 145), (190, 165), (85, 140)], fill=(220, 60, 50))
-            d.text((95, 170), "MARKER", fill=(160, 35, 30))
+            # Subtle desk mat border & shadow
+            d.rectangle([28, 28, 612, 452], fill=(232, 230, 224), outline=(185, 182, 175), width=2)
+            # Departure tray (top right) with inner shadow
+            d.rounded_rectangle([424, 48, 598, 214], radius=12, fill=(170, 174, 180))
+            d.rounded_rectangle([420, 42, 594, 208], radius=12, fill=(208, 215, 224), outline=(80, 95, 115), width=3)
+            d.rounded_rectangle([432, 54, 582, 196], radius=8, fill=(224, 229, 236), outline=(145, 155, 170), width=1)
+            d.text((452, 62), "DEPARTURE TRAY", fill=(65, 80, 105))
+            # Ceramic mug with handle & coffee
+            d.ellipse([265, 185, 353, 273], fill=(165, 162, 156))  # drop shadow
+            d.arc([332, 202, 366, 246], start=-70, end=70, fill=(245, 243, 238), width=7)
+            d.ellipse([260, 180, 346, 266], fill=(245, 243, 238), outline=(180, 176, 170), width=2)
+            d.ellipse([270, 190, 336, 256], fill=(72, 44, 28))  # coffee
+            # Keys: blue silicone fob + metal key ring + brass key blade
+            d.polygon([(145, 314), (219, 289), (229, 319), (155, 344)], fill=(165, 162, 156))
+            d.polygon([(140, 310), (215, 285), (225, 315), (150, 340)], fill=(32, 110, 215))
+            d.ellipse([212, 280, 240, 308], outline=(185, 190, 198), width=3)
+            d.polygon([(234, 286), (274, 274), (277, 283), (237, 295)], fill=(200, 170, 85))
+            # Chunky marker (black body + red cap)
+            d.polygon([(94, 125), (199, 150), (194, 170), (89, 145)], fill=(165, 162, 156))
+            d.polygon([(90, 120), (165, 138), (160, 158), (85, 140)], fill=(38, 40, 46))
+            d.polygon([(165, 138), (196, 145), (191, 165), (160, 158)], fill=(210, 48, 42))
+            # White earbud case
+            d.rounded_rectangle([322, 344, 386, 396], radius=14, fill=(165, 162, 156))
+            d.rounded_rectangle([318, 340, 382, 392], radius=14, fill=(248, 249, 250), outline=(195, 198, 204), width=2)
+            d.ellipse([348, 364, 354, 370], fill=(40, 210, 95))
         else:
-            d.rectangle([20, 20, 620, 460], outline=(80, 180, 255), width=3)
-            d.polygon([(260, 210), (370, 185), (385, 235), (275, 260)], fill=(35, 115, 220))
+            # Wrist view with simulated dark gripper jaws & target
+            d.polygon([(260, 210), (370, 185), (385, 235), (275, 260)], fill=(32, 110, 215))
+            d.polygon([(40, 480), (150, 310), (195, 330), (120, 480)], fill=(28, 30, 35))
+            d.polygon([(600, 480), (490, 310), (445, 330), (520, 480)], fill=(28, 30, 35))
             d.line([(320, 0), (320, 480)], fill=(100, 220, 120), width=1)
             d.line([(0, 240), (640, 240)], fill=(100, 220, 120), width=1)
-        d.text((12, 10), f"MOCK {camera.upper()} | j1={self._motors[1].position}", fill=(20, 20, 20) if camera == "top" else (240, 240, 240))
+        d.text((12, 10), f"MOCK {camera.upper()} | j1={self._motors[1].position}", fill=(35, 35, 35) if camera == "top" else (240, 240, 240))
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
+        img.save(buf, format="JPEG", quality=88)
         return buf.getvalue()
 
     async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP) -> dict[int, int]:

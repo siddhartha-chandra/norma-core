@@ -156,8 +156,8 @@ async def main() -> int:
                 res_frame = await session.call_tool("get_frame", {"camera": "top", "as_matrix": True, "max_dim": 16})
                 meta = _parse(res_frame)
                 arr = np.load(meta["npy_path"])
-                check("get_frame saves full (480,640,3) uint8 ndarray", arr.shape == (480, 640, 3) and arr.dtype == np.uint8, str(arr.shape))
-                check("get_frame inline matrix matches requested max_dim", "matrix" in meta and len(meta["matrix"]) == 12, str(meta.get("matrix_shape")))
+                check("get_frame saves valid RGB uint8 ndarray", arr.shape in ((480, 640, 3), (720, 1280, 3)) and arr.dtype == np.uint8, str(arr.shape))
+                check("get_frame inline matrix matches requested max_dim", "matrix" in meta and len(meta["matrix"]) in (9, 12), str(meta.get("matrix_shape")))
 
                 # 5. get_metric_depth(x, y) + undistortion + wrist FK check
                 depth_z = _parse(await session.call_tool("get_metric_depth", {"x": 320.0, "y": 240.0, "camera": "top"}))

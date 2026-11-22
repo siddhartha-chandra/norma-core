@@ -10,7 +10,7 @@ Shared calibration contract linking Station hardware, camera extrinsics/intrinsi
 - **Camera frames:** OpenCV optical frame (`+X` right, `+Y` down, `+Z` forward out of lens).
 - **Transforms (`T_A_B`):** `4x4` row-major homogeneous matrix mapping `p_A = T_A_B @ p_B`:
   - `T_world_cam_top`: fixed overhead camera → `base_link`.
-  - `T_ee_cam_wrist`: follower wrist camera → `wrist_mount_link` (`Gripper_Base_v1_1`). At runtime, `T_world_cam_wrist(q) = T_world_ee(q) @ T_ee_cam_wrist` via URDF FK (`elrobot_follower.urdf`).
+  - `T_ee_cam_wrist`: the gripper-mounted eye-in-hand camera (the `wrist` view id; there is no separate wrist camera) → `wrist_mount_link` (`Gripper_Base_v1_1`). At runtime, `T_world_cam_wrist(q) = T_world_ee(q) @ T_ee_cam_wrist` via URDF FK (`elrobot_follower.urdf`).
   - `dist_top` / `dist_wrist`: OpenCV 5-element `[k1, k2, p1, p2, k3]` distortion coefficients (automatically applied via `cv2.undistortPoints`).
   - `H_table`: optional `3x3` 4-corner planar homography mapping `top` pixel `[u, v, 1]` to tabletop `[X, Y, 1]` at `z = z_table`.
 - **Joint mapping:** `angle_rad = joint_signs[i] * (tick - joint_zero_ticks[i]) / (4096 / 2pi)`, aligned with the URDF zero pose (`hardware/elrobot/simulation/elrobot_follower.urdf`).
