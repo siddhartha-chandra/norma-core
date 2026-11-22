@@ -42,8 +42,12 @@ class SpeakerTTS:
         while True:
             text = self._q.get()
             try:
-                if self._backend == "macos-say":
-                    subprocess.run(["say", "-r", "185", text], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                from .llm_plugins import speak_text_sync
+
+                if speak_text_sync(text):
+                    pass
+                elif self._backend == "macos-say":
+                    subprocess.run(["say", "-v", "Samantha", "-r", "175", text], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif self._backend == "pyttsx3" and engine is not None:
                     engine.say(text)
                     engine.runAndWait()
