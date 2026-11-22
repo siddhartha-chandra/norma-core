@@ -32,9 +32,11 @@ from PIL import Image as PILImage
 from .calib_store import CalibrationStore, TICKS_PER_RAD
 from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
+from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
 from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, StationBridge, create_bridge
-from .vision_3d import localize_object_3d
+from .tts import SpeakerTTS
+from .vision_3d import localize_object_3d, localize_object_3d_dual
 
 if os.environ.get("DESK_NO_DOTENV") != "1":
     for _k, _v in dotenv_values(REPO_ROOT / ".env").items():
@@ -48,6 +50,8 @@ _connect_cooldown_until = 0.0
 _calib = CalibrationStore()
 _ik = IKAdapter()
 _obstacles: dict[str, SceneObstacle] = {}
+_robo_jev = RoboJevGatekeeper()
+_tts = SpeakerTTS()
 
 RUNS_DIR = Path(os.environ.get("DESK_RUNS_DIR") or (REPO_ROOT / "runs"))
 _logger: RunLogger | None = None
@@ -117,7 +121,7 @@ mcp = FastMCP("desk-core")
 @mcp.tool()
 @_traced
 async def observe(views: list[str] | None = None, denoise: bool = True) -> list:
-    """Inspect camera feed(s) ('top', 'wrist') and live ST3215 joint telemetry in one round-trip."""
+    """Inspect camera feed(s) ('top', or 'wrist' = gripper eye-in-hand; there is no separate wrist camera) and live ST3215 joint telemetry in one round-trip."""
     bridge = await _get_bridge()
     want_views = views or ["top", "wrist"]
     st = await bridge.get_state()
@@ -389,7 +393,8 @@ async def solve_ik(
 async def _live_arm_q(q_rad: list[float] | None, camera: str) -> list[float] | None:
     if q_rad is not None:
         return [float(v) for v in q_rad]
-    if f"T_world_cam_{camera}" in _calib.data or f"T_ee_cam_{camera}" not in _calib.data:
+    cam_check = "wrist" if camera in ("both", "dual") else camera
+    if f"T_world_cam_{cam_check}" in _calib.data or f"T_ee_cam_{cam_check}" not in _calib.data:
         return None
     bridge = await _get_bridge()
     st = await bridge.get_state()
@@ -434,9 +439,29 @@ async def localize_3d(
     use_gemini: bool = True,
     denoise: bool = True,
     timeout_s: float = 6.0,
+    provider: str = "auto",
+    model: str | None = None,
 ) -> dict:
-    """Zero-shot 3D object localization via Gemini 4 Hydrogen with automatic OpenCV HSV/contour fallback."""
+    """Zero-shot 3D object localization via Gemini/Anthropic/OpenAI/Qwen/DeepSeek with automatic OpenCV fallback. Pass camera='both' to fuse top + gripper eye-in-hand ('wrist') views."""
     bridge = await _get_bridge()
+    if camera in ("both", "dual"):
+        top_jpeg, wrist_jpeg = await asyncio.gather(
+            bridge.get_frame("top", denoise=denoise),
+            bridge.get_frame("wrist", denoise=denoise),
+        )
+        q = await _live_arm_q(None, "wrist")
+        return await localize_object_3d_dual(
+            top_jpeg=top_jpeg,
+            wrist_jpeg=wrist_jpeg,
+            query=query,
+            calib=_calib,
+            q_rad=q,
+            z_m=z_m,
+            use_gemini=use_gemini,
+            timeout_s=float(timeout_s),
+            model=model,
+            provider=provider,
+        )
     jpeg = await bridge.get_frame(camera, denoise=denoise)
     q = await _live_arm_q(None, camera)
     return await localize_object_3d(
@@ -448,7 +473,89 @@ async def localize_3d(
         z_m=z_m,
         use_gemini=use_gemini,
         timeout_s=float(timeout_s),
+        model=model,
+        provider=provider,
     )
+
+
+@mcp.tool()
+@_traced
+async def robo_jev_arm_watch(
+    x: float,
+    y: float,
+    query: str = "target",
+    camera: str = "top",
+    depth_m: float | None = None,
+) -> dict:
+    """Arm Robo-Jev's <150 ms visual reflex watch on pixel (x, y) before a reach."""
+    bridge = await _get_bridge()
+    jpeg = await bridge.get_frame(camera, denoise=False)
+    d_m = float(depth_m) if depth_m is not None else _calib.get_metric_depth(float(x), float(y), camera=camera)
+    return _robo_jev.arm_watch(jpeg_bytes=jpeg, pixel=(float(x), float(y)), query=query, depth_m=d_m)
+
+
+@mcp.tool()
+@_traced
+async def robo_jev_check(
+    camera: str = "top",
+    target_x: float | None = None,
+    target_y: float | None = None,
+    abort_on_hazard: bool = True,
+) -> dict:
+    """Run Robo-Jev <150 ms reflex checks (`target_shifted`, `path_clear`, `will_tip`, `grasp_secure`)."""
+    bridge = await _get_bridge()
+    target_xy = (float(target_x), float(target_y)) if (target_x is not None and target_y is not None) else None
+    if abort_on_hazard:
+        return await check_reflex_and_abort(
+            gatekeeper=_robo_jev,
+            bridge=bridge,
+            calib=_calib,
+            obstacles=list(_obstacles.values()),
+            target_xy=target_xy,
+            camera=camera,
+        )
+    jpeg = await bridge.get_frame(camera, denoise=False)
+    return _robo_jev.evaluate(
+        curr_jpeg=jpeg,
+        calib=_calib,
+        obstacles=list(_obstacles.values()),
+        target_xy=target_xy,
+        camera=camera,
+    )
+
+
+@mcp.tool()
+@_traced
+async def robo_jev_guard(
+    query: str = "keys",
+    target_x: float | None = None,
+    target_y: float | None = None,
+    camera: str = "top",
+    obstacle_wait_timeout_s: float = 8.0,
+    use_gemini: bool = False,
+) -> dict:
+    """Pause on obstacle until clear & resume; recalibrate on target shift if inside safe bounds."""
+    bridge = await _get_bridge()
+    target_xy = (float(target_x), float(target_y)) if (target_x is not None and target_y is not None) else None
+    return await guarded_recover(
+        gatekeeper=_robo_jev,
+        bridge=bridge,
+        calib=_calib,
+        query=query,
+        obstacles_fn=lambda: list(_obstacles.values()),
+        target_xy=target_xy,
+        camera=camera,
+        obstacle_wait_timeout_s=float(obstacle_wait_timeout_s),
+        use_gemini=use_gemini,
+    )
+
+
+@mcp.tool()
+@_traced
+async def speak_status(text: str) -> dict:
+    """Speak a short status cue over the portable speaker (non-blocking TTS)."""
+    queued = _tts.speak(text)
+    return {"queued": queued, "tts": _tts.status()}
 
 
 @mcp.tool()
@@ -616,6 +723,10 @@ _SEQ_TOOLS = {
     "get_metric_depth": get_metric_depth,
     "pixel_to_world": pixel_to_world,
     "localize_3d": localize_3d,
+    "robo_jev_arm_watch": robo_jev_arm_watch,
+    "robo_jev_check": robo_jev_check,
+    "robo_jev_guard": robo_jev_guard,
+    "speak_status": speak_status,
     "update_scene_obstacle": update_scene_obstacle,
     "get_calib_status": get_calib_status,
     "reload_config": reload_config,
