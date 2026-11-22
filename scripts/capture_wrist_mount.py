@@ -37,7 +37,7 @@ async def capture(args):
         print("Recording raw ticks. Joint angles and FK use the current calibration defaults.")
     robot = load_urdf()
     bridge = LiveStationBridge(host=args.host, port=args.port, target_bus=args.bus,
-                               cam_wrist=args.camera)
+                               cam_wrist=args.camera, follow_motor_rx=True)
     await bridge.connect()
     for _ in range(50):
         keys = [k for k in await bridge.list_cameras() if args.camera in k]

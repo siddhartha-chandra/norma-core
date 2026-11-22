@@ -10,17 +10,10 @@ The stereo command works on saved captures and can run on any teammate's laptop 
 | --- | --- |
 | `desk_core/wrist_stereo.py` | The standalone module on `feat/epipolar`. |
 | `calib_frames/session1/camera_calibration.json` | The tracked camera intrinsics and distortion file. Both commands default to the `wrist` calibration for **1280 × 720** images. |
-| `/tmp/measured_rig.json` | The measured calibration for the actual arm, with `T_ee_cam_wrist`, `joint_zero_ticks`, and `joint_signs`. The commands below create this path from the calibration branch. You can also use your own measured rig file and substitute its path. |
+| `calib/rig_calib.json` | The team's measured rig calibration from `desk-core`, with `T_ee_cam_wrist`, `joint_zero_ticks`, and `joint_signs`. Substitute your measured rig file when using another follower or wrist mount. |
 | `calib_frames/wrist_sweep_01/samples.json` and `wrist-*.jpg` | The capture script writes these files. The manifest pairs each JPEG with the seven arm encoder readings. Keep the JPEGs next to the manifest. |
 
-If you're using the team's measured rig from `origin/feat/metric_depth_estimation`, extract it while staying on `feat/epipolar`:
-
-```bash
-git fetch origin
-git show origin/feat/metric_depth_estimation:calib/rig_calib.json > /tmp/measured_rig.json
-```
-
-The `calib/rig_calib.json` checked into `feat/epipolar` has nominal values. Use the measured file for the same follower and wrist mount that captured your frames. The stereo command recomputes joint angles from the manifest's raw ticks with that file.
+Use the measured file for the same follower and wrist mount that captured your frames. The stereo command recomputes joint angles from the manifest's raw ticks with that file.
 
 Use the repo's Python environment. For a fresh setup with `uv`, run `uv sync --python 3.12` and `source .venv/bin/activate`. The capture preview needs desktop OpenCV, and the live Station connection needs generated Python protobufs. If `target/gen_python` is missing, generate the bindings with `make protobuf`. [Repo dependencies](pyproject.toml) · [Protobuf target](Makefile)
 
@@ -38,17 +31,17 @@ When the correct `STATION_HOST`, `STATION_BUS_SERIAL`, and `CAMERA_WRIST` are al
 
 ```bash
 python scripts/capture_wrist_mount.py calib_frames/wrist_sweep_01 \
-  --joint-calibration /tmp/measured_rig.json
+  --joint-calibration calib/rig_calib.json
 ```
 
 You can also pass `--host`, `--port`, `--bus`, and `--camera` directly. Use a new session directory for each sweep. The capture window reads video and encoders while the operator positions the arm. [Capture script](scripts/capture_wrist_mount.py)
 
-1. Before moving, call `observe()` and check `link.rx_age_ms` and both camera views. Register tabletop obstacles and use the calibrated Pink IK or pose pipeline. If the arm stalls or anything shifts, call `estop()` and observe again. [Operator guide](AGENTS.md)
+1. Before moving, call `observe()` and check `link.rx_age_ms` and both camera views. Register tabletop obstacles and use the calibrated IK or pose pipeline. If the arm stalls or anything shifts, call `estop()` and observe again. [Operator guide](AGENTS.md)
 2. Place a stationary, textured target in view. Hold the arm at the reference pose until **READY**, focus the capture window, and press **Space**. Confirm the saved count increases.
 3. At a safe clearance, aim for about **40 mm** of sideways translation across the wrist camera's line of sight. A robot-base X move works when that axis is mostly sideways in the wrist view. Keep wrist orientation fixed as closely as practical and keep the same target visible. Wait for **READY** again and press **Space** for the second capture.
 4. Press lowercase **q** or **Esc** to finish. The session directory should contain `samples.json`, `wrist-000.jpg`, and `wrist-001.jpg`. Share the directory as a unit if a teammate will run the estimate. New capture sessions are Git-ignored.
 
-**READY** depends on fresh video and seven encoder readings, a 0.7-second hold within three ticks per joint, and at least one joint reading 25 ticks away from each saved pose. The checkerboard text in the preview is a framing hint. You can capture a textured object once **READY** appears. [Capture conditions](scripts/capture_wrist_mount.py#L70-L109)
+**READY** depends on a fresh wrist frame and seven fresh raw encoder readings, a 0.7-second hold within three ticks per joint, and at least one joint reading 25 ticks away from each saved pose. The capture keeps the frame's original receipt time when it sees the same Station entry again. The checkerboard text in the preview is a framing hint. You can capture a textured object once **READY** appears. [Capture conditions](scripts/capture_wrist_mount.py#L70-L109)
 
 ## 3. Set the ROI and run stereo
 
@@ -56,7 +49,7 @@ Open `calib_frames/wrist_sweep_01/wrist-000.jpg` at full resolution and pick a r
 
 ```bash
 python -m desk_core.wrist_stereo calib_frames/wrist_sweep_01/samples.json \
-  --rig /tmp/measured_rig.json --pair 0 1 --roi 480 260 250 180
+  --rig calib/rig_calib.json --pair 0 1 --roi 480 260 250 180
 ```
 
 - `--pair 0 1` selects the first two manifest entries. The ROI always applies to the first entry in the selected pair.
@@ -85,16 +78,11 @@ For the first accuracy check, use a textured target at independently measured he
 
 ## Optional check with saved Station frames
 
-After extracting `/tmp/measured_rig.json`, use this saved pair to check the command and file layout before collecting your own sweep:
+Use the checked-in calibration captures to check the command and file layout before collecting your own sweep:
 
 ```bash
-saved_wrist_pair=$(mktemp -d /tmp/deskcore-wrist-pair.XXXXXX)
-for artifact in samples.json wrist-003.jpg wrist-010.jpg; do
-  git show "origin/feat/metric_depth_estimation:calib_frames/hand_eye_1/$artifact" \
-    > "$saved_wrist_pair/$artifact"
-done
-python -m desk_core.wrist_stereo "$saved_wrist_pair/samples.json" \
-  --rig /tmp/measured_rig.json --pair 3 10 --roi 340 160 600 380
+python -m desk_core.wrist_stereo calib_frames/hand_eye_1/samples.json \
+  --rig calib/rig_calib.json --pair 3 10 --roi 340 160 600 380
 ```
 
 This pair gave a baseline near **51 mm** and retained matches in the offline smoke check. The fresh fixed-orientation sweep with a physical reference is the Station accuracy test.

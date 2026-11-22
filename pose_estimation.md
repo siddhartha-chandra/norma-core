@@ -4,11 +4,11 @@ The grasp estimator takes two settled wrist captures, the measured rig calibrati
 
 ## Run the grasp estimator
 
-From the repo root, follow the wrist stereo guide to get the measured rig JSON and capture a pair. This example uses `calib_frames/wrist_sweep_01/samples.json` with its JPEGs alongside it, `/tmp/measured_rig.json` for the rig, and the default `calib_frames/session1/camera_calibration.json` for wrist intrinsics. Run in the repo's Python environment with NumPy, OpenCV, Pillow, and SciPy. [Capture and calibration setup](epipolar.md) · [Dependencies](pyproject.toml)
+From the repo root, follow the wrist stereo guide to capture a pair. This example uses `calib_frames/wrist_sweep_01/samples.json` with its JPEGs alongside it, the team's measured `calib/rig_calib.json`, and the default `calib_frames/session1/camera_calibration.json` for wrist intrinsics. Run in the repo's Python environment with NumPy, OpenCV, Pillow, and SciPy. [Capture and calibration setup](epipolar.md) · [Dependencies](pyproject.toml)
 
 ```bash
 python -m desk_core.pose_estimation calib_frames/wrist_sweep_01/samples.json \
-  --rig /tmp/measured_rig.json --pair 0 1 --roi 480 260 250 180 \
+  --rig calib/rig_calib.json --pair 0 1 --roi 480 260 250 180 \
   --tool-quat QX QY QZ QW --reference-jaw-yaw-deg REF_YAW \
   --tcp-offset-m TCP_X TCP_Y TCP_Z
 ```
@@ -42,9 +42,9 @@ The command prints JSON. `grasp_point_base_m` is the contact point and `ik_targe
 | Wrist intrinsics, distortion, and `T_base_cam_a` | Map reference-image pixels to rays in `base_link` using the arm pose at the time the image was captured. |
 | Gripper approach orientation and fingertip offset | Convert the chosen contact position and jaw direction to the pose of the link controlled by IK. Confirm the reference configuration on the actual rig. |
 
-Keep the pose estimate and the IK request explicit. The estimate contains `grasp_point_base_m`, `object_yaw_rad` when available, and enough diagnostics to judge the measurement. The IK request contains `x`, `y`, `z` in meters and `qx`, `qy`, `qz`, `qw` in that order. The IK position is the origin of the controlled link. [Stereo result fields](desk_core/wrist_stereo.py#L16-L37) · [Calibration frames](calib/README.md#conventions)
+Keep the pose estimate and the IK request explicit. The estimate contains `grasp_point_base_m`, `object_yaw_rad` when available, and enough diagnostics to judge the measurement. The IK request contains `x`, `y`, `z` in meters and `qx`, `qy`, `qz`, `qw` in that order. The IK position is the origin of the controlled link. [Stereo result fields](desk_core/wrist_stereo.py#L36-L51) · [Calibration frames](calib/README.md#conventions)
 
-Use the detection from the same wrist frame as `pixels_a`. If the fixed scene camera finds the object first, associate it with a fresh wrist detection before using the wrist ROI. A second option is to project the stereo points into the scene image with the calibrated scene camera pose and test them against the scene box. The detector format `[ymin, xmin, ymax, xmax]` uses a different order from `--roi`. If normalized to 0–1000, multiply X values by `image_width / 1000` and Y values by `image_height / 1000` before computing `(x, y, width, height)`. [Detection schema](desk_core/interfaces.py#L36-L45) · [World-to-pixel projection](desk_core/calib_store.py#L347-L371)
+Use the detection from the same wrist frame as `pixels_a`. If the fixed scene camera finds the object first, associate it with a fresh wrist detection before using the wrist ROI. A second option is to project the stereo points into the scene image with the calibrated scene camera pose and test them against the scene box. The detector format `[ymin, xmin, ymax, xmax]` uses a different order from `--roi`. If normalized to 0–1000, multiply X values by `image_width / 1000` and Y values by `image_height / 1000` before computing `(x, y, width, height)`. [Detection schema](desk_core/interfaces.py#L39-L47) · [World-to-pixel projection](desk_core/calib_store.py#L391-L415)
 
 ## 1. Estimate `x`, `y`, `z`
 
@@ -60,7 +60,7 @@ s = (z_surface - C.z) / ray.z
 point_base = C + s * ray
 ```
 
-Require a positive intersection with a ray that crosses the plane at a useful angle. An object with a nonplanar grasp surface needs a reliable 3D match near the intended contact or a surface model. `median_depth_m` from stereo is camera optical Z. The `z_m` input to `pixel_to_world` specifies a base-frame plane height. Use `points_base_m` when estimating that height. [Stereo depth convention](desk_core/wrist_stereo.py#L17-L32) · [Pixel-to-world convention](desk_core/calib_store.py#L314-L338)
+Require a positive intersection with a ray that crosses the plane at a useful angle. An object with a nonplanar grasp surface needs a reliable 3D match near the intended contact or a surface model. `median_depth_m` from stereo is camera optical Z. The `z_m` input to `pixel_to_world` specifies a base-frame plane height. Use `points_base_m` when estimating that height. [Stereo depth convention](desk_core/wrist_stereo.py#L36-L51) · [Pixel-to-world convention](desk_core/calib_store.py#L358-L382)
 
 ## 2. Estimate yaw around `base_link` +Z
 
@@ -84,14 +84,13 @@ q_z = [0, 0, sin(delta / 2), cos(delta / 2)]
 q_base_ee = normalize(q_z ⊗ q_ref)
 ```
 
-Here `⊗` means quaternion multiplication with the base-frame rotation on the left. This keeps the reference approach angle. A pure yaw quaternion `[0, 0, sin(yaw / 2), cos(yaw / 2)]` is the full IK orientation only if the solver's identity pose already gives the required tool approach. The quaternion branch's URDF solver targets `Gripper_Base_v1_1`. The modeled fingers extend approximately along local +Y, and jaw travel is nearly along local X. A 90° rotation about Y leaves local +Y horizontal when applied directly to that link. Verify the reference pose on the deployed solver and the actual rig. [ElRobot jaw joints and mesh origins](hardware/elrobot/simulation/elrobot_follower.urdf#L370-L408) · [Joint axes](hardware/elrobot/simulation/elrobot_follower.urdf#L487-L520)
+Here `⊗` means quaternion multiplication with the base-frame rotation on the left. This keeps the reference approach angle. A pure yaw quaternion `[0, 0, sin(yaw / 2), cos(yaw / 2)]` is the full IK orientation only if the solver's identity pose already gives the required tool approach. The ElRobot solver targets `Gripper_Base_v1_1`. The modeled fingers extend approximately along local +Y, and jaw travel is nearly along local X. A 90° rotation about Y leaves local +Y horizontal when applied directly to that link. Verify the reference pose on the deployed solver and the actual rig. [ElRobot jaw joints and mesh origins](hardware/elrobot/simulation/elrobot_follower.urdf#L370-L408) · [Joint axes](hardware/elrobot/simulation/elrobot_follower.urdf#L487-L520)
 
 If the selected position is the fingertip or tool-center point, apply the measured link-to-TCP offset before sending the pose. For a fixed vector `t_ee_tcp` from the IK link origin to the desired TCP, expressed in the link frame, use `p_base_ee = p_base_tcp - R(q_base_ee) @ t_ee_tcp`. Send `p_base_ee` and `q_base_ee` together.
 
 ### Which IK interface to call
 
-- The quaternion API on `origin/feat/metric_depth_estimation` takes `solve_ik(x, y, z, qx, qy, qz, qw)`. Its `pick_at` default includes a 90° rotation about Y. Use that as a reference only after verifying the physical approach on the deployed rig.
-- The `feat/epipolar` MCP server takes `solve_ik(x, y, z, alpha, beta, gamma)` in radians. Its `pick_at(x, y, z, yaw=...)` supplies fixed `beta = π/2` and uses `yaw` as `gamma`. This is a direct route if that approach convention has been verified. For a different reference pose, use the Euler interface with the deployed solver's rotation convention or use the quaternion API on the integration branch. [Current MCP IK](desk_core/mcp_server.py#L358-L384) · [Current pick path](desk_core/mcp_server.py#L497-L516)
+The merged MCP server accepts `solve_ik(x, y, z, qx, qy, qz, qw)`. Pass the fields in `ik_target` as its pose arguments to check the solution. For a verified pick, `pick_at` accepts the same XYZ and quaternion fields. Pass the estimated quaternion explicitly so the gripper uses the calibrated approach and jaw yaw. The pose estimator remains independent of the configured IK backend. [MCP IK](desk_core/mcp_server.py#L369-L394) · [Pick path](desk_core/mcp_server.py#L752-L772)
 
 ## First validation
 
@@ -103,7 +102,7 @@ Use the same capture pair and ROI. The preview script gets depth from the two im
 
 ```bash
 python scripts/preview_wrist_cuboid.py calib_frames/wrist_sweep_01/samples.json \
-  --rig /tmp/measured_rig.json --pair 0 1 --roi 480 260 250 180 \
+  --rig calib/rig_calib.json --pair 0 1 --roi 480 260 250 180 \
   --output /tmp/wrist-cuboid.png
 ```
 

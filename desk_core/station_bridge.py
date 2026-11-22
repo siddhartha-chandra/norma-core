@@ -479,6 +479,8 @@ class LiveStationBridge:
         target_bus: str | None = None,
         cam_top: str | None = None,
         cam_wrist: str | None = None,
+        *,
+        follow_motor_rx: bool = False,
     ):
         self.host = host
         self.port = port
@@ -493,8 +495,10 @@ class LiveStationBridge:
         self._motor_state: dict[str, dict[int, MotorState]] = {}
         self._bus_voltage: dict[str, float] = {}
         self._torque_started: set[int] = set()
+        self._follow_motor_rx = follow_motor_rx
         self.rx_received_at: dict[tuple[str, int], float] = {}
         self.frame_received_at: dict[str, float] = {}
+        self._video_entry_ids: dict[str, bytes] = {}
         self._frames: dict[str, bytes] = {}
         self._frame_buf: dict[str, deque[bytes]] = {}
         self._frame_order: list[str] = []
@@ -562,7 +566,11 @@ class LiveStationBridge:
         # When read_from_tail is available (live station_py), poll st3215/inference
         # on-demand instead of following the 400-800 Hz st3215/rx & st3215/inference
         # firehoses continuously over Tailscale (which drifts behind by seconds).
-        queues = ("inference-states",) if hasattr(self.client, "read_from_tail") else self._BASE_QUEUES
+        if self._follow_motor_rx:
+            # Paired camera captures need receipt times for each raw encoder sample.
+            queues = ("st3215/rx", "inference-states")
+        else:
+            queues = ("inference-states",) if hasattr(self.client, "read_from_tail") else self._BASE_QUEUES
         self._queues = {qid: asyncio.Queue() for qid in queues}
         self._video_q = asyncio.Queue()
         self._follow_errors = {}
@@ -774,7 +782,8 @@ class LiveStationBridge:
         return updated
 
     async def _poll_inference_tail(self, timeout_s: float = 2.0) -> bool:
-        if self.client is None or not hasattr(self.client, "read_from_tail"):
+        # Keep raw encoder values and receipt times paired for calibration capture.
+        if self._follow_motor_rx or self.client is None or not hasattr(self.client, "read_from_tail"):
             return False
         if not (self.client.connected and self.client.setup_done):
             return False
@@ -851,12 +860,26 @@ class LiveStationBridge:
         )
         return (key, jpeg) if jpeg is not None else None
 
-    async def _fetch_tail_frames(self, qid: str, count: int = 1, timeout_s: float = 3.0) -> list[tuple[str, bytes]]:
+    def _record_frame_receipt(self, key: str, jpeg: bytes, entry_id: bytes | None) -> None:
+        if self._follow_motor_rx:
+            # Re-reading the queue tail must not make a stalled camera look fresh.
+            if entry_id is None:
+                if self._frames.get(key) == jpeg:
+                    return
+            else:
+                if self._video_entry_ids.get(key) == entry_id:
+                    return
+                self._video_entry_ids[key] = entry_id
+        self.frame_received_at[key] = time.monotonic()
+
+    async def _fetch_tail_frames(
+        self, qid: str, count: int = 1, timeout_s: float = 3.0,
+    ) -> list[tuple[str, bytes, bytes | None]]:
         if self.client is None or not hasattr(self.client, "read_from_tail"):
             return []
         offset = (count - 1).to_bytes(8, "little") if count > 1 else b"\x00"
         qr = self.client.read_from_tail(qid, offset=offset, limit=count, step=1, buf_size=max(4, count + 2))
-        out: list[tuple[str, bytes]] = []
+        out: list[tuple[str, bytes, bytes | None]] = []
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             rem = max(0.05, deadline - time.monotonic())
@@ -869,7 +892,7 @@ class LiveStationBridge:
             try:
                 parsed = self._extract_jpeg(entry)
                 if parsed is not None:
-                    out.append(parsed)
+                    out.append((*parsed, getattr(getattr(entry, "ID", None), "ID", None)))
             except Exception as exc:
                 log.debug("tail video parse skip: %s", exc)
         return out
@@ -879,9 +902,9 @@ class LiveStationBridge:
             items = await self._fetch_tail_frames(qid, count=1, timeout_s=3.0)
             if not items:
                 return
-            key, jpeg = items[-1]
+            key, jpeg, entry_id = items[-1]
             self._key_to_qid[key] = qid
-            self.frame_received_at[key] = time.monotonic()
+            self._record_frame_receipt(key, jpeg, entry_id)
             self._frames[key] = jpeg
             self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
             if key not in self._frame_order:
@@ -902,7 +925,7 @@ class LiveStationBridge:
                 if parsed is None:
                     continue
                 key, jpeg = parsed
-                self.frame_received_at[key] = time.monotonic()
+                self._record_frame_receipt(key, jpeg, getattr(getattr(entry, "ID", None), "ID", None))
                 self._frames[key] = jpeg
                 self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
                 if key not in self._frame_order:
@@ -981,9 +1004,9 @@ class LiveStationBridge:
         if qid:
             try:
                 items = await self._fetch_tail_frames(qid, count=4 if denoise else 1, timeout_s=3.0)
-                jpegs = [jb for _k, jb in items]
+                jpegs = [jb for _key, jb, _entry_id in items]
                 if jpegs:
-                    self.frame_received_at[key] = time.monotonic()
+                    self._record_frame_receipt(key, jpegs[-1], items[-1][2])
                     self._frames[key] = jpegs[-1]
                     buf = self._frame_buf.setdefault(key, deque(maxlen=7))
                     buf.extend(jpegs)
