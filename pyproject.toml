@@ -25,6 +25,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "matplotlib>=3.11.2",
+    "open3d>=0.20",
     "pytest>=9.2.0",
     "pytest-cov>=7.1.0",
 ]
