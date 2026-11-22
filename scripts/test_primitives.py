@@ -108,8 +108,17 @@ async def main() -> int:
                 from desk_core.calib_store import CalibrationStore
                 from desk_core.station_bridge import MotorState
                 conversion_calib = CalibrationStore()
+                measured_ranges = {
+                    1: (1146, 2950),
+                    2: (1002, 3094),
+                    3: (907, 3189),
+                    4: (900, 3196),
+                    5: (166, 3930),
+                    6: (1061, 3035),
+                    7: (124, 3972),
+                }
                 conversion_motors = [
-                    MotorState(mid, 2048, 0, 0, 4095)
+                    MotorState(mid, 2048, 0, *measured_ranges[mid])
                     for mid in range(1, 8)
                 ]
                 q_roundtrip = [0.0, 0.25, -0.5, 1.0, -1.0, 0.75, -0.25]
@@ -127,9 +136,17 @@ async def main() -> int:
                 )
 
                 # 2. solve_ik(x, y, z, qx, qy, qz, qw) -> [j1..j7]
+                # Target 1 cm above the current flange pose, so it is reachable within the motor ranges.
+                from scipy.spatial.transform import Rotation
+
+                from desk_core.ik_tracik import get_solver
+
+                T_now = get_solver().fk(q0)
+                ik_x, ik_y, ik_z = (T_now[:3, 3] + [0.0, 0.0, 0.01]).tolist()
+                ik_qx, ik_qy, ik_qz, ik_qw = Rotation.from_matrix(T_now[:3, :3]).as_quat().tolist()
                 q_ik = _parse(await session.call_tool("solve_ik", {
-                    "x": 0.25, "y": 0.05, "z": 0.12,
-                    "qx": 0.0, "qy": 0.3826834324, "qz": 0.0, "qw": 0.9238795325,
+                    "x": ik_x, "y": ik_y, "z": ik_z,
+                    "qx": ik_qx, "qy": ik_qy, "qz": ik_qz, "qw": ik_qw,
                 }))
                 check("solve_ik returns 7 rad floats", isinstance(q_ik, list) and len(q_ik) == 7 and all(isinstance(v, (int, float)) for v in q_ik), str(q_ik))
 
@@ -181,7 +198,7 @@ async def main() -> int:
                 seq_res = _parse(await session.call_tool("execute_sequence", {
                     "steps": [
                         {"tool": "update_scene_obstacle", "args": {"name": "mug", "x": 0.25, "y": 0.0}},
-                        {"tool": "solve_ik", "args": {"x": 0.22, "y": -0.06, "z": 0.08, "qy": 0.70710678, "qw": 0.70710678}, "save_as": "q_pick"},
+                        {"tool": "solve_ik", "args": {"x": ik_x, "y": ik_y, "z": ik_z, "qx": ik_qx, "qy": ik_qy, "qz": ik_qz, "qw": ik_qw}, "save_as": "q_pick"},
                         {"tool": "move_joint", "args": {"joints": "$q_pick"}},
                         {"tool": "grasp", "args": {}},
                         {"tool": "release", "args": {}},

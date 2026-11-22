@@ -8,9 +8,7 @@ drivers:
     enabled: true
     resize_target: 0          # Keep the camera capture resolution
     formats:
-      - {format: "1920x1080@30fps,mjpeg"}
       - {format: "1280x720@30fps,mjpeg"}
-      - {format: "640x480@30fps,mjpeg"}
     frame-skip: 0
 
 inference:
@@ -18,5 +16,7 @@ inference:
     shm: /tmp/normvla         # macOS-safe path (/dev/shm is Linux-only)
     shm-size-mb: 12
     format: normvla
-    st3215-bus: auto          # IMPORTANT: Replace "auto" with FOLLOWER bus serial if leader+follower are both plugged in!
+    # Follower 5B8E115307 (12 V). Leader 5B61034956 (7.4 V) has no config key;
+    # mirroring is set at runtime in the web UI (follower card, source = leader).
+    st3215-bus: 5B8E115307
     update-interval: 100ms

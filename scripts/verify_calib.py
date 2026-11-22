@@ -119,7 +119,7 @@ def main() -> int:
         print(f"ERROR: file not found: {calib_path}", file=sys.stderr)
         return 1
 
-    calib = CalibrationStore(calib_path)
+    calib = CalibrationStore(args.calib)
     st_info = calib.status()
     print(f"  arm_type={st_info['arm_type']} | calibrated={st_info['calibrated']} | z_table={calib.z_table()} m")
     print(f"  hardware (effective): {st_info['hardware']}")

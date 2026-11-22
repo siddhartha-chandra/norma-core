@@ -57,6 +57,17 @@ DEFAULT_MAX_STEP = int(os.environ.get("ROBOT_MAX_STEP_TICKS", "250"))
 DEFAULT_SPEED = int(os.environ.get("ROBOT_GOAL_SPEED", "600"))
 DEFAULT_ACCEL = int(os.environ.get("ROBOT_GOAL_ACCEL", "20"))
 
+ELROBOT_MOTOR_RANGES: dict[int, tuple[int, int]] = {
+    1: (1146, 2950),
+    2: (1002, 3094),
+    3: (907, 3189),
+    4: (900, 3196),
+    5: (166, 3930),
+    6: (1061, 3035),
+    7: (124, 3972),
+    8: (1255, 2841),
+}
+
 # Auto-reconnect (issue #3): a live NormFS subscription should see motor
 # traffic many times per second; silence this long means the subscription died
 # (e.g. Station restart) even if no explicit error surfaced.
@@ -154,7 +165,13 @@ class MockStationBridge:
         self._aborted = False
         self._frame_overrides: dict[str, bytes] = {}
         self._motors: dict[int, MotorState] = {
-            mid: MotorState(mid, 2048, 35, 1000, 3100, 0)
+            mid: MotorState(
+                mid,
+                2048,
+                35,
+                *ELROBOT_MOTOR_RANGES.get(mid, (0, MAX_ANGLE_STEP)),
+                0,
+            )
             for mid in range(1, num_joints + 1)
         }
         self._ee_pos: list[float] = [0.28, 0.0, 0.25]
@@ -476,6 +493,8 @@ class LiveStationBridge:
         self._motor_state: dict[str, dict[int, MotorState]] = {}
         self._bus_voltage: dict[str, float] = {}
         self._torque_started: set[int] = set()
+        self.rx_received_at: dict[tuple[str, int], float] = {}
+        self.frame_received_at: dict[str, float] = {}
         self._frames: dict[str, bytes] = {}
         self._frame_buf: dict[str, deque[bytes]] = {}
         self._frame_order: list[str] = []
@@ -805,6 +824,7 @@ class LiveStationBridge:
                     continue
                 slot = self._motor_state.setdefault(serial, {})
                 pos = _norm_pos(_u16(sb, RAM_PRESENT_POSITION))
+                self.rx_received_at[serial, mid] = time.monotonic()
                 cur = _u16(sb, RAM_PRESENT_CURRENT)
                 err = sb[RAM_STATUS]
                 if mid in slot:
@@ -861,6 +881,7 @@ class LiveStationBridge:
                 return
             key, jpeg = items[-1]
             self._key_to_qid[key] = qid
+            self.frame_received_at[key] = time.monotonic()
             self._frames[key] = jpeg
             self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
             if key not in self._frame_order:
@@ -881,6 +902,7 @@ class LiveStationBridge:
                 if parsed is None:
                     continue
                 key, jpeg = parsed
+                self.frame_received_at[key] = time.monotonic()
                 self._frames[key] = jpeg
                 self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
                 if key not in self._frame_order:
@@ -961,6 +983,7 @@ class LiveStationBridge:
                 items = await self._fetch_tail_frames(qid, count=4 if denoise else 1, timeout_s=3.0)
                 jpegs = [jb for _k, jb in items]
                 if jpegs:
+                    self.frame_received_at[key] = time.monotonic()
                     self._frames[key] = jpegs[-1]
                     buf = self._frame_buf.setdefault(key, deque(maxlen=7))
                     buf.extend(jpegs)

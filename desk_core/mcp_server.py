@@ -4,7 +4,7 @@ Exposes:
   1. Bare-bone hardware primitives: observe, get_state, set_torque, move_joints, grasp, release, go_home, estop
   2. Core robotics primitives: move_joint, get_frame, solve_ik, get_joint_angles, get_metric_depth
   3. Calibration & scene tools: pixel_to_world, update_scene_obstacle, get_calib_status, reload_config
-  4. Composite execution tools: move_to_pose, pick_at, place_at, pick_pixel, execute_sequence
+  4. Composite execution tools: move_to_pose, move_flange, pick_at, place_at, pick_pixel, execute_sequence
   5. Prompt skills (@mcp.prompt): desk_operator_skill, pick_and_place_skill, cleanup_skill
 
 Every tool call is recorded under runs/<UTC timestamp>/ (calls.jsonl + frames/*.jpg)
@@ -45,6 +45,7 @@ if os.environ.get("DESK_NO_DOTENV") != "1":
 
 _bridge: StationBridge | None = None
 _connect_lock = asyncio.Lock()
+_flange_lock = asyncio.Lock()
 _connect_cooldown_until = 0.0
 
 _calib = CalibrationStore()
@@ -390,6 +391,7 @@ async def solve_ik(
         seed_joints_rad=seed_joints_rad,
         obstacles=list(_obstacles.values()),
         n_arm=n_arm,
+        joint_bounds_rad=_calib.bounds_rad(st.motors),
     )
 
 
@@ -631,7 +633,7 @@ async def move_to_pose(
     bridge = await _get_bridge()
     try:
         angles = await solve_ik(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         if not hasattr(bridge, "set_mock_ee_pose"):
             raise
         import math as _math
@@ -644,6 +646,67 @@ async def move_to_pose(
     if ok and hasattr(bridge, "set_mock_ee_pose"):
         bridge.set_mock_ee_pose(x, y, z)
     return {"ok": ok, "pose": [x, y, z, qx, qy, qz, qw], "joints_rad": angles}
+
+
+@mcp.tool()
+@_traced
+async def move_flange(
+    dx_cm: float = 0.0,
+    dy_cm: float = 0.0,
+    dz_cm: float = 0.0,
+    rx_deg: float = 0.0,
+    ry_deg: float = 0.0,
+    rz_deg: float = 0.0,
+    rot_frame: str = "flange",
+    execute: bool = False,
+    speed_cm_s: float = 1.0,
+    rot_speed_deg_s: float = 10.0,
+    joint_speed_deg_s: float = 20.0,
+    floor_cm: float = 8.0,
+    min_duration_s: float = 2.0,
+    lag_limit_ticks: int = 80,
+    correct: bool = True,
+) -> dict:
+    """Move the gripper flange relative to its current pose along a straight line, smoothly (TRAC-IK).
+
+    Translation is in base_link (cm); rotation (deg, x-y-z order) is about the flange origin, using the
+    flange's own axes (rot_frame="flange", flange +Y is the gripper axis) or base_link axes ("base").
+    Dry run by default: returns the plan. execute=True streams a minimum-jerk trajectory and holds
+    position on tracking lag. Refuses plans that leave the motor ranges, flip configuration or come
+    within floor_cm of the table. correct=True closes the loop at the end, offsetting joint targets until
+    gravity-loaded joints actually reach the planned pose. Pace settings are bounded (max 6 cm/s, 90 deg/s
+    joint speed, lag limit 120 ticks, min duration 1 s) and only one move_flange runs at a time.
+    """
+    from scipy.spatial.transform import Rotation
+
+    from .motion import MotionLimits, correct_final_pose, flange_error, plan_flange_move, stream_joint_path
+
+    if rot_frame not in ("flange", "base"):
+        return {"ok": False, "problems": [f"rot_frame must be 'flange' or 'base', got {rot_frame!r}"]}
+    limits = MotionLimits(speed_cm_s=speed_cm_s, rot_speed_deg_s=rot_speed_deg_s,
+                          joint_speed_deg_s=joint_speed_deg_s, floor_cm=floor_cm,
+                          min_duration_s=min_duration_s, lag_limit_ticks=lag_limit_ticks)
+    if problems := limits.out_of_bounds():
+        return {"ok": False, "executed": False, "problems": problems}
+    if _flange_lock.locked():
+        return {"ok": False, "executed": False, "problems": ["another move_flange is still running"]}
+    async with _flange_lock:
+        bridge = await _get_bridge()
+        st = await bridge.get_state()
+        rotation = Rotation.from_euler("xyz", [rx_deg, ry_deg, rz_deg], degrees=True)
+        plan = await asyncio.to_thread(plan_flange_move, _calib, st.motors,
+                                       np.array([dx_cm, dy_cm, dz_cm]) / 100.0, rotation, rot_frame, limits)
+        result = {"ok": plan["ok"], "executed": False, "problems": plan["problems"], "plan": plan["summary"]}
+        if not plan["ok"] or not execute:
+            return result
+        run = await stream_joint_path(bridge, _calib, plan["path"], plan["duration_s"], limits)
+        result.update({"ok": run["ok"], "executed": True, "run": run})
+        if run["ok"]:
+            if correct:
+                result["correction"] = await correct_final_pose(bridge, _calib, plan["path"], limits)
+            final_rad = _calib.ticks_to_rad((await bridge.get_state()).motors)
+            result["result"] = flange_error(_calib, plan["path"], final_rad)
+        return result
 
 
 @mcp.tool()
@@ -792,6 +855,7 @@ _SEQ_TOOLS = {
     "go_home": go_home,
     "estop": estop,
     "move_to_pose": move_to_pose,
+    "move_flange": move_flange,
     "pick_at": pick_at,
     "place_at": place_at,
     "pick_pixel": pick_pixel,

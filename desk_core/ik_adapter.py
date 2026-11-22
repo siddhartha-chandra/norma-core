@@ -2,9 +2,11 @@
 
 Resolution order:
   1. External HTTP service if `PINK_IK_URL` env var is set (remote Pink IK server).
-  2. Local Python module `desk_core/ik_pink.py` exporting
+  2. TRAC-IK in `desk_core/ik_tracik.py` (pytracik), bounded by the motor ranges passed as
+     `joint_bounds_rad`.
+  3. Local Python module `desk_core/ik_pink.py` exporting
      `solve_ik(x, y, z, qx, qy, qz, qw, seed_joints_rad, obstacles) -> list[float]`.
-  3. If neither backend is available, `solve_ik` raises an error.
+  4. If no backend is available, `solve_ik` raises an error.
 
 KINEMATICS CONTRACT:
   - URDF: hardware/elrobot/simulation/elrobot_follower.urdf
@@ -53,10 +55,19 @@ def _normalize_quaternion(
 class IKAdapter:
     def __init__(self) -> None:
         self._pink_fn = None
+        self._tracik_fn = None
         self.reload()
 
     def reload(self) -> None:
         self._pink_fn = None
+        self._tracik_fn = None
+        try:
+            mod = importlib.import_module("desk_core.ik_tracik")
+            importlib.reload(mod)
+            mod.get_solver()
+            self._tracik_fn = mod.solve_ik
+        except Exception:
+            self._tracik_fn = None
         if (REPO_ROOT / "desk_core" / "ik_pink.py").exists():
             try:
                 mod = importlib.import_module("desk_core.ik_pink")
@@ -68,6 +79,8 @@ class IKAdapter:
     def backend_name(self) -> str:
         if os.environ.get("PINK_IK_URL", "").strip():
             return f"http:{os.environ['PINK_IK_URL'].strip()}"
+        if self._tracik_fn is not None:
+            return "tracik_local"
         if self._pink_fn is not None:
             try:
                 self._pink_fn(0, 0, 0.1)  # Quick probe
@@ -90,8 +103,9 @@ class IKAdapter:
         seed_joints_rad: list[float] | None = None,
         obstacles: list[SceneObstacle] | None = None,
         n_arm: int = 7,
+        joint_bounds_rad: list[tuple[float, float]] | None = None,
     ) -> list[float]:
-        """Solve IK for an xyzw target quaternion and optional joint seed."""
+        """Solve IK for an xyzw target quaternion, optional joint seed and optional per-joint limits."""
         qx, qy, qz, qw = _normalize_quaternion(qx, qy, qz, qw)
         seed = list(seed_joints_rad) if seed_joints_rad is not None else [0.0] * n_arm
         if len(seed) != n_arm:
@@ -121,9 +135,18 @@ class IKAdapter:
                     raise ValueError(f"IK service must return {n_arm} finite joint angles")
                 return result
 
+        if self._tracik_fn is not None:
+            result = [float(v) for v in self._tracik_fn(
+                x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw,
+                seed_joints_rad=seed, obstacles=obstacles or [], joint_bounds_rad=joint_bounds_rad,
+            )]
+            if len(result) != n_arm or not all(math.isfinite(v) for v in result):
+                raise ValueError(f"TRAC-IK must return {n_arm} finite joint angles")
+            return result
+
         if self._pink_fn is None:
             raise RuntimeError(
-                "No IK backend configured. Implement desk_core/ik_pink.py or set PINK_IK_URL."
+                "No IK backend configured. Install pytracik, implement desk_core/ik_pink.py or set PINK_IK_URL."
             )
         try:
             angles = self._pink_fn(
