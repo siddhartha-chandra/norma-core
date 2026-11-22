@@ -50,6 +50,7 @@ RAM_STATUS = 0x40
 RAM_PRESENT_CURRENT = 0x45
 
 MAX_ANGLE_STEP = 4095
+RANGES_REFRESH_S = 5.0
 SIGN_BIT_MASK = 0x8000
 FULL_STATE_LEN = 0x47
 GRIPPER_SLACK_STEPS = 120
@@ -58,14 +59,14 @@ DEFAULT_SPEED = int(os.environ.get("ROBOT_GOAL_SPEED", "600"))
 DEFAULT_ACCEL = int(os.environ.get("ROBOT_GOAL_ACCEL", "20"))
 
 ELROBOT_MOTOR_RANGES: dict[int, tuple[int, int]] = {
-    1: (1146, 2950),
-    2: (1002, 3094),
-    3: (907, 3189),
-    4: (900, 3196),
-    5: (166, 3930),
-    6: (1061, 3035),
-    7: (124, 3972),
-    8: (1255, 2841),
+    1: (1088, 3008),
+    2: (1001, 3095),
+    3: (912, 3184),
+    4: (899, 3197),
+    5: (154, 3942),
+    6: (1026, 3070),
+    7: (125, 3971),
+    8: (1232, 2864),
 }
 
 # Auto-reconnect (issue #3): a live NormFS subscription should see motor
@@ -496,6 +497,8 @@ class LiveStationBridge:
         self._bus_voltage: dict[str, float] = {}
         self._torque_started: set[int] = set()
         self._follow_motor_rx = follow_motor_rx
+        self._station_ranges: dict[str, dict[int, tuple[int, int]]] = {}
+        self._ranges_polled_mono: float | None = None
         self.rx_received_at: dict[tuple[str, int], float] = {}
         self.frame_received_at: dict[str, float] = {}
         self._video_entry_ids: dict[str, bytes] = {}
@@ -741,13 +744,24 @@ class LiveStationBridge:
             except Exception as exc:
                 log.debug("inference-states parse skip: %s", exc)
 
-    def _ingest_inference_bytes(self, raw: bytes | memoryview) -> bool:
+    def _ingest_inference_bytes(self, raw: bytes | memoryview, ranges_only: bool = False) -> bool:
+        # ranges_only keeps positions owned by st3215/rx so encoder samples stay paired with receipt times.
         reader = self._st3215.InferenceStateReader(memoryview(bytes(raw)))
         updated = False
         for bus in reader.get_buses():
             info = bus.get_bus()
             serial = info.get_serial_number() if info else ""
             if not serial:
+                continue
+            ranges = self._station_ranges.setdefault(serial, {})
+            for m in bus.get_motors():
+                if m.get_range_max() > m.get_range_min():
+                    ranges[m.get_id()] = (m.get_range_min(), m.get_range_max())
+            if ranges_only:
+                for mid, ms in self._motor_state.get(serial, {}).items():
+                    if mid in ranges:
+                        ms.range_min, ms.range_max = ranges[mid]
+                        updated = True
                 continue
             slot = self._motor_state.setdefault(serial, {})
             volts: list[float] = []
@@ -782,9 +796,12 @@ class LiveStationBridge:
         return updated
 
     async def _poll_inference_tail(self, timeout_s: float = 2.0) -> bool:
-        # Keep raw encoder values and receipt times paired for calibration capture.
-        if self._follow_motor_rx or self.client is None or not hasattr(self.client, "read_from_tail"):
+        if self.client is None or not hasattr(self.client, "read_from_tail"):
             return False
+        if self._follow_motor_rx:
+            # Positions come from st3215/rx here; refresh only the calibrated ranges, and not on every call.
+            if self._ranges_polled_mono is not None and time.monotonic() - self._ranges_polled_mono < RANGES_REFRESH_S:
+                return False
         if not (self.client.connected and self.client.setup_done):
             return False
         try:
@@ -797,6 +814,10 @@ class LiveStationBridge:
                 if entry is None:
                     break
                 latest_entry = entry
+            if latest_entry is not None and self._follow_motor_rx:
+                self._ranges_polled_mono = time.monotonic()
+                self._ingest_inference_bytes(latest_entry.Data, ranges_only=True)
+                return False
             if latest_entry is not None and self._ingest_inference_bytes(latest_entry.Data):
                 self._last_rx_mono = time.monotonic()
                 return True
@@ -841,7 +862,8 @@ class LiveStationBridge:
                     slot[mid].current_ma = cur
                     slot[mid].error_status = err
                 else:
-                    slot[mid] = MotorState(mid, pos, cur, 0, MAX_ANGLE_STEP, err)
+                    lo, hi = self._station_ranges.get(serial, {}).get(mid, (0, MAX_ANGLE_STEP))
+                    slot[mid] = MotorState(mid, pos, cur, lo, hi, err)
             except Exception as exc:
                 log.debug("rx parse skip: %s", exc)
 
