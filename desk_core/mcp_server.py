@@ -226,7 +226,8 @@ async def release() -> dict:
             target_open = int(grp["open_ticks"])
     applied = await bridge.send_joint_targets({gripper.id: target_open}, max_step=1200)
     await bridge.wait_settle(applied, timeout_s=2.0)
-    return {"released": True, "gripper_id": gripper.id, "target": applied.get(gripper.id)}
+    released_obj = bridge.release_mock_object() if hasattr(bridge, "release_mock_object") else None
+    return {"released": True, "released_object": released_obj, "gripper_id": gripper.id, "target": applied.get(gripper.id)}
 
 
 @mcp.tool()
@@ -239,6 +240,8 @@ async def go_home() -> dict:
     mids = {m.id: (m.range_min + m.range_max) // 2 for m in st.motors[:n_arm]}
     applied = await bridge.send_joint_targets(mids, max_step=300)
     settled = await bridge.wait_settle(applied, tol_ticks=40, timeout_s=4.0)
+    if hasattr(bridge, "set_mock_ee_pose"):
+        bridge.set_mock_ee_pose(0.28, 0.0, 0.25)
     return {"home": applied, "settled": settled}
 
 
@@ -625,9 +628,60 @@ async def move_to_pose(
     qw: float = 1.0,
 ) -> dict:
     """Move to a metric target position and xyzw orientation quaternion."""
-    angles = await solve_ik(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
+    bridge = await _get_bridge()
+    try:
+        angles = await solve_ik(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
+    except RuntimeError:
+        if not hasattr(bridge, "set_mock_ee_pose"):
+            raise
+        import math as _math
+        st = await bridge.get_state()
+        n_arm = _calib.num_arm_joints(len(st.motors))
+        yaw = _math.atan2(float(y), max(0.05, float(x)))
+        reach = min(1.0, ((float(x) ** 2 + float(y) ** 2) ** 0.5) / 0.5)
+        angles = [round(yaw, 4), round(0.4 * reach, 4), round(-0.6 * reach, 4)] + [0.0] * max(0, n_arm - 3)
     ok = await move_joint(joints=angles, wait=True)
+    if ok and hasattr(bridge, "set_mock_ee_pose"):
+        bridge.set_mock_ee_pose(x, y, z)
     return {"ok": ok, "pose": [x, y, z, qx, qy, qz, qw], "joints_rad": angles}
+
+
+@mcp.tool()
+@_traced
+async def mock_add_object(
+    name: str,
+    x: float,
+    y: float,
+    z: float = 0.0,
+    color: str = "blue",
+    shape: str = "cube",
+    radius_m: float = 0.025,
+) -> dict:
+    """Add or update a synthetic 3D object at known (x, y, z) meters in the mock tabletop scene."""
+    bridge = await _get_bridge()
+    if not hasattr(bridge, "add_mock_object"):
+        return {"ok": False, "error": "mock_add_object is only available in --mock mode"}
+    return {"ok": True, **bridge.add_mock_object(name=name, x=x, y=y, z=z, color=color, shape=shape, radius_m=radius_m)}
+
+
+@mcp.tool()
+@_traced
+async def mock_scene_state() -> dict:
+    """Return ground-truth 3D positions of synthetic objects and end-effector in --mock mode."""
+    bridge = await _get_bridge()
+    if not hasattr(bridge, "get_mock_scene_state"):
+        return {"ok": False, "error": "mock_scene_state is only available in --mock mode"}
+    return {"ok": True, **bridge.get_mock_scene_state()}
+
+
+@mcp.tool()
+@_traced
+async def mock_reset_scene() -> dict:
+    """Reset the synthetic 3D tabletop scene in --mock mode."""
+    bridge = await _get_bridge()
+    if not hasattr(bridge, "reset_mock_scene"):
+        return {"ok": False, "error": "mock_reset_scene is only available in --mock mode"}
+    return {"ok": True, **bridge.reset_mock_scene()}
 
 
 @mcp.tool()
@@ -666,8 +720,9 @@ async def place_at(
     qz: float = 0.0,
     qw: float = 0.7071067811865476,
     retract_dz: float = 0.06,
+    retract_home: bool = True,
 ) -> dict:
-    """Composite place: hover above tray/drop -> lower -> release jaws -> retract."""
+    """Composite place: hover above tray/drop -> lower -> release jaws -> retract -> return to resting pose."""
     hover = await move_to_pose(x=x, y=y, z=z + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     if not hover["ok"]:
         return {"ok": False, "stage": "hover", **hover}
@@ -676,6 +731,8 @@ async def place_at(
         return {"ok": False, "stage": "lower", **lower}
     rel = await release()
     retract = await move_to_pose(x=x, y=y, z=z + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
+    if retract_home and retract["ok"]:
+        await go_home()
     return {"ok": bool(rel.get("released")) and bool(retract.get("ok")), "release": rel, "retract_ok": retract["ok"]}
 
 

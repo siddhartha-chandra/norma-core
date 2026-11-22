@@ -157,6 +157,102 @@ class MockStationBridge:
             mid: MotorState(mid, 2048, 35, 1000, 3100, 0)
             for mid in range(1, num_joints + 1)
         }
+        self._ee_pos: list[float] = [0.28, 0.0, 0.25]
+        self._held_object: str | None = None
+        self._held_riders: list[str] = []
+        self._scene_objects: dict[str, dict[str, Any]] = {}
+        self.reset_mock_scene()
+
+    def reset_mock_scene(self) -> dict[str, Any]:
+        self._ee_pos = [0.28, 0.0, 0.25]
+        self._held_object = None
+        self._held_riders = []
+        self._scene_objects = {
+            "keys": {"x": 0.27, "y": -0.06, "z": 0.0, "color": "blue", "shape": "cube", "radius_m": 0.025},
+            "mug": {"x": 0.30, "y": 0.02, "z": 0.0, "color": "brown", "shape": "cylinder", "radius_m": 0.032},
+            "red_cube": {"x": 0.18, "y": 0.10, "z": 0.0, "color": "red", "shape": "cube", "radius_m": 0.024},
+            "green_block": {"x": 0.36, "y": -0.12, "z": 0.0, "color": "green", "shape": "cube", "radius_m": 0.024},
+        }
+        return self.get_mock_scene_state()
+
+    def add_mock_object(
+        self,
+        name: str,
+        x: float,
+        y: float,
+        z: float = 0.0,
+        color: str = "blue",
+        shape: str = "cube",
+        radius_m: float = 0.025,
+    ) -> dict[str, Any]:
+        self._scene_objects[name] = {
+            "x": round(float(x), 4),
+            "y": round(float(y), 4),
+            "z": round(float(z), 4),
+            "color": color.strip().lower(),
+            "shape": shape.strip().lower(),
+            "radius_m": float(radius_m),
+        }
+        return self.get_mock_scene_state()
+
+    @staticmethod
+    def _obj_height(name: str, obj: dict[str, Any]) -> float:
+        heights = {
+            "cylinder": 0.09, "mug": 0.09, "pen": 0.012, "wallet": 0.025,
+            "airpods": 0.025, "wired_earphones": 0.015, "mobile_phone": 0.010,
+            "sphere": 0.048, "cube": 0.045,
+        }
+        return heights.get("mug" if name == "mug" else obj.get("shape", "cube"), 0.04)
+
+    def set_mock_ee_pose(self, x: float, y: float, z: float) -> None:
+        self._ee_pos = [round(float(x), 4), round(float(y), 4), round(float(z), 4)]
+        if self._held_object and self._held_object in self._scene_objects:
+            obj = self._scene_objects[self._held_object]
+            new_z = max(0.0, round(self._ee_pos[2], 4))
+            dx = self._ee_pos[0] - obj["x"]
+            dy = self._ee_pos[1] - obj["y"]
+            dz = new_z - obj.get("z", 0.0)
+            obj["x"] = self._ee_pos[0]
+            obj["y"] = self._ee_pos[1]
+            obj["z"] = new_z
+            for r_name in self._held_riders:
+                if r_name in self._scene_objects:
+                    r_obj = self._scene_objects[r_name]
+                    r_obj["x"] = round(r_obj["x"] + dx, 4)
+                    r_obj["y"] = round(r_obj["y"] + dy, 4)
+                    r_obj["z"] = max(0.0, round(r_obj.get("z", 0.0) + dz, 4))
+
+    def release_mock_object(self) -> str | None:
+        released = self._held_object
+        riders = list(self._held_riders)
+        self._held_object = None
+        self._held_riders = []
+        if released and released in self._scene_objects:
+            obj = self._scene_objects.pop(released)
+            rider_objs = {r: self._scene_objects.pop(r) for r in riders if r in self._scene_objects}
+            support_z = 0.0
+            for other_name, other in self._scene_objects.items():
+                dx = obj["x"] - other["x"]
+                dy = obj["y"] - other["y"]
+                if (dx * dx + dy * dy) ** 0.5 < (obj.get("radius_m", 0.025) + other.get("radius_m", 0.025)):
+                    oh = self._obj_height(other_name, other)
+                    support_z = max(support_z, round(other.get("z", 0.0) + oh, 4))
+            obj["z"] = max(round(self._ee_pos[2], 4), support_z)
+            # Re-insert last so newly placed object renders on top of co-planar items
+            self._scene_objects[released] = obj
+            base_top = round(obj["z"] + self._obj_height(released, obj), 4)
+            for r_name, r_obj in rider_objs.items():
+                r_obj["z"] = max(base_top, round(r_obj.get("z", base_top), 4))
+                self._scene_objects[r_name] = r_obj
+                base_top = round(r_obj["z"] + self._obj_height(r_name, r_obj), 4)
+        return released
+
+    def get_mock_scene_state(self) -> dict[str, Any]:
+        return {
+            "ee_pos": {"x": self._ee_pos[0], "y": self._ee_pos[1], "z": self._ee_pos[2]},
+            "held_object": self._held_object,
+            "objects": {k: dict(v) for k, v in self._scene_objects.items()},
+        }
 
     async def connect(self) -> None:
         log.info("MockStationBridge connected (%d-DOF offline desk mode)", self.num_joints)
@@ -176,55 +272,106 @@ class MockStationBridge:
     async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
         if camera in self._frame_overrides:
             return self._frame_overrides[camera]
-        # 1. Explicit realistic test image override via env var or repo `mock_frames/{top,wrist}.jpg`
-        env_key = "DESK_MOCK_TOP_IMAGE" if camera == "top" else "DESK_MOCK_WRIST_IMAGE"
-        candidates = []
-        if os.environ.get(env_key, "").strip():
-            candidates.append(Path(os.environ[env_key].strip()))
-        candidates.append(REPO_ROOT / "mock_frames" / f"{camera}.jpg")
-        if os.environ.get("DESK_MOCK_REAL_SNAPS") == "1":
-            candidates.append(REPO_ROOT / ("cam_1.jpg" if camera == "top" else "cam_0.jpg"))
-        for cand in candidates:
-            if cand.exists() and cand.is_file():
-                return cand.read_bytes()
+        if os.environ.get("DESK_MOCK_SYNTHETIC") != "1":
+            env_key = "DESK_MOCK_TOP_IMAGE" if camera == "top" else "DESK_MOCK_WRIST_IMAGE"
+            candidates = []
+            if os.environ.get(env_key, "").strip():
+                candidates.append(Path(os.environ[env_key].strip()))
+            candidates.append(REPO_ROOT / "mock_frames" / f"{camera}.jpg")
+            if os.environ.get("DESK_MOCK_REAL_SNAPS") == "1":
+                candidates.append(REPO_ROOT / ("cam_1.jpg" if camera == "top" else "cam_0.jpg"))
+            for cand in candidates:
+                if cand.exists() and cand.is_file():
+                    return cand.read_bytes()
 
-        # 2. Realistic 640x480 fallback desk scene (matches test_primitives shape expectation)
-        img = Image.new("RGB", (640, 480), (222, 220, 214) if camera == "top" else (36, 38, 44))
+        # 2. Clean 640x480 synthetic 3D tabletop scene projected into top & gripper ('wrist') views
+        color_rgb = {
+            "blue": (40, 115, 220),
+            "red": (215, 55, 50),
+            "green": (45, 175, 90),
+            "yellow": (230, 185, 45),
+            "purple": (150, 75, 205),
+            "pink": (225, 105, 165),
+            "brown": (125, 78, 48),
+            "orange": (230, 125, 40),
+        }
+        img = Image.new("RGB", (640, 480), (234, 232, 226) if camera == "top" else (34, 38, 46))
         d = ImageDraw.Draw(img)
+
         if camera == "top":
-            # Subtle desk mat border & shadow
-            d.rectangle([28, 28, 612, 452], fill=(232, 230, 224), outline=(185, 182, 175), width=2)
-            # Departure tray (top right) with inner shadow
-            d.rounded_rectangle([424, 48, 598, 214], radius=12, fill=(170, 174, 180))
-            d.rounded_rectangle([420, 42, 594, 208], radius=12, fill=(208, 215, 224), outline=(80, 95, 115), width=3)
-            d.rounded_rectangle([432, 54, 582, 196], radius=8, fill=(224, 229, 236), outline=(145, 155, 170), width=1)
-            d.text((452, 62), "DEPARTURE TRAY", fill=(65, 80, 105))
-            # Ceramic mug with handle & coffee
-            d.ellipse([265, 185, 353, 273], fill=(165, 162, 156))  # drop shadow
-            d.arc([332, 202, 366, 246], start=-70, end=70, fill=(245, 243, 238), width=7)
-            d.ellipse([260, 180, 346, 266], fill=(245, 243, 238), outline=(180, 176, 170), width=2)
-            d.ellipse([270, 190, 336, 256], fill=(72, 44, 28))  # coffee
-            # Keys: blue silicone fob + metal key ring + brass key blade
-            d.polygon([(145, 314), (219, 289), (229, 319), (155, 344)], fill=(165, 162, 156))
-            d.polygon([(140, 310), (215, 285), (225, 315), (150, 340)], fill=(32, 110, 215))
-            d.ellipse([212, 280, 240, 308], outline=(185, 190, 198), width=3)
-            d.polygon([(234, 286), (274, 274), (277, 283), (237, 295)], fill=(200, 170, 85))
-            # Chunky marker (black body + red cap)
-            d.polygon([(94, 125), (199, 150), (194, 170), (89, 145)], fill=(165, 162, 156))
-            d.polygon([(90, 120), (165, 138), (160, 158), (85, 140)], fill=(38, 40, 46))
-            d.polygon([(165, 138), (196, 145), (191, 165), (160, 158)], fill=(210, 48, 42))
-            # White earbud case
-            d.rounded_rectangle([322, 344, 386, 396], radius=14, fill=(165, 162, 156))
-            d.rounded_rectangle([318, 340, 382, 392], radius=14, fill=(248, 249, 250), outline=(195, 198, 204), width=2)
-            d.ellipse([348, 364, 354, 370], fill=(40, 210, 95))
+            cx_cam, cy_cam, cz_cam = 0.28, 0.0, 0.65
+            f_px = 680.0
+            d.rectangle([28, 28, 612, 452], fill=(242, 240, 235), outline=(190, 188, 180), width=2)
         else:
-            # Wrist view with simulated dark gripper jaws & target
-            d.polygon([(260, 210), (370, 185), (385, 235), (275, 260)], fill=(32, 110, 215))
-            d.polygon([(40, 480), (150, 310), (195, 330), (120, 480)], fill=(28, 30, 35))
-            d.polygon([(600, 480), (490, 310), (445, 330), (520, 480)], fill=(28, 30, 35))
-            d.line([(320, 0), (320, 480)], fill=(100, 220, 120), width=1)
-            d.line([(0, 240), (640, 240)], fill=(100, 220, 120), width=1)
-        d.text((12, 10), f"MOCK {camera.upper()} | j1={self._motors[1].position}", fill=(35, 35, 35) if camera == "top" else (240, 240, 240))
+            cx_cam, cy_cam, cz_cam = self._ee_pos[0], self._ee_pos[1], max(0.12, self._ee_pos[2])
+            f_px = 520.0
+            # Clean desk background inside gripper field of view
+            d.rectangle([0, 0, 640, 480], fill=(224, 222, 216))
+
+        def _proj(wx: float, wy: float, wz: float) -> tuple[float, float, float]:
+            dz = max(0.06, cz_cam - wz)
+            # World +X = forward (up on screen -> -v), World +Y = left (-u)
+            u = 320.0 - ((wy - cy_cam) / dz) * f_px
+            v = 240.0 - ((wx - cx_cam) / dz) * f_px
+            return u, v, dz
+
+        for name, obj in sorted(self._scene_objects.items(), key=lambda kv: kv[1].get("z", 0.0)):
+            u, v, dz = _proj(obj["x"], obj["y"], obj["z"])
+            r_px = max(8, int(round((obj.get("radius_m", 0.025) / dz) * f_px)))
+            if u < -r_px * 2 or u > 640 + r_px * 2 or v < -r_px * 2 or v > 480 + r_px * 2:
+                continue
+            rgb = color_rgb.get(obj.get("color", "blue"), (60, 130, 210))
+            shape = obj.get("shape", "cube")
+            # Subtle drop shadow
+            d.ellipse([u - r_px + 4, v - r_px + 5, u + r_px + 4, v + r_px + 5], fill=(185, 183, 177))
+            if shape == "cylinder" or name == "mug":
+                d.ellipse([u - r_px, v - r_px, u + r_px, v + r_px], fill=rgb, outline=(40, 40, 40), width=2)
+                inner = max(3, int(r_px * 0.6))
+                d.ellipse([u - inner, v - inner, u + inner, v + inner], fill=(70, 42, 26))
+            elif shape == "sphere":
+                d.ellipse([u - r_px, v - r_px, u + r_px, v + r_px], fill=rgb, outline=(40, 40, 40), width=2)
+            elif shape == "pen":
+                pw = max(14, int(r_px * 1.8))
+                ph = max(4, int(r_px * 0.32))
+                d.rounded_rectangle([u - pw, v - ph, u + pw, v + ph], radius=3, fill=(35, 38, 44), outline=(140, 145, 155), width=1)
+                d.rectangle([u + pw - max(6, pw // 3), v - ph, u + pw, v + ph], fill=rgb)
+            elif shape == "wallet":
+                ww = max(14, int(r_px * 1.35))
+                wh = max(10, int(r_px * 0.95))
+                d.rounded_rectangle([u - ww, v - wh, u + ww, v + wh], radius=5, fill=(105, 62, 38), outline=(55, 32, 20), width=2)
+                d.line([(u - ww + 4, v), (u + ww - 4, v)], fill=(140, 90, 55), width=1)
+            elif shape == "airpods":
+                aw = max(10, int(r_px * 0.95))
+                ah = max(8, int(r_px * 0.8))
+                d.rounded_rectangle([u - aw, v - ah, u + aw, v + ah], radius=7, fill=(248, 249, 250), outline=(185, 190, 198), width=2)
+                d.ellipse([u - 2, v - 2, u + 3, v + 3], fill=(45, 205, 95))
+            elif shape == "wired_earphones":
+                d.arc([u - r_px, v - r_px, u + r_px, v + r_px], start=20, end=310, fill=(240, 242, 246), width=3)
+                d.ellipse([u - r_px - 3, v - 4, u - r_px + 5, v + 4], fill=(248, 249, 250), outline=(150, 155, 165), width=1)
+                d.ellipse([u + r_px - 5, v - 4, u + r_px + 3, v + 4], fill=(248, 249, 250), outline=(150, 155, 165), width=1)
+            elif shape == "mobile_phone":
+                mw = max(11, int(r_px * 0.85))
+                mh = max(18, int(r_px * 1.55))
+                d.rounded_rectangle([u - mw, v - mh, u + mw, v + mh], radius=6, fill=(26, 30, 38), outline=(110, 120, 135), width=2)
+                d.rounded_rectangle([u - mw + 3, v - mh + 4, u + mw - 3, v + mh - 4], radius=3, fill=(45, 65, 95))
+            else:
+                d.rounded_rectangle([u - r_px, v - r_px, u + r_px, v + r_px], radius=4, fill=rgb, outline=(40, 40, 40), width=2)
+            d.text((u - r_px, max(4, v - r_px - 14)), name, fill=(35, 35, 35))
+
+        if camera == "top":
+            eu, ev, _ = _proj(self._ee_pos[0], self._ee_pos[1], self._ee_pos[2])
+            d.ellipse([eu - 10, ev - 10, eu + 10, ev + 10], outline=(230, 110, 30), width=3)
+            d.line([(eu - 14, ev), (eu + 14, ev)], fill=(230, 110, 30), width=2)
+            d.line([(eu, ev - 14), (eu, ev + 14)], fill=(230, 110, 30), width=2)
+        else:
+            # Gripper jaws overlay at bottom of eye-in-hand view + crosshair
+            d.polygon([(40, 480), (150, 330), (190, 348), (115, 480)], fill=(32, 34, 40))
+            d.polygon([(600, 480), (490, 330), (450, 348), (525, 480)], fill=(32, 34, 40))
+            d.line([(320, 0), (320, 480)], fill=(90, 190, 110), width=1)
+            d.line([(0, 240), (640, 240)], fill=(90, 190, 110), width=1)
+
+        cam_lbl = "TOP" if camera == "top" else "GRIPPER (wrist)"
+        d.text((12, 10), f"MOCK {cam_lbl} | EE=({self._ee_pos[0]:.2f},{self._ee_pos[1]:.2f},{self._ee_pos[2]:.2f})", fill=(35, 35, 35))
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=88)
         return buf.getvalue()
@@ -255,7 +402,36 @@ class MockStationBridge:
         target = close_ticks if close_ticks is not None else (m.range_min + GRIPPER_SLACK_STEPS + 80)
         m.position = max(m.range_min, min(m.range_max, target))
         gap = abs(m.position - m.range_min)
-        return {"ok": True, "holding": gap > GRIPPER_SLACK_STEPS, "gripper_id": gid, "position": m.position, "current_ma": 180}
+        best_name = None
+        best_dist_3d = 0.12
+        for name, obj in sorted(self._scene_objects.items(), key=lambda kv: kv[1].get("z", 0.0)):
+            dx = obj["x"] - self._ee_pos[0]
+            dy = obj["y"] - self._ee_pos[1]
+            dz = obj["z"] - self._ee_pos[2]
+            d_xy = (dx * dx + dy * dy) ** 0.5
+            d_3d = (dx * dx + dy * dy + dz * dz) ** 0.5
+            if d_xy < 0.08 and abs(dz) < 0.09 and d_3d < best_dist_3d:
+                best_dist_3d = d_3d
+                best_name = name
+        self._held_object = best_name
+        self._held_riders = []
+        if best_name and best_name in self._scene_objects:
+            held = self._scene_objects[best_name]
+            held_h = self._obj_height(best_name, held)
+            for other_name, other in sorted(self._scene_objects.items(), key=lambda kv: kv[1].get("z", 0.0)):
+                if other_name == best_name:
+                    continue
+                d_xy = ((other["x"] - held["x"]) ** 2 + (other["y"] - held["y"]) ** 2) ** 0.5
+                if d_xy < (held.get("radius_m", 0.025) + other.get("radius_m", 0.025)) and other.get("z", 0.0) >= held.get("z", 0.0) + held_h * 0.5:
+                    self._held_riders.append(other_name)
+        return {
+            "ok": True,
+            "holding": gap > GRIPPER_SLACK_STEPS,
+            "held_object": best_name,
+            "gripper_id": gid,
+            "position": m.position,
+            "current_ma": 180,
+        }
 
     async def abort(self) -> dict:
         self._aborted = True
