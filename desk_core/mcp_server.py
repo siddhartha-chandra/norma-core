@@ -309,6 +309,11 @@ async def get_joint_angles(include_gripper: bool = False) -> list[float]:
     return angles
 
 
+MOVE_JOINT_SPEED_DEG_S = 25.0
+MOVE_JOINT_MIN_DURATION_S = 1.0
+MOVE_JOINT_LAG_LIMIT_TICKS = 120
+
+
 @mcp.tool()
 @_traced
 async def move_joint(
@@ -320,10 +325,9 @@ async def move_joint(
     j_5: float | None = None,
     j_6: float | None = None,
     j_7: float | None = None,
-    max_step_rad: float = 0.4,
     wait: bool = True,
 ) -> bool:
-    """Move arm to target joint angles [j_1, ..., j_7] (radians), safely creep-stepped. Returns True on settle."""
+    """Move arm to target joint angles [j_1, ..., j_7] (radians) in one smooth minimum-jerk stream. Returns True on arrival."""
     bridge = await _get_bridge()
     st = await bridge.get_state()
     n_arm = _calib.num_arm_joints(len(st.motors))
@@ -340,24 +344,15 @@ async def move_joint(
     if not ok_lim:
         return False
 
-    try:
-        tgt_ticks = _calib.rad_to_ticks(target_rad, st.motors)
-        step_ticks = max(40, min(int(round(max_step_rad * TICKS_PER_RAD)), DEFAULT_MAX_STEP * 2))
-        # Creep smoothly in bounded steps so large IK moves never trigger shoulder overload
-        for _ in range(12):
-            curr = (await bridge.get_state()).positions()
-            if all(abs(curr.get(mid, 0) - tgt) <= 25 for mid, tgt in tgt_ticks.items()):
-                return True
-            applied = await bridge.send_joint_targets(tgt_ticks, max_step=step_ticks)
-            if not applied:
-                return False
-            if wait:
-                settled = await bridge.wait_settle(applied, tol_ticks=25, timeout_s=3.0)
-                if not settled:
-                    return False
-            if all(applied.get(mid) == tgt for mid, tgt in tgt_ticks.items()):
-                return True
+    from .motion import MotionLimits, move_joints_smooth
+
+    limits = MotionLimits(joint_speed_deg_s=MOVE_JOINT_SPEED_DEG_S, min_duration_s=MOVE_JOINT_MIN_DURATION_S,
+                          lag_limit_ticks=MOVE_JOINT_LAG_LIMIT_TICKS)
+    if limits.out_of_bounds():
         return False
+    try:
+        run = await move_joints_smooth(bridge, _calib, target_rad, limits)
+        return bool(run["ok"])
     except Exception:
         return False
 

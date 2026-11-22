@@ -268,6 +268,25 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
             "final_ticks": [final[mid] for mid in arm_ids]}
 
 
+async def move_joints_smooth(bridge: StationBridge, calib: CalibrationStore, q_goal, limits: MotionLimits | None = None) -> dict:
+    """Move the arm in joint space to ``q_goal`` (radians) as one continuous minimum-jerk stream.
+
+    The peak joint speed is ``limits.joint_speed_deg_s`` (or ``limits.min_duration_s`` for short moves); the
+    arm never stops between waypoints. The end pose is then corrected for gravity sag.
+    """
+    limits = limits or MotionLimits()
+    motors = (await bridge.get_state()).motors
+    q0 = np.array(calib.ticks_to_rad(motors))
+    goal = np.asarray(q_goal, dtype=float)
+    path = np.vstack([q0, goal])
+    travel = float(np.max(np.abs(goal - q0)))
+    duration = max(limits.min_duration_s, 1.875 * travel / math.radians(limits.joint_speed_deg_s))
+    run = await stream_joint_path(bridge, calib, path, duration, limits)
+    if run["ok"]:
+        await correct_final_pose(bridge, calib, path, limits)
+    return run
+
+
 async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, path: np.ndarray,
                              limits: MotionLimits | None = None) -> dict:
     """Close the loop on the path's end pose: offset joint targets by their remaining error until the flange arrives.
