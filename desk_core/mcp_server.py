@@ -367,6 +367,7 @@ async def get_frame(
     denoise: bool = True,
     as_matrix: bool = False,
     max_dim: int = 0,
+    save_npy: bool = True,
 ) -> list:
     """Fetch camera frame as (H, W, 3) uint8 RGB matrix reference (.npy path + optional inline matrix) and Image."""
     global _frame_seq
@@ -378,13 +379,14 @@ async def get_frame(
     frame_dir = (_logger.run_dir / "frames") if _logger is not None else (RUNS_DIR / "latest_frames")
     frame_dir.mkdir(parents=True, exist_ok=True)
     npy_path = frame_dir / f"matrix_{_frame_seq:04d}_{camera}.npy"
-    np.save(npy_path, arr)
+    if save_npy:
+        np.save(npy_path, arr)
 
     meta: dict[str, Any] = {
         "camera": camera,
         "shape": list(arr.shape),
         "dtype": str(arr.dtype),
-        "npy_path": str(npy_path),
+        "npy_path": str(npy_path) if save_npy else None,
     }
     if as_matrix:
         mat = arr

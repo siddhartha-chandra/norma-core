@@ -589,8 +589,8 @@ class RobotAgentTUI(App):
     #key-status { height: auto; margin-bottom: 0; color: $text-muted; }
     #guide-panel { height: auto; border: solid $accent; background: $panel; padding: 0 1; margin-bottom: 1; }
     #camera-panel { height: 18; margin-bottom: 1; display: none; }
-    .cam-box { width: 1fr; height: 18; border: solid $success; padding: 0 1; margin-right: 1; }
-    .cam-img { width: 1fr; height: 15; }
+    .cam-box { width: 1fr; height: 18; border: solid $success; padding: 0 1; margin-right: 1; align-horizontal: center; }
+    .cam-img { width: auto; height: 15; }
     #chat-log { height: 1fr; border: solid $primary; padding: 0 1; margin-bottom: 1; }
     #input-bar { height: auto; align: left middle; }
     #cmd-input { width: 1fr; margin-right: 1; }
@@ -721,7 +721,7 @@ class RobotAgentTUI(App):
 
     async def on_mount(self) -> None:
         self._refresh_status()
-        self._cam_timer = self.set_interval(0.9, self._poll_cameras)
+        self._cam_timer = self.set_interval(0.2, self._poll_cameras)
         self._mcp_task = asyncio.create_task(self._mcp_runner())
 
     def action_show_guide(self) -> None:
@@ -911,12 +911,15 @@ class RobotAgentTUI(App):
                 return
         except Exception:
             return
+        if getattr(self, "_cam_busy", False):
+            return
+        self._cam_busy = True
         if not hasattr(self, "_last_cam_sig"):
             self._last_cam_sig: dict[str, tuple[bytes, str]] = {}
         try:
             r_top, r_wrist = await asyncio.gather(
-                self.session.call_tool("get_frame", {"camera": "top", "denoise": False}),
-                self.session.call_tool("get_frame", {"camera": "wrist", "denoise": False}),
+                self.session.call_tool("get_frame", {"camera": "top", "denoise": False, "save_npy": False}),
+                self.session.call_tool("get_frame", {"camera": "wrist", "denoise": False, "save_npy": False}),
             )
             markers = getattr(self, "_overlay_markers", {})
             marker_sig = json.dumps(
@@ -936,6 +939,8 @@ class RobotAgentTUI(App):
                         break
         except Exception:
             pass
+        finally:
+            self._cam_busy = False
 
     @on(Button.Pressed, "#btn-placement")
     async def _on_placement_btn(self) -> None:
