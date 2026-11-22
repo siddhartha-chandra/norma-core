@@ -1048,7 +1048,8 @@ class LiveStationBridge:
             if mid not in by_id:
                 continue
             m = by_id[mid]
-            lo, hi = (m.range_min, m.range_max) if m.range_max > m.range_min else (0, MAX_ANGLE_STEP)
+            valid_range = m.range_max > m.range_min and m.range_min <= m.position <= m.range_max
+            lo, hi = (m.range_min, m.range_max) if valid_range else (0, MAX_ANGLE_STEP)
             clamped = max(lo, min(hi, int(raw_tgt)))
             delta = max(-max_step, min(max_step, clamped - m.position))
             applied[mid] = m.position + delta

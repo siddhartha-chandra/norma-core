@@ -222,6 +222,9 @@ def _build_system_prompt(tools_summary: str) -> str:
         "- Do NOT output or narrate your thoughts, reasoning, coordinates, or step-by-step plan.\n"
         "- While `done` is false, set `reply` to \"\".\n"
         "- When `done` is true, set `reply` to ONE short, direct confirmation or answer (under 15 words, e.g. 'Moved the pen onto the mug.').\n"
+        "- To locate objects before picking/moving, prefer `localize_3d(query=..., camera='both')` so both top and wrist views triangulate 3D pose and mark the live overlays.\n"
+        "- Call `pick_at(x, y, z)` and `place_at(x, y, z)` directly once coordinates are known (they handle reachable grasp orientation); do NOT loop on `solve_ik` guessing quaternions.\n"
+        "- Never report success if a motion tool failed or was blocked; report the failure briefly.\n"
         "- Batch tool calls in one step when safe (e.g., `pick_at` + `place_at` when target coordinates are known) "
         "and avoid redundant `observe`/`get_state` calls since live camera images are already attached.\n"
         f"Available MCP tools:\n{tools_summary}"
@@ -741,7 +744,7 @@ async def run_agent_command(
     fetch_images_fn: Callable[[], Awaitable[list[tuple[str, bytes]]]],
     tools_summary: str,
     call_tool_fn: Callable[[str, dict[str, Any]], Awaitable[Any]],
-    max_steps: int = 5,
+    max_steps: int = 8,
     step_fn: Callable[..., AgentStepResponse] | None = None,
 ) -> dict[str, Any]:
     """Run up to `max_steps` multimodal tool-calling turns for a user voice/text command."""
@@ -752,6 +755,8 @@ async def run_agent_command(
     history: list[str] = [f"User command: {command_text}"]
     executed: list[dict[str, Any]] = []
     final_reply = ""
+    completed = False
+    last_error = ""
 
     for _ in range(max_steps):
         images = await fetch_images_fn()
@@ -761,21 +766,38 @@ async def run_agent_command(
         )
         if step.thought:
             history.append(f"Thought: {step.thought}")
+
+        for tc in step.tool_calls:
+            try:
+                res = await call_tool_fn(tc.tool, tc.args)
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)}
+            if isinstance(res, dict) and res.get("ok") is False and res.get("error"):
+                last_error = str(res["error"])
+            elif isinstance(res, str) and "Error" in res:
+                last_error = res[:180]
+            executed.append({"tool": tc.tool, "args": tc.args, "result": res})
+            history.append(f"Tool {tc.tool}({json.dumps(tc.args)}) -> {json.dumps(res, default=str)[:1200]}")
+
         if step.reply and (step.done or not step.tool_calls):
             cleaned = _sanitize_reply(step.reply, step.thought)
             if cleaned:
                 final_reply = cleaned
 
         if not step.tool_calls or step.done:
+            completed = True
             break
 
-        for tc in step.tool_calls:
-            res = await call_tool_fn(tc.tool, tc.args)
-            executed.append({"tool": tc.tool, "args": tc.args, "result": res})
-            history.append(f"Tool {tc.tool}({json.dumps(tc.args)}) -> {json.dumps(res, default=str)[:1200]}")
+    if not final_reply:
+        if completed:
+            final_reply = "Done."
+        elif last_error:
+            final_reply = f"Failed before completion: {last_error}"
+        else:
+            final_reply = "Stopped after reaching step limit before completing the task."
 
     return {
-        "reply": final_reply or "Done.",
+        "reply": final_reply,
         "steps": executed,
         "provider": provider,
         "model": model_id,

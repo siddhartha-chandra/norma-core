@@ -233,17 +233,52 @@ async def release() -> dict:
 
 @mcp.tool()
 @_traced
-async def go_home() -> dict:
-    """Move arm safely toward calibrated midpoint pose (creep-stepped if far)."""
+async def go_home(look_at_table: bool = True) -> dict:
+    """Move arm safely toward calibrated home / table-viewing pose (creep-stepped if far)."""
     bridge = await _get_bridge()
     st = await bridge.get_state()
     n_arm = _calib.num_arm_joints(len(st.motors))
-    mids = {m.id: (m.range_min + m.range_max) // 2 for m in st.motors[:n_arm]}
-    applied = await bridge.send_joint_targets(mids, max_step=300)
-    settled = await bridge.wait_settle(applied, tol_ticks=40, timeout_s=4.0)
+    arm_motors = st.motors[:n_arm]
+
+    targets: dict[int, int] = {}
+    if _calib.data.get("calibrated"):
+        home_q = _calib.data.get("home_joints_rad")
+        table_q = _calib.data.get("table_view_joints_rad") or [0.0, 0.4, 0.0, -1.1, 0.0, 0.9, 0.0]
+        if look_at_table:
+            # Prefer explicit table_view_joints_rad, or use table-viewing pose if home_joints_rad is all zeros
+            if _calib.data.get("table_view_joints_rad"):
+                q_list = list(table_q)
+            elif isinstance(home_q, list) and len(home_q) == n_arm and any(abs(float(v)) > 0.05 for v in home_q):
+                q_list = [float(v) for v in home_q]
+            else:
+                q_list = list(table_q[:n_arm])
+        else:
+            q_list = [float(v) for v in home_q] if isinstance(home_q, list) and len(home_q) == n_arm else [0.0] * n_arm
+
+        for m, angle in zip(arm_motors, q_list):
+            raw = _calib._zero_tick(m) + _calib._sign(m.id) * float(angle) * TICKS_PER_RAD
+            tick = int(round(raw))
+            valid_bounds = m.range_max > m.range_min and m.range_min <= m.position <= m.range_max
+            lo, hi = (m.range_min, m.range_max) if valid_bounds else (0, 4095)
+            targets[m.id] = max(lo, min(hi, tick))
+    else:
+        for m in arm_motors:
+            valid_bounds = m.range_max > m.range_min and m.range_min <= m.position <= m.range_max
+            targets[m.id] = (m.range_min + m.range_max) // 2 if valid_bounds else 2048
+
+    applied = targets
+    settled = False
+    for _ in range(10):
+        applied = await bridge.send_joint_targets(targets, max_step=300)
+        settled = await bridge.wait_settle(applied, tol_ticks=40, timeout_s=2.0)
+        cur = {m.id: m.position for m in (await bridge.get_state()).motors[:n_arm]}
+        if all(abs(cur.get(mid, tgt) - tgt) <= 40 for mid, tgt in targets.items()):
+            settled = True
+            break
+
     if hasattr(bridge, "set_mock_ee_pose"):
-        bridge.set_mock_ee_pose(0.28, 0.0, 0.25)
-    return {"home": applied, "settled": settled}
+        bridge.set_mock_ee_pose(0.0, 0.27, 0.25 if look_at_table else 0.22)
+    return {"home": targets, "applied": applied, "look_at_table": look_at_table, "settled": settled}
 
 
 @mcp.tool()
@@ -380,6 +415,7 @@ async def solve_ik(
     st = await bridge.get_state()
     seed_joints_rad = _calib.ticks_to_rad(st.motors)
     n_arm = _calib.num_arm_joints(len(st.motors))
+    valid_bounds = all(m.range_max > m.range_min and m.range_min <= m.position <= m.range_max for m in st.motors[:n_arm])
     return _ik.solve_ik(
         x=float(x),
         y=float(y),
@@ -391,7 +427,7 @@ async def solve_ik(
         seed_joints_rad=seed_joints_rad,
         obstacles=list(_obstacles.values()),
         n_arm=n_arm,
-        joint_bounds_rad=_calib.bounds_rad(st.motors),
+        joint_bounds_rad=_calib.bounds_rad(st.motors) if valid_bounds else None,
     )
 
 
@@ -747,6 +783,89 @@ async def mock_reset_scene() -> dict:
     return {"ok": True, **bridge.reset_mock_scene()}
 
 
+async def _resolve_grasp_pose(
+    x: float,
+    y: float,
+    z: float,
+    qx: float,
+    qy: float,
+    qz: float,
+    qw: float,
+    dz: float = 0.06,
+) -> tuple[float, float, float, list[float] | None, list[float] | None]:
+    """Find reachable (grasp, hover) joint solutions for pick/place, falling back to radial tabletop orientations."""
+    try:
+        q_hover = await solve_ik(x=x, y=y, z=z + dz, qx=qx, qy=qy, qz=qz, qw=qw)
+        q_grasp = await solve_ik(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
+        return (x, y, z, q_hover, q_grasp)
+    except (RuntimeError, ValueError):
+        pass
+
+    import math as _math
+    from scipy.spatial.transform import Rotation as _Rot
+
+    yaw = _math.atan2(float(y), float(x)) - _math.pi / 2.0
+    z_candidates = [float(z)] + ([float(z) + 0.06, float(z) + 0.08] if float(z) < 0.06 else [])
+    pitches = (60.0, 45.0, 30.0, 75.0, 15.0, 0.0, 90.0, -15.0, -30.0, -45.0, -60.0)
+    for z_try in z_candidates:
+        q_grasp = None
+        best_rot = None
+        for pitch in pitches:
+            for roll in (0.0, 180.0):
+                rot = (
+                    _Rot.from_euler("z", yaw)
+                    * _Rot.from_euler("x", -pitch, degrees=True)
+                    * _Rot.from_euler("y", roll, degrees=True)
+                )
+                cand_q = rot.as_quat()
+                try:
+                    q_grasp = await solve_ik(
+                        x=x, y=y, z=z_try,
+                        qx=float(cand_q[0]), qy=float(cand_q[1]),
+                        qz=float(cand_q[2]), qw=float(cand_q[3]),
+                    )
+                    best_rot = cand_q
+                    break
+                except (RuntimeError, ValueError):
+                    continue
+            if q_grasp is not None:
+                break
+        if q_grasp is None:
+            continue
+        # Solve hover pose (preferring the same orientation and requested dz, falling back to dz=0.04 at workspace edge)
+        bridge = await _get_bridge()
+        st = await bridge.get_state()
+        n_arm = _calib.num_arm_joints(len(st.motors))
+        valid_bounds = all(m.range_max > m.range_min and m.range_min <= m.position <= m.range_max for m in st.motors[:n_arm])
+        bounds = _calib.bounds_rad(st.motors) if valid_bounds else None
+        hover_quats = [best_rot] + [
+            (
+                _Rot.from_euler("z", yaw)
+                * _Rot.from_euler("x", -hp, degrees=True)
+                * _Rot.from_euler("y", hr, degrees=True)
+            ).as_quat()
+            for hp in pitches
+            for hr in (0.0, 180.0)
+        ]
+        dz_candidates = [dz] if dz <= 0.04 else [dz, 0.04]
+        for dz_try in dz_candidates:
+            for hq in hover_quats:
+                try:
+                    q_hover = _ik.solve_ik(
+                        x=x, y=y, z=z_try + dz_try,
+                        qx=float(hq[0]), qy=float(hq[1]),
+                        qz=float(hq[2]), qw=float(hq[3]),
+                        seed_joints_rad=q_grasp,
+                        obstacles=list(_obstacles.values()),
+                        n_arm=n_arm,
+                        joint_bounds_rad=bounds,
+                    )
+                    return (x, y, z_try, q_hover, q_grasp)
+                except (RuntimeError, ValueError):
+                    continue
+    return (x, y, z, None, None)
+
+
 @mcp.tool()
 @_traced
 async def pick_at(
@@ -760,15 +879,30 @@ async def pick_at(
     approach_dz: float = 0.06,
 ) -> dict:
     """Composite pick: open jaws -> hover above -> descend -> grasp_with_verify -> retract cleanly."""
+    rx, ry, rz, q_hover, q_grasp = await _resolve_grasp_pose(x, y, z, qx, qy, qz, qw, dz=approach_dz)
     await release()
-    hover = await move_to_pose(x=x, y=y, z=z + approach_dz, qx=qx, qy=qy, qz=qz, qw=qw)
+    if q_hover is not None and q_grasp is not None:
+        bridge = await _get_bridge()
+        if not await move_joint(joints=q_hover, wait=True):
+            return {"ok": False, "stage": "hover", "error": "move_joint(hover) failed"}
+        if not await move_joint(joints=q_grasp, wait=True):
+            return {"ok": False, "stage": "descend", "error": "move_joint(descend) failed"}
+        if hasattr(bridge, "set_mock_ee_pose"):
+            bridge.set_mock_ee_pose(rx, ry, rz)
+        grip = await grasp()
+        retract_ok = await move_joint(joints=q_hover, wait=True)
+        if retract_ok and hasattr(bridge, "set_mock_ee_pose"):
+            bridge.set_mock_ee_pose(rx, ry, rz + approach_dz)
+        return {"ok": bool(grip.get("ok")) and bool(retract_ok), "grasp": grip, "retract_ok": retract_ok}
+
+    hover = await move_to_pose(x=rx, y=ry, z=rz + approach_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     if not hover["ok"]:
         return {"ok": False, "stage": "hover", **hover}
-    descend = await move_to_pose(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
+    descend = await move_to_pose(x=rx, y=ry, z=rz, qx=qx, qy=qy, qz=qz, qw=qw)
     if not descend["ok"]:
         return {"ok": False, "stage": "descend", **descend}
     grip = await grasp()
-    retract = await move_to_pose(x=x, y=y, z=z + approach_dz, qx=qx, qy=qy, qz=qz, qw=qw)
+    retract = await move_to_pose(x=rx, y=ry, z=rz + approach_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     return {"ok": bool(grip.get("ok")) and bool(retract.get("ok")), "grasp": grip, "retract_ok": retract["ok"]}
 
 
@@ -786,14 +920,31 @@ async def place_at(
     retract_home: bool = True,
 ) -> dict:
     """Composite place: hover above tray/drop -> lower -> release jaws -> retract -> return to resting pose."""
-    hover = await move_to_pose(x=x, y=y, z=z + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
+    rx, ry, rz, q_hover, q_grasp = await _resolve_grasp_pose(x, y, z, qx, qy, qz, qw, dz=retract_dz)
+    if q_hover is not None and q_grasp is not None:
+        bridge = await _get_bridge()
+        if not await move_joint(joints=q_hover, wait=True):
+            return {"ok": False, "stage": "hover", "error": "move_joint(hover) failed"}
+        if not await move_joint(joints=q_grasp, wait=True):
+            return {"ok": False, "stage": "lower", "error": "move_joint(lower) failed"}
+        if hasattr(bridge, "set_mock_ee_pose"):
+            bridge.set_mock_ee_pose(rx, ry, rz)
+        rel = await release()
+        retract_ok = await move_joint(joints=q_hover, wait=True)
+        if retract_ok and hasattr(bridge, "set_mock_ee_pose"):
+            bridge.set_mock_ee_pose(rx, ry, rz + retract_dz)
+        if retract_home and retract_ok:
+            await go_home()
+        return {"ok": bool(rel.get("released")) and bool(retract_ok), "release": rel, "retract_ok": retract_ok}
+
+    hover = await move_to_pose(x=rx, y=ry, z=rz + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     if not hover["ok"]:
         return {"ok": False, "stage": "hover", **hover}
-    lower = await move_to_pose(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
+    lower = await move_to_pose(x=rx, y=ry, z=rz, qx=qx, qy=qy, qz=qz, qw=qw)
     if not lower["ok"]:
         return {"ok": False, "stage": "lower", **lower}
     rel = await release()
-    retract = await move_to_pose(x=x, y=y, z=z + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
+    retract = await move_to_pose(x=rx, y=ry, z=rz + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     if retract_home and retract["ok"]:
         await go_home()
     return {"ok": bool(rel.get("released")) and bool(retract.get("ok")), "release": rel, "retract_ok": retract["ok"]}
