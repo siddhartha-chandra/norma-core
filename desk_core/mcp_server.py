@@ -1,11 +1,15 @@
 """DESK-CORE FastMCP Server — connects Claude Code and Codex to NormaCore Station.
 
 Exposes:
-  1. Bare-bone hardware primitives: observe, get_state, set_torque, move_joints, grasp, release, go_home, estop
+  1. Bare-bone hardware primitives: observe, get_state, set_torque, move_joints, grasp, release, go_home,
+     move_to_home, estop
   2. Core robotics primitives: move_joint, get_frame, solve_ik, get_joint_angles, get_metric_depth
   3. Calibration & scene tools: pixel_to_world, update_scene_obstacle, get_calib_status, reload_config
   4. Composite execution tools: move_to_pose, move_flange, pick_at, place_at, pick_pixel, execute_sequence
-  5. Prompt skills (@mcp.prompt): desk_operator_skill, pick_and_place_skill, cleanup_skill
+  5. Numbered wrist stereo workflow: detect_requested_object, aim_wrist, capture_wrist_stereo, estimate_wrist_depth,
+     measure_graspability, estimate_grasp_pose, plan_tolerant_grasp, retract_to_hover, move_to_drop,
+     master_pick_place
+  6. Prompt skills (@mcp.prompt): desk_operator_skill, pick_and_place_skill
 
 Every tool call is recorded under runs/<UTC timestamp>/ (calls.jsonl + frames/*.jpg)
 so sessions are replayable; set DESK_RUNLOG=0 to disable. See desk_core/runlog.py.
@@ -20,7 +24,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
@@ -39,6 +43,9 @@ from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
 from .vision_3d import localize_object_3d
 
+if TYPE_CHECKING:
+    from .main_control import MainControl
+
 if os.environ.get("DESK_NO_DOTENV") != "1":
     for _k, _v in dotenv_values(REPO_ROOT / ".env").items():
         if _v is not None and not os.environ.get(_k, "").strip():
@@ -47,6 +54,11 @@ if os.environ.get("DESK_NO_DOTENV") != "1":
 _bridge: StationBridge | None = None
 _connect_lock = asyncio.Lock()
 _flange_lock = asyncio.Lock()
+# Motion tools may call other motion tools in the same task. Independent calls share the lock.
+## added by Abhi
+_motion_owner: asyncio.Task | None = None
+_estop_lock = asyncio.Lock()
+_main_control: MainControl | None = None
 _connect_cooldown_until = 0.0
 
 _calib = CalibrationStore()
@@ -56,6 +68,7 @@ _robo_jev = RoboJevGatekeeper()
 _tts = SpeakerTTS()
 
 RUNS_DIR = Path(os.environ.get("DESK_RUNS_DIR") or (REPO_ROOT / "runs"))
+FIXED_POSITIONS_PATH = REPO_ROOT / "calib" / "fixed_positions.json"
 _logger: RunLogger | None = None
 _frame_seq = 0
 
@@ -82,6 +95,32 @@ def _traced(fn):
     return wrapper
 
 
+## added by Abhi
+def _motion_tool(fn):
+    """Serialize MCP motion operations while allowing nested calls in the same task."""
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        global _motion_owner
+        task = asyncio.current_task()
+        if _estop_lock.locked():
+            raise RuntimeError("Emergency stop is in progress.")
+        if _motion_owner is task and task is not None:
+            return await fn(*args, **kwargs)
+        if _flange_lock.locked():
+            if fn.__name__ == "move_flange":
+                return {"ok": False, "executed": False, "problems": ["another move_flange is still running"]}
+            raise RuntimeError("Another desk-core motion operation is running.")
+        async with _flange_lock:
+            _motion_owner = task
+            try:
+                return await fn(*args, **kwargs)
+            finally:
+                _motion_owner = None
+
+    return wrapper
+
+
 async def _get_bridge() -> StationBridge:
     """Lazy bridge singleton that retries failed cold connects."""
     global _bridge, _connect_cooldown_until
@@ -90,7 +129,8 @@ async def _get_bridge() -> StationBridge:
             return _bridge
         if time.monotonic() < _connect_cooldown_until:
             raise RuntimeError("desk-core: Station still unreachable, retry in a few seconds.")
-        bridge = create_bridge()
+        ## added by Abhi
+        bridge = create_bridge(follow_motor_rx=True)
         try:
             await bridge.connect()
         except Exception as exc:
@@ -120,6 +160,8 @@ mcp = FastMCP("desk-core")
 # =============================================================================
 
 
+### 1. Observe the robot and both cameras
+# Existing MCP tool
 @mcp.tool()
 @_traced
 async def observe(views: list[str] | None = None, denoise: bool = True) -> list:
@@ -157,6 +199,8 @@ async def observe(views: list[str] | None = None, denoise: bool = True) -> list:
     return out
 
 
+### 1. Read motor telemetry
+# Existing MCP tool
 @mcp.tool()
 @_traced
 async def get_state() -> dict:
@@ -185,6 +229,7 @@ async def get_state() -> dict:
 
 @mcp.tool()
 @_traced
+@_motion_tool
 async def set_torque(enable: bool) -> dict:
     """Safely enable or disable motor torque (writes Goal=Present + speed/accel caps first)."""
     bridge = await _get_bridge()
@@ -194,6 +239,7 @@ async def set_torque(enable: bool) -> dict:
 
 @mcp.tool()
 @_traced
+@_motion_tool
 async def move_joints(targets: dict[str, int], max_step: int = DEFAULT_MAX_STEP, wait: bool = True) -> dict:
     """Move joints to target raw encoder ticks (clamped to calibrated range & max_step per call)."""
     bridge = await _get_bridge()
@@ -203,8 +249,11 @@ async def move_joints(targets: dict[str, int], max_step: int = DEFAULT_MAX_STEP,
     return {"applied": applied, "settled": settled}
 
 
+### 7. Close and verify the grasp
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def grasp(close_ticks: int | None = None) -> dict:
     """Close gripper jaws and verify grasp via jaw encoder slack + motor current."""
     bridge = await _get_bridge()
@@ -215,26 +264,44 @@ async def grasp(close_ticks: int | None = None) -> dict:
     return await bridge.grasp_with_verify(close_ticks=close_ticks)
 
 
+### 7 and 8. Open the gripper before the pick and during placement
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def release() -> dict:
     """Open gripper jaws to calibrated open limit."""
     bridge = await _get_bridge()
     st = await bridge.get_state()
-    gripper = st.motors[-1]
-    target_open = gripper.range_max
-    if _calib.data.get("calibrated"):
-        grp = _calib.data.get("gripper") or {}
-        if "open_ticks" in grp:
-            target_open = int(grp["open_ticks"])
-    applied = await bridge.send_joint_targets({gripper.id: target_open}, max_step=1200)
-    await bridge.wait_settle(applied, timeout_s=2.0)
-    released_obj = bridge.release_mock_object() if hasattr(bridge, "release_mock_object") else None
-    return {"released": True, "released_object": released_obj, "gripper_id": gripper.id, "target": applied.get(gripper.id)}
+    ## added by Abhi
+    grp = _calib.data.get("gripper") or {}
+    gripper_id = int(grp.get("motor_id", _calib.num_arm_joints(len(st.motors)) + 1))
+    gripper = next((m for m in st.motors if m.id == gripper_id), None)
+    if gripper is None or gripper.error_status:
+        return {"ok": False, "released": False, "gripper_id": gripper_id, "reason": "Missing or faulted gripper"}
+    target_open = int(grp.get("open_ticks", gripper.range_max)) if _calib.data.get("calibrated") else gripper.range_max
+    result = {"ok": False, "released": False, "released_object": None, "gripper_id": gripper_id, "target": target_open}
+    deadline = time.monotonic() + 12.0
+    while time.monotonic() < deadline:
+        state = await bridge.get_state()
+        motor = next((m for m in state.motors if m.id == gripper_id), None)
+        if state.bus_serial != st.bus_serial or motor is None or motor.error_status:
+            return {**result, "reason": "Gripper telemetry changed while opening"}
+        if abs(motor.position - target_open) <= 25:
+            released = bridge.release_mock_object() if hasattr(bridge, "release_mock_object") else None
+            return {**result, "ok": True, "released": True, "released_object": released}
+        applied = await bridge.send_joint_targets({gripper_id: target_open}, max_step=DEFAULT_MAX_STEP)
+        step = applied.get(gripper_id)
+        if step is None or step == motor.position or not await bridge.wait_settle({gripper_id: step}, timeout_s=2.0):
+            return {**result, "reason": "Gripper did not settle at the commanded open step"}
+    return {**result, "reason": "Gripper did not reach the open target"}
 
 
+### 9. Return to the legacy midpoint home
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def go_home(look_at_table: bool = True) -> dict:
     """Move arm safely toward calibrated home / table-viewing pose (creep-stepped if far)."""
     bridge = await _get_bridge()
@@ -283,12 +350,72 @@ async def go_home(look_at_table: bool = True) -> dict:
     return {"home": targets, "applied": applied, "look_at_table": look_at_table, "settled": settled}
 
 
+### 9. Return to the calibrated saved home
+# Existing MCP tool
+@mcp.tool()
+@_traced
+@_motion_tool
+async def move_to_home(max_step: int = DEFAULT_MAX_STEP, timeout_s: float = 30.0) -> dict:
+    """Move the arm straight to the saved "home" joint ticks in calib/fixed_positions.json.
+
+    No IK and no trajectory planning: arm joints are stepped toward the stored ticks, at most ``max_step``
+    ticks per command, until every joint is within 40 ticks of home or ``timeout_s`` runs out. Joints move
+    independently, so the path between poses is not collision-checked. The gripper is left as it is.
+    """
+    home = json.loads(FIXED_POSITIONS_PATH.read_text())["home"]
+    bridge = await _get_bridge()
+    ## added by Abhi
+    if max_step <= 0 or not np.isfinite(timeout_s) or timeout_s <= 0:
+        return {"ok": False, "settled": False, "reason": "Home motion needs a positive step and timeout"}
+    max_step = min(max_step, DEFAULT_MAX_STEP)
+    start = await bridge.get_state()
+    motors = {m.id: m for m in start.motors}
+    requested = {int(k): int(v) for k, v in home["joint_ticks"].items()}
+    if not requested or not all(mid in motors and motors[mid].error_status == 0 for mid in requested):
+        return {"ok": False, "settled": False, "reason": "Missing or faulted home motor", "home_ticks": requested}
+    targets, clamped = {}, {}
+    for mid, ticks in requested.items():
+        m = motors[mid]
+        lo, hi = m.range_min, m.range_max
+        if hi <= lo:
+            return {"ok": False, "settled": False, "reason": f"Invalid range for home motor {mid}"}
+        targets[mid] = max(lo, min(hi, ticks))
+        if targets[mid] != ticks:
+            clamped[mid] = ticks
+    deadline = time.monotonic() + timeout_s
+    settled = False
+    final = start.positions()
+    while time.monotonic() < deadline:
+        state = await bridge.get_state()
+        final = state.positions()
+        healthy = {m.id for m in state.motors if m.error_status == 0}
+        if state.bus_serial != start.bus_serial or not targets.keys() <= healthy:
+            break
+        if all(abs(final[mid] - tgt) <= 40 for mid, tgt in targets.items()):
+            settled = True
+            break
+        applied = await bridge.send_joint_targets(targets, max_step=max_step)
+        if applied.keys() != targets.keys() or not await bridge.wait_settle(
+            applied, tol_ticks=40, timeout_s=min(3.0, max(0.1, deadline - time.monotonic()))
+        ):
+            break
+    return {"ok": settled, "settled": settled, "home_ticks": targets, "clamped_from": clamped,
+            "final_ticks": {mid: final.get(mid) for mid in targets}}
+
+
+### 1–9. Emergency stop on a hazard
+# Existing MCP tool
 @mcp.tool()
 @_traced
 async def estop() -> dict:
     """Emergency stop: freeze every motor immediately at its current encoder reading (or cut torque if stale)."""
-    bridge = await _get_bridge()
-    return await bridge.abort()
+    ## added by Abhi
+    async with _estop_lock:
+        owner = _motion_owner
+        if owner is not None and owner is not asyncio.current_task():
+            owner.cancel()
+        bridge = await _get_bridge()
+        return await bridge.abort()
 
 
 # =============================================================================
@@ -296,6 +423,8 @@ async def estop() -> dict:
 # =============================================================================
 
 
+### 6. Read the live IK seed
+# Existing MCP tool
 @mcp.tool()
 @_traced
 async def get_joint_angles(include_gripper: bool = False) -> list[float]:
@@ -314,8 +443,11 @@ MOVE_JOINT_MIN_DURATION_S = 1.0
 MOVE_JOINT_LAG_LIMIT_TICKS = 120
 
 
+### 7 and 8. Execute a validated joint solution
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def move_joint(
     joints: list[float] | None = None,
     j_1: float | None = None,
@@ -357,6 +489,8 @@ async def move_joint(
         return False
 
 
+### 2. Read a scene frame for target localization
+# Existing MCP tool
 @mcp.tool()
 @_traced
 async def get_frame(
@@ -398,6 +532,8 @@ async def get_frame(
     return [json.dumps(meta), Image(data=jpeg, format="jpeg")]
 
 
+### 6. Solve the flange pose with the configured IK backend
+# Existing MCP tool
 @mcp.tool()
 @_traced
 async def solve_ik(
@@ -408,14 +544,18 @@ async def solve_ik(
     qy: float = 0.0,
     qz: float = 0.0,
     qw: float = 1.0,
+    seed_joints_rad: list[float] | None = None,
 ) -> list[float]:
     """Solve IK for a metric target pose with an xyzw quaternion."""
     bridge = await _get_bridge()
     st = await bridge.get_state()
-    seed_joints_rad = _calib.ticks_to_rad(st.motors)
+    ## added by Abhi
+    if seed_joints_rad is None:
+        seed_joints_rad = _calib.ticks_to_rad(st.motors)
     n_arm = _calib.num_arm_joints(len(st.motors))
     valid_bounds = all(m.range_max > m.range_min and m.range_min <= m.position <= m.range_max for m in st.motors[:n_arm])
-    return _ik.solve_ik(
+    return await asyncio.to_thread(
+        _ik.solve_ik,
         x=float(x),
         y=float(y),
         z=float(z),
@@ -441,6 +581,8 @@ async def _live_arm_q(q_rad: list[float] | None, camera: str) -> list[float] | N
     return _calib.ticks_to_rad(st.motors)
 
 
+### 2. Read the existing single-frame depth approximation
+# Existing MCP tool
 @mcp.tool()
 @_traced
 async def get_metric_depth(x: float, y: float, camera: str = "top", q_rad: list[float] | None = None) -> float:
@@ -454,6 +596,8 @@ async def get_metric_depth(x: float, y: float, camera: str = "top", q_rad: list[
 # =============================================================================
 
 
+### 2. Project a scene pixel to the coarse targeting plane
+# Existing MCP tool
 @mcp.tool()
 @_traced
 async def pixel_to_world(
@@ -470,6 +614,8 @@ async def pixel_to_world(
     return {"x": wx, "y": wy, "z": wz, "cam_depth_z": depth_cam_z, "camera": camera}
 
 
+### 2. Find the requested object in a camera frame
+# Existing MCP tool
 @mcp.tool()
 @_traced
 async def localize_3d(
@@ -561,6 +707,7 @@ async def robo_jev_check(
 
 @mcp.tool()
 @_traced
+@_motion_tool
 async def robo_jev_guard(
     query: str = "keys",
     target_x: float | None = None,
@@ -593,8 +740,11 @@ async def speak_status(text: str) -> dict:
     return {"queued": queued, "tts": _tts.status()}
 
 
+### 1. Register an obstacle before planning movement
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def update_scene_obstacle(
     name: str,
     x: float,
@@ -616,6 +766,8 @@ async def update_scene_obstacle(
     return {"obstacles": sorted(_obstacles.keys())}
 
 
+### 1. Check active calibration and IK backend
+# Existing MCP tool
 @mcp.tool()
 @_traced
 async def get_calib_status() -> dict:
@@ -629,9 +781,13 @@ async def get_calib_status() -> dict:
 
 @mcp.tool()
 @_traced
+@_motion_tool
 async def reload_config() -> dict:
     """Hot-reload calib/rig_calib.json and the Pink IK module without restarting the MCP server."""
+    ## added by Abhi
+    global _main_control
     cal_status = _calib.reload()
+    _main_control = None  # Captured poses use the calibration active when their images were taken.
     _ik.reload()
     if _bridge is not None and hasattr(_bridge, "apply_hardware_config"):
         hw = _calib.hardware_config()
@@ -648,8 +804,11 @@ async def reload_config() -> dict:
 # =============================================================================
 
 
+### 7 and 8. Move to a flange pose through the configured IK backend
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def move_to_pose(
     x: float,
     y: float,
@@ -678,8 +837,11 @@ async def move_to_pose(
     return {"ok": ok, "pose": [x, y, z, qx, qy, qz, qw], "joints_rad": angles}
 
 
+### 3 and 4. Plan or execute a calibrated Cartesian flange move
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def move_flange(
     dx_cm: float = 0.0,
     dy_cm: float = 0.0,
@@ -718,25 +880,22 @@ async def move_flange(
                           min_duration_s=min_duration_s, lag_limit_ticks=lag_limit_ticks)
     if problems := limits.out_of_bounds():
         return {"ok": False, "executed": False, "problems": problems}
-    if _flange_lock.locked():
-        return {"ok": False, "executed": False, "problems": ["another move_flange is still running"]}
-    async with _flange_lock:
-        bridge = await _get_bridge()
-        st = await bridge.get_state()
-        rotation = Rotation.from_euler("xyz", [rx_deg, ry_deg, rz_deg], degrees=True)
-        plan = await asyncio.to_thread(plan_flange_move, _calib, st.motors,
-                                       np.array([dx_cm, dy_cm, dz_cm]) / 100.0, rotation, rot_frame, limits)
-        result = {"ok": plan["ok"], "executed": False, "problems": plan["problems"], "plan": plan["summary"]}
-        if not plan["ok"] or not execute:
-            return result
-        run = await stream_joint_path(bridge, _calib, plan["path"], plan["duration_s"], limits)
-        result.update({"ok": run["ok"], "executed": True, "run": run})
-        if run["ok"]:
-            if correct:
-                result["correction"] = await correct_final_pose(bridge, _calib, plan["path"], limits)
-            final_rad = _calib.ticks_to_rad((await bridge.get_state()).motors)
-            result["result"] = flange_error(_calib, plan["path"], final_rad)
+    bridge = await _get_bridge()
+    st = await bridge.get_state()
+    rotation = Rotation.from_euler("xyz", [rx_deg, ry_deg, rz_deg], degrees=True)
+    plan = await asyncio.to_thread(plan_flange_move, _calib, st.motors,
+                                   np.array([dx_cm, dy_cm, dz_cm]) / 100.0, rotation, rot_frame, limits)
+    result = {"ok": plan["ok"], "executed": False, "problems": plan["problems"], "plan": plan["summary"]}
+    if not plan["ok"] or not execute:
         return result
+    run = await stream_joint_path(bridge, _calib, plan["path"], plan["duration_s"], limits)
+    result.update({"ok": run["ok"], "executed": True, "run": run})
+    if run["ok"]:
+        if correct:
+            result["correction"] = await correct_final_pose(bridge, _calib, plan["path"], limits)
+        final_rad = _calib.ticks_to_rad((await bridge.get_state()).motors)
+        result["result"] = flange_error(_calib, plan["path"], final_rad)
+    return result
 
 
 @mcp.tool()
@@ -860,8 +1019,11 @@ async def _resolve_grasp_pose(
     return (x, y, z, None, None)
 
 
+### 7. Execute a grasp at an already validated pose
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def pick_at(
     x: float,
     y: float,
@@ -874,7 +1036,9 @@ async def pick_at(
 ) -> dict:
     """Composite pick: open jaws -> hover above -> descend -> grasp_with_verify -> retract cleanly."""
     rx, ry, rz, q_hover, q_grasp = await _resolve_grasp_pose(x, y, z, qx, qy, qz, qw, dz=approach_dz)
-    await release()
+    ## added by Abhi
+    if not (opened := await release()).get("released"):
+        return {"ok": False, "stage": "open", "release": opened}
     if q_hover is not None and q_grasp is not None:
         bridge = await _get_bridge()
         if not await move_joint(joints=q_hover, wait=True):
@@ -884,10 +1048,12 @@ async def pick_at(
         if hasattr(bridge, "set_mock_ee_pose"):
             bridge.set_mock_ee_pose(rx, ry, rz)
         grip = await grasp()
+        if not grip.get("ok"):
+            return {"ok": False, "stage": "close", "grasp": grip, "retract_ok": False}
         retract_ok = await move_joint(joints=q_hover, wait=True)
         if retract_ok and hasattr(bridge, "set_mock_ee_pose"):
             bridge.set_mock_ee_pose(rx, ry, rz + approach_dz)
-        return {"ok": bool(grip.get("ok")) and bool(retract_ok), "grasp": grip, "retract_ok": retract_ok}
+        return {"ok": bool(grip.get("holding")) and bool(retract_ok), "grasp": grip, "retract_ok": retract_ok}
 
     hover = await move_to_pose(x=rx, y=ry, z=rz + approach_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     if not hover["ok"]:
@@ -896,12 +1062,18 @@ async def pick_at(
     if not descend["ok"]:
         return {"ok": False, "stage": "descend", **descend}
     grip = await grasp()
+    ## added by Abhi
+    if not grip.get("ok"):
+        return {"ok": False, "stage": "close", "grasp": grip, "retract_ok": False}
     retract = await move_to_pose(x=rx, y=ry, z=rz + approach_dz, qx=qx, qy=qy, qz=qz, qw=qw)
-    return {"ok": bool(grip.get("ok")) and bool(retract.get("ok")), "grasp": grip, "retract_ok": retract["ok"]}
+    return {"ok": bool(grip.get("holding")) and bool(retract.get("ok")), "grasp": grip, "retract_ok": retract["ok"]}
 
 
+### 8. Place at an already validated release pose
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def place_at(
     x: float,
     y: float,
@@ -924,6 +1096,8 @@ async def place_at(
         if hasattr(bridge, "set_mock_ee_pose"):
             bridge.set_mock_ee_pose(rx, ry, rz)
         rel = await release()
+        if not rel.get("released"):
+            return {"ok": False, "stage": "release", "release": rel, "retract_ok": False}
         retract_ok = await move_joint(joints=q_hover, wait=True)
         if retract_ok and hasattr(bridge, "set_mock_ee_pose"):
             bridge.set_mock_ee_pose(rx, ry, rz + retract_dz)
@@ -938,14 +1112,20 @@ async def place_at(
     if not lower["ok"]:
         return {"ok": False, "stage": "lower", **lower}
     rel = await release()
+    ## added by Abhi
+    if not rel.get("released"):
+        return {"ok": False, "stage": "release", "release": rel, "retract_ok": False}
     retract = await move_to_pose(x=rx, y=ry, z=rz + retract_dz, qx=qx, qy=qy, qz=qz, qw=qw)
     if retract_home and retract["ok"]:
         await go_home()
     return {"ok": bool(rel.get("released")) and bool(retract.get("ok")), "release": rel, "retract_ok": retract["ok"]}
 
 
+### 7. Legacy single-frame pick shortcut
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def pick_pixel(
     x: float,
     y: float,
@@ -976,6 +1156,174 @@ def _resolve_refs(obj: Any, env: dict[str, Any]) -> Any:
     return obj
 
 
+## added by Abhi
+async def _get_main_control() -> MainControl:
+    """Use the existing bridge and calibration for all numbered workflow stages."""
+    from .main_control import MainControl
+
+    global _main_control
+    bridge = await _get_bridge()
+    if _main_control is None or _main_control.bridge is not bridge:
+        _main_control = MainControl(bridge, _calib, {
+            "observe": observe,
+            "localize_3d": localize_3d,
+            "update_scene_obstacle": update_scene_obstacle,
+            "solve_ik": solve_ik,
+            "grasp": grasp,
+            "release": release,
+            "estop": estop,
+        }, _obstacles)
+    return _main_control
+
+
+## added by Abhi
+def _target_coordinates(target: list[float] | dict[str, float]) -> list[float]:
+    """Use a localization result's world field or explicit XYZ in meters."""
+    return [target[key] for key in ("x", "y", "z")] if isinstance(target, dict) else target
+
+
+### 2. Detect the requested object in the scene camera
+## added by Abhi
+@mcp.tool()
+@_traced
+async def detect_requested_object(query: str, provider: str = "auto") -> dict:
+    """Detect a named object in the top view and return a coarse target in base_link for aim_wrist."""
+    controller = await _get_main_control()
+    await controller.observe()
+    return await controller.detect_requested_object(query, provider=provider)
+
+
+### 3. Aim the wrist camera at the localized object
+## added by Abhi
+@mcp.tool()
+@_traced
+@_motion_tool
+async def aim_wrist(target_base_m: list[float] | dict[str, float], execute: bool = False) -> dict:
+    """Plan a wrist viewing pose from XYZ or localize_3d's world field. Pass execute=True to move."""
+    controller = await _get_main_control()
+    await controller.observe()
+    return await controller.aim_wrist(_target_coordinates(target_base_m), execute=execute)
+
+
+### 4. Capture both settled wrist frames for temporal stereo
+## added by Abhi
+@mcp.tool()
+@_traced
+@_motion_tool
+async def capture_wrist_stereo(target_base_m: list[float] | dict[str, float], execute: bool = False) -> dict:
+    """Plan one sweep at the target. Pass execute=True to capture both views and receive a capture_id."""
+    controller = await _get_main_control()
+    await controller.observe()
+    return await controller.capture_wrist_stereo(_target_coordinates(target_base_m), execute=execute)
+
+
+### 4. Estimate metric depth from the captured wrist images
+## added by Abhi
+@mcp.tool()
+@_traced
+async def estimate_wrist_depth(capture_id: str, roi: list[int] | None = None, build_cloud: bool = False) -> dict:
+    """Triangulate a captured wrist sweep. ROI is [x, y, width, height] in image A. Dense output is optional."""
+    controller = await _get_main_control()
+    return await controller.estimate_wrist_depth(capture_id, roi=roi, build_cloud=build_cloud)
+
+
+### 5. Measure the object's footprint and check the jaw gap
+## added by Abhi
+@mcp.tool()
+@_traced
+async def measure_graspability(capture_id: str, jaw_opening_mm: float, clearance_mm: float = 2.0) -> dict:
+    """Check the captured object's footprint against the measured jaw opening in millimeters."""
+    controller = await _get_main_control()
+    return controller.measure_graspability(capture_id, jaw_opening_mm=jaw_opening_mm, clearance_mm=clearance_mm)
+
+
+### 6. Estimate the calibrated grasp pose for IK
+## added by Abhi
+@mcp.tool()
+@_traced
+async def estimate_grasp_pose(
+    capture_id: str,
+    tool: dict[str, Any] | None = None,
+    jaw_offset_deg: float = 90.0,
+    grasp_drop_m: float | None = None,
+) -> dict:
+    """Convert the estimated object surface into an IK target using measured grasp tool calibration."""
+    controller = await _get_main_control()
+    selected_tool = _calib.data.get("grasp_tool") if tool is None else tool
+    if not isinstance(selected_tool, dict):
+        return {"ok": False, "reason": "Provide measured tool calibration or configure grasp_tool in the active rig."}
+    return controller.estimate_grasp_pose(
+        capture_id, tool=selected_tool, jaw_offset_deg=jaw_offset_deg, grasp_drop_m=grasp_drop_m
+    )
+
+
+### 6. Plan a tolerant top-down grasp from the measured 3D pose and planar yaw
+@mcp.tool()
+@_traced
+async def plan_tolerant_grasp(capture_id: str, tool: dict[str, Any] | None = None) -> dict:
+    """Plan grasp and hover joints for a captured object after estimate_wrist_depth. Used by master_pick_place.
+
+    The wide jaws self-centre the object, so the jaw tips may sit off-centre along the closing axis and the jaw
+    heading may deviate within the slack the measured footprint allows. Returns ``q_hover`` and ``q_contact``
+    joint angles plus the flange ``ik_target``. Planning only, the arm does not move.
+    """
+    controller = await _get_main_control()
+    selected_tool = _calib.data.get("grasp_tool") if tool is None else tool
+    if not isinstance(selected_tool, dict):
+        return {"ok": False, "reason": "Provide measured tool calibration or configure grasp_tool in the active rig."}
+    return await controller.plan_tolerant_grasp(capture_id, tool=selected_tool)
+
+
+### 7. Retract the closed gripper to the planned pickup hover
+@mcp.tool()
+@_traced
+@_motion_tool
+async def retract_to_hover() -> dict:
+    """After closing the jaws on the object, move back to the hover from the last plan_tolerant_grasp.
+
+    Runs through the controller's checked joint path (table clearance for the jaw geometry) and then verifies
+    the gripper still holds. Call before move_to_drop.
+    """
+    controller = await _get_main_control()
+    return await controller.retract_to_hover()
+
+
+### 8. Move to the saved drop X with stored joint ticks
+@mcp.tool()
+@_traced
+@_motion_tool
+async def move_to_drop() -> dict:
+    """Move to the drop pose above the saved X using joint_ticks in calib/drop_location.json (no IK).
+
+    The joint path is checked against the table for the jaw geometry before streaming. The gripper is not
+    opened; call release() afterwards to drop the object.
+    """
+    controller = await _get_main_control()
+    return await controller.move_to_drop()
+
+
+### 10. Run the complete request-to-pick-and-place workflow
+## added by Abhi
+@mcp.tool()
+@_traced
+@_motion_tool
+async def master_pick_place(
+    query: str,
+    execute: bool = False,
+    tool: dict[str, Any] | None = None,
+    obstacles: list[dict[str, Any]] | None = None,
+    provider: str = "auto",
+    build_cloud: bool = False,
+    return_home: bool = True,
+) -> dict:
+    """Find an object, estimate its grasp from wrist stereo, and place at saved X. Dry run unless execute=True."""
+    controller = await _get_main_control()
+    return await controller.master_pick_place(
+        query, execute=execute, tool=tool, obstacles=obstacles, provider=provider, build_cloud=build_cloud,
+        return_home=return_home,
+    )
+
+
 _SEQ_TOOLS = {
     "observe": observe,
     "get_state": get_state,
@@ -998,17 +1346,32 @@ _SEQ_TOOLS = {
     "grasp": grasp,
     "release": release,
     "go_home": go_home,
+    "move_to_home": move_to_home,
     "estop": estop,
     "move_to_pose": move_to_pose,
     "move_flange": move_flange,
     "pick_at": pick_at,
     "place_at": place_at,
     "pick_pixel": pick_pixel,
+    ## added by Abhi
+    "detect_requested_object": detect_requested_object,
+    "aim_wrist": aim_wrist,
+    "capture_wrist_stereo": capture_wrist_stereo,
+    "estimate_wrist_depth": estimate_wrist_depth,
+    "measure_graspability": measure_graspability,
+    "estimate_grasp_pose": estimate_grasp_pose,
+    "plan_tolerant_grasp": plan_tolerant_grasp,
+    "retract_to_hover": retract_to_hover,
+    "move_to_drop": move_to_drop,
+    "master_pick_place": master_pick_place,
 }
 
 
+### 1–9. Pass values between MCP tools in an explicit sequence
+# Existing MCP tool
 @mcp.tool()
 @_traced
+@_motion_tool
 async def execute_sequence(steps: list[dict[str, Any]], stop_on_false: bool = True) -> dict:
     """Execute a composite multi-tool pipeline in one MCP call with $var bindings across steps.
 
@@ -1059,16 +1422,19 @@ def desk_operator_skill() -> str:
     )
 
 
+### 1–9. Direct Claude to the complete wrist stereo workflow
+# Existing MCP prompt
+## added by Abhi
 @mcp.prompt()
-def pick_and_place_skill(target_name: str, destination_name: str = "departure tray") -> str:
+def pick_and_place_skill(target_name: str, destination_name: str = "drop_x") -> str:
     """Guided camera-to-grasp workflow for picking a messy desk item and placing it cleanly."""
     return (
-        f"Execute Pick & Place for `{target_name}` -> `{destination_name}`:\n"
-        "1. Call `observe(views=['top', 'wrist'])` and locate pixel coordinates (x, y) of "
-        f"`{target_name}`, `{destination_name}`, and any mug obstacle.\n"
-        "2. Call `update_scene_obstacle` for any obstacle in the workspace.\n"
-        "3. Call `get_metric_depth(x, y)` and `pixel_to_world(x, y)` (or composite `pick_pixel(x, y)`).\n"
-        "4. Verify grasp outcome via `grasp` holding flag, then call `place_at(...)` and `go_home()`."
+        f"Plan the pick of `{target_name}` for the requested destination `{destination_name}`.\n"
+        "1. Call `observe(views=['top', 'wrist'])` and check follower telemetry.\n"
+        "2. Register visible tabletop obstacles with `update_scene_obstacle` before moving.\n"
+        f"3. Call `master_pick_place(query={target_name!r})` for a dry run. The master's destination is the saved X (`drop_x`).\n"
+        "4. For an authorized live pick to X with verified tool calibration, call the same tool with `execute=True`. "
+        "Use the returned status to report absence, uncertainty, an aborted stage, or successful placement."
     )
 
 
