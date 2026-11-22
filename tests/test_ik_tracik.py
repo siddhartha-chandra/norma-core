@@ -1,4 +1,5 @@
 """TRAC-IK solver: FK/IK round trips, joint-limit handling, diagnostics and Cartesian planning."""
+from concurrent.futures import ThreadPoolExecutor
 import math
 import os
 
@@ -57,6 +58,26 @@ def test_solution_respects_custom_limits(solver, q_front):
     sol = solver.solve(T[:3, 3], T[:3, :3], q_front, lower, upper)
     assert sol.ok, sol.reason
     assert np.all(sol.q >= lower - 1e-9) and np.all(sol.q <= upper + 1e-9)
+
+
+def test_concurrent_solves_keep_their_own_limits(solver, q_front):
+    tight = (q_front - 0.05, q_front + 0.05)
+    T_near, T_far = solver.fk(q_front + 0.02), solver.fk(q_front + 0.4)
+
+    def near(_):
+        return solver.solve(T_near[:3, 3], T_near[:3, :3], q_front, *tight)
+
+    def far(_):
+        return solver.solve(T_far[:3, 3], T_far[:3, :3], q_front)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        near_jobs = [pool.submit(near, i) for i in range(100)]
+        far_jobs = [pool.submit(far, i) for i in range(100)]
+        results = [job.result() for job in near_jobs]
+        [job.result() for job in far_jobs]
+    for sol in results:
+        assert sol.ok, sol.reason
+        assert np.all(sol.q >= tight[0] - 1e-9) and np.all(sol.q <= tight[1] + 1e-9)
 
 
 def test_blocked_by_limits_names_the_joint(solver, q_front):

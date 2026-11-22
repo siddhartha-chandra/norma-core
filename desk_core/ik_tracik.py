@@ -17,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import threading
 
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
@@ -82,6 +83,8 @@ class TracIKSolver:
             os.dup2(saved_stdout, 1)
             os.close(saved_stdout)
         self.urdf_limits = tuple(np.array(v, dtype=float) for v in self._ik.joint_limits)
+        # get_solver() shares one instance across threads, and every solve rewrites its joint limits.
+        self._lock = threading.Lock()
 
     @property
     def dof(self) -> int:
@@ -89,16 +92,18 @@ class TracIKSolver:
 
     def fk(self, q) -> np.ndarray:
         """Return the 4x4 base_link -> flange transform for joint angles q (radians)."""
-        position, rotation = self._ik.fk(np.asarray(q, dtype=float))
+        with self._lock:
+            position, rotation = self._ik.fk(np.asarray(q, dtype=float))
         T = np.eye(4)
         T[:3, :3] = np.asarray(rotation, dtype=float).reshape(3, 3)
         T[:3, 3] = np.ravel(position)
         return T
 
     def _raw_solve(self, position, rotation, seed, lower, upper):
-        self._ik.joint_limits = (lower, upper)
-        q = self._ik.ik(np.asarray(position, dtype=float), np.asarray(rotation, dtype=float),
-                        seed_jnt_values=np.asarray(seed, dtype=float))
+        with self._lock:
+            self._ik.joint_limits = (lower, upper)
+            q = self._ik.ik(np.asarray(position, dtype=float), np.asarray(rotation, dtype=float),
+                            seed_jnt_values=np.asarray(seed, dtype=float))
         if q is None or len(q) != self.dof or not np.all(np.isfinite(q)):
             return None
         return np.asarray(q, dtype=float)

@@ -45,6 +45,7 @@ if os.environ.get("DESK_NO_DOTENV") != "1":
 
 _bridge: StationBridge | None = None
 _connect_lock = asyncio.Lock()
+_flange_lock = asyncio.Lock()
 _connect_cooldown_until = 0.0
 
 _calib = CalibrationStore()
@@ -632,7 +633,7 @@ async def move_to_pose(
     bridge = await _get_bridge()
     try:
         angles = await solve_ik(x=x, y=y, z=z, qx=qx, qy=qy, qz=qz, qw=qw)
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         if not hasattr(bridge, "set_mock_ee_pose"):
             raise
         import math as _math
@@ -673,7 +674,8 @@ async def move_flange(
     Dry run by default: returns the plan. execute=True streams a minimum-jerk trajectory and holds
     position on tracking lag. Refuses plans that leave the motor ranges, flip configuration or come
     within floor_cm of the table. correct=True closes the loop at the end, offsetting joint targets until
-    gravity-loaded joints actually reach the planned pose.
+    gravity-loaded joints actually reach the planned pose. Pace settings are bounded (max 6 cm/s, 90 deg/s
+    joint speed, lag limit 120 ticks, min duration 1 s) and only one move_flange runs at a time.
     """
     from scipy.spatial.transform import Rotation
 
@@ -684,22 +686,27 @@ async def move_flange(
     limits = MotionLimits(speed_cm_s=speed_cm_s, rot_speed_deg_s=rot_speed_deg_s,
                           joint_speed_deg_s=joint_speed_deg_s, floor_cm=floor_cm,
                           min_duration_s=min_duration_s, lag_limit_ticks=lag_limit_ticks)
-    bridge = await _get_bridge()
-    st = await bridge.get_state()
-    rotation = Rotation.from_euler("xyz", [rx_deg, ry_deg, rz_deg], degrees=True)
-    plan = await asyncio.to_thread(plan_flange_move, _calib, st.motors, np.array([dx_cm, dy_cm, dz_cm]) / 100.0,
-                                   rotation, rot_frame, limits)
-    result = {"ok": plan["ok"], "executed": False, "problems": plan["problems"], "plan": plan["summary"]}
-    if not plan["ok"] or not execute:
+    if problems := limits.out_of_bounds():
+        return {"ok": False, "executed": False, "problems": problems}
+    if _flange_lock.locked():
+        return {"ok": False, "executed": False, "problems": ["another move_flange is still running"]}
+    async with _flange_lock:
+        bridge = await _get_bridge()
+        st = await bridge.get_state()
+        rotation = Rotation.from_euler("xyz", [rx_deg, ry_deg, rz_deg], degrees=True)
+        plan = await asyncio.to_thread(plan_flange_move, _calib, st.motors,
+                                       np.array([dx_cm, dy_cm, dz_cm]) / 100.0, rotation, rot_frame, limits)
+        result = {"ok": plan["ok"], "executed": False, "problems": plan["problems"], "plan": plan["summary"]}
+        if not plan["ok"] or not execute:
+            return result
+        run = await stream_joint_path(bridge, _calib, plan["path"], plan["duration_s"], limits)
+        result.update({"ok": run["ok"], "executed": True, "run": run})
+        if run["ok"]:
+            if correct:
+                result["correction"] = await correct_final_pose(bridge, _calib, plan["path"], limits)
+            final_rad = _calib.ticks_to_rad((await bridge.get_state()).motors)
+            result["result"] = flange_error(_calib, plan["path"], final_rad)
         return result
-    run = await stream_joint_path(bridge, _calib, plan["path"], plan["duration_s"], limits)
-    result.update({"ok": run["ok"], "executed": True, "run": run})
-    if run["ok"]:
-        if correct:
-            result["correction"] = await correct_final_pose(bridge, _calib, plan["path"], limits)
-        final_rad = _calib.ticks_to_rad((await bridge.get_state()).motors)
-        result["result"] = flange_error(_calib, plan["path"], final_rad)
-    return result
 
 
 @mcp.tool()

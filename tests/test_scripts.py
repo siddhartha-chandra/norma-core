@@ -1,4 +1,5 @@
 """Offline checks for the motion scripts: gravity fit, infinity tracing/plotting and the move_flange MCP client."""
+import asyncio
 import importlib.util
 import json
 import os
@@ -187,3 +188,20 @@ def test_move_flange_refusal_exit_code():
     proc = run_move_flange("--dy", "-60")
     assert proc.returncode == 1
     assert "REFUSED" in proc.stdout
+
+
+def test_move_flange_rejects_unbounded_pace_over_mcp():
+    proc = run_move_flange("--dz", "1", "--speed-cm-s", "30", "--lag-limit-ticks", "4000")
+    assert proc.returncode == 1
+    assert "speed_cm_s=30.0 outside" in proc.stdout and "lag_limit_ticks=4000 outside" in proc.stdout
+
+
+def test_move_flange_refuses_while_another_runs():
+    from desk_core import mcp_server
+
+    async def overlapping():
+        async with mcp_server._flange_lock:
+            return await mcp_server.move_flange(dz_cm=1.0)
+
+    result = asyncio.run(overlapping())
+    assert not result["ok"] and result["problems"] == ["another move_flange is still running"]

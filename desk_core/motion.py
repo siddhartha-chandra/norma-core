@@ -26,6 +26,15 @@ HEIGHT_CHECK_LINKS = ("ST3215_3_v1_1", "ST3215_5_v1_1", "ST3215_7_v1_1", TOOL_FR
 RANGE_MARGIN_TICKS = 50
 GRAVITY_FF_PATH = Path(__file__).resolve().parents[1] / "calib" / "gravity_ff.json"
 GRAVITY_FF_MAX_RAD = 0.15
+# Allowed ranges for agent-supplied settings; the pace ceilings are the fastest settings tested on the arm.
+AGENT_BOUNDS = {
+    "speed_cm_s": (0.1, 6.0),
+    "rot_speed_deg_s": (1.0, 45.0),
+    "joint_speed_deg_s": (1.0, 90.0),
+    "min_duration_s": (1.0, 60.0),
+    "floor_cm": (5.0, 40.0),
+    "lag_limit_ticks": (10, 120),
+}
 
 
 @dataclass
@@ -43,6 +52,11 @@ class MotionLimits:
     correct_iterations: int = 4
     correct_tol_mm: float = 2.0
     correct_max_offset_ticks: int = 120
+
+    def out_of_bounds(self) -> list[str]:
+        """Settings outside ``AGENT_BOUNDS``, as readable problems."""
+        return [f"{name}={getattr(self, name)} outside [{lo}, {hi}]" for name, (lo, hi) in AGENT_BOUNDS.items()
+                if not lo <= getattr(self, name) <= hi]
 
 
 def min_jerk(tau: float) -> float:
@@ -260,7 +274,9 @@ async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, pat
 
     The servos are proportional position loops, so joints carrying gravity load settle short of their targets.
     Each iteration adds the measured joint error to the commanded target (bounded offset, inside the motor
-    range) until the flange is within ``correct_tol_mm`` of the planned end pose.
+    range) until the flange is within ``correct_tol_mm`` of the planned end pose. If an iteration stops helping
+    while still off target (typically a torque-saturated joint), the targets fall back to the gravity
+    feed-forward command so the servos do not keep pushing against the extra offset.
 
     Parameters
     ----------
@@ -276,7 +292,8 @@ async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, pat
     Returns
     -------
     dict
-        ``iterations``, flange error after each iteration and the commanded offsets in ticks.
+        ``iterations``, flange error after each iteration, the commanded offsets in ticks and ``released``
+        (True when a stall reverted the targets to the feed-forward command).
     """
     limits = limits or MotionLimits()
     motors = (await bridge.get_state()).motors
@@ -287,12 +304,17 @@ async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, pat
     start = calib.rad_to_ticks(list(path[-1] + offset), motors)
     command = {m.id: start[m.id] for m in arm}
     history = []
+    released = False
     for iteration in range(limits.correct_iterations + 1):
         state = await bridge.get_state()
         err = flange_error(calib, path, calib.ticks_to_rad(state.motors))
         history.append(err["off_target_mm"])
-        stalled = len(history) > 1 and history[-2] - history[-1] < 0.3
-        if err["off_target_mm"] <= limits.correct_tol_mm or stalled or iteration == limits.correct_iterations:
+        if err["off_target_mm"] <= limits.correct_tol_mm or iteration == limits.correct_iterations:
+            break
+        if len(history) > 1 and history[-2] - history[-1] < 0.3:
+            command = {m.id: start[m.id] for m in arm}
+            await bridge.send_joint_targets(command, max_step=limits.max_step_ticks)
+            released = True
             break
         present = state.positions()
         for m in arm:
@@ -302,7 +324,7 @@ async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, pat
         await bridge.send_joint_targets(command, max_step=limits.max_step_ticks)
         await asyncio.sleep(0.5)
     return {"iterations": len(history) - 1, "off_target_mm": history,
-            "offset_ticks": [command[m.id] - goal[m.id] for m in arm]}
+            "offset_ticks": [command[m.id] - goal[m.id] for m in arm], "released": released}
 
 
 def flange_error(calib: CalibrationStore, path: np.ndarray, final_rad) -> dict:

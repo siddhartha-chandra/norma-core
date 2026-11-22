@@ -1,5 +1,6 @@
 """desk_core.motion: timing, feed-forward, planning rules, streaming, lag abort and end-pose correction."""
 import asyncio
+from dataclasses import replace
 import math
 
 import numpy as np
@@ -34,6 +35,20 @@ def test_min_jerk_profile():
     s = np.array([min_jerk(x) for x in tau])
     assert np.all(np.diff(s) >= 0)
     assert np.max(np.diff(s) / np.diff(tau)) == pytest.approx(1.875, rel=1e-3)
+
+
+def test_agent_bounds_accept_defaults_and_tested_fast_pace():
+    assert MotionLimits().out_of_bounds() == []
+    fast = MotionLimits(speed_cm_s=6.0, joint_speed_deg_s=90.0, min_duration_s=1.0, lag_limit_ticks=120)
+    assert fast.out_of_bounds() == []
+
+
+@pytest.mark.parametrize("field, value", [("speed_cm_s", 20.0), ("speed_cm_s", 0.0), ("joint_speed_deg_s", 500.0),
+                                          ("min_duration_s", 0.1), ("lag_limit_ticks", 4000), ("floor_cm", 0.0),
+                                          ("rot_speed_deg_s", math.nan)])
+def test_agent_bounds_reject_out_of_range(field, value):
+    problems = replace(MotionLimits(), **{field: value}).out_of_bounds()
+    assert len(problems) == 1 and problems[0].startswith(f"{field}=")
 
 
 def test_sample_interpolates_between_waypoints():
@@ -257,14 +272,29 @@ def test_correction_cancels_servo_sag(calib, no_ff, no_sleep):
     assert result["offset_ticks"][1:4] == [30, -25, -20]
 
 
-def test_correction_offset_is_bounded_and_stops_when_stalled(calib, no_ff, no_sleep):
+def test_correction_releases_offset_when_stalled(calib, no_ff, no_sleep):
+    bridge = SaggingBridge(sag={2: -400})
+    path = line_path(rad(calib, FRONT_POSE_TICKS), np.zeros(7), n=3)
+    goal = calib.rad_to_ticks(list(path[-1]), motors_at(FRONT_POSE_TICKS))
+    for _ in range(3):
+        asyncio.run(bridge.send_joint_targets(goal))
+    result = asyncio.run(correct_final_pose(bridge, calib, path, FAST))
+    assert result["released"]
+    assert result["iterations"] < FAST.correct_iterations
+    assert result["off_target_mm"][1] < result["off_target_mm"][0]
+    assert result["off_target_mm"][-1] > FAST.correct_tol_mm
+    assert result["offset_ticks"] == [0] * 7
+    assert bridge._motors[2].position == goal[2] - 400
+
+
+def test_correction_offset_is_bounded(calib, no_ff, no_sleep):
     bridge = SaggingBridge(sag={2: -400})
     path = line_path(rad(calib, FRONT_POSE_TICKS), np.zeros(7), n=3)
     asyncio.run(bridge.send_joint_targets(calib.rad_to_ticks(list(path[-1]), motors_at(FRONT_POSE_TICKS))))
-    result = asyncio.run(correct_final_pose(bridge, calib, path, FAST))
-    assert abs(result["offset_ticks"][1]) == FAST.correct_max_offset_ticks
-    assert result["iterations"] < FAST.correct_iterations
-    assert result["off_target_mm"][-1] > FAST.correct_tol_mm
+    limits = replace(FAST, correct_iterations=1)
+    result = asyncio.run(correct_final_pose(bridge, calib, path, limits))
+    assert not result["released"]
+    assert abs(result["offset_ticks"][1]) == limits.correct_max_offset_ticks
 
 
 def test_correction_skips_when_already_on_target(calib, mock_bridge, no_ff, no_sleep):
