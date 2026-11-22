@@ -36,7 +36,8 @@ from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
 from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, StationBridge, create_bridge
 from .tts import SpeakerTTS
-from .vision_3d import localize_object_3d, localize_object_3d_dual
+from .command_planner import plan_command as _plan_command
+from .vision_3d import localize_object_3d
 
 if os.environ.get("DESK_NO_DOTENV") != "1":
     for _k, _v in dotenv_values(REPO_ROOT / ".env").items():
@@ -486,26 +487,10 @@ async def localize_3d(
     provider: str = "auto",
     model: str | None = None,
 ) -> dict:
-    """Zero-shot 3D object localization via Gemini/Anthropic/OpenAI/Qwen/DeepSeek with automatic OpenCV fallback. Pass camera='both' to fuse top + gripper eye-in-hand ('wrist') views."""
-    bridge = await _get_bridge()
+    """Zero-shot 2D object localization (Gemini/Anthropic/OpenAI/Qwen/DeepSeek with OpenCV fallback) on one camera. The 3D point uses a placeholder depth: the table plane (z_table) unless z_m is given; epipolar 2D->3D is not wired yet."""
     if camera in ("both", "dual"):
-        top_jpeg, wrist_jpeg = await asyncio.gather(
-            bridge.get_frame("top", denoise=denoise),
-            bridge.get_frame("wrist", denoise=denoise),
-        )
-        q = await _live_arm_q(None, "wrist")
-        return await localize_object_3d_dual(
-            top_jpeg=top_jpeg,
-            wrist_jpeg=wrist_jpeg,
-            query=query,
-            calib=_calib,
-            q_rad=q,
-            z_m=z_m,
-            use_gemini=use_gemini,
-            timeout_s=float(timeout_s),
-            model=model,
-            provider=provider,
-        )
+        raise ValueError("camera='both' is disabled: dual-camera 3D localization is pending the epipolar step; use 'top' or 'wrist'.")
+    bridge = await _get_bridge()
     jpeg = await bridge.get_frame(camera, denoise=denoise)
     q = await _live_arm_q(None, camera)
     return await localize_object_3d(
@@ -520,6 +505,17 @@ async def localize_3d(
         model=model,
         provider=provider,
     )
+
+
+@mcp.tool()
+@_traced
+async def plan_command(command: str) -> dict:
+    """Route a natural-language command with Jev: returns an execute_sequence plan for pick/place/home templates, or a non-motion route. Dry run; never moves the arm."""
+
+    async def _localize(query: str) -> dict:
+        return await localize_3d(query=query, camera="top")
+
+    return await _plan_command(command, localize=_localize)
 
 
 @mcp.tool()

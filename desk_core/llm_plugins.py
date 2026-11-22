@@ -222,7 +222,7 @@ def _build_system_prompt(tools_summary: str) -> str:
         "- Do NOT output or narrate your thoughts, reasoning, coordinates, or step-by-step plan.\n"
         "- While `done` is false, set `reply` to \"\".\n"
         "- When `done` is true, set `reply` to ONE short, direct confirmation or answer (under 15 words, e.g. 'Moved the pen onto the mug.').\n"
-        "- To locate objects before picking/moving, prefer `localize_3d(query=..., camera='both')` so both top and wrist views triangulate 3D pose and mark the live overlays.\n"
+        "- To locate objects before picking/moving, call `localize_3d(query=..., camera='top')` to get the object's 2D box and marks the live overlays. Its 3D point is a placeholder on the table plane, so it is only approximate.\n"
         "- Call `pick_at(x, y, z)` and `place_at(x, y, z)` directly once coordinates are known (they handle reachable grasp orientation); do NOT loop on `solve_ik` guessing quaternions.\n"
         "- Never report success if a motion tool failed or was blocked; report the failure briefly.\n"
         "- Batch tool calls in one step when safe (e.g., `pick_at` + `place_at` when target coordinates are known) "

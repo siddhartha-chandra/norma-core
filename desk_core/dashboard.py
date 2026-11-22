@@ -14,7 +14,6 @@ Run:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import time
@@ -25,7 +24,7 @@ from typing import Any
 import cv2
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -38,7 +37,6 @@ from .vision_3d import (
     _get_api_key,
     _load_keystore,
     localize_object_3d,
-    localize_object_3d_dual,
 )
 
 app = FastAPI(title="DESK-CORE Mission Control")
@@ -180,40 +178,24 @@ async def api_estop() -> dict[str, Any]:
 @app.post("/api/localize")
 async def api_localize(req: LocalizeReq) -> dict[str, Any]:
     global _last_detection
-    bridge = await srv._get_bridge()
     if req.camera in ("both", "dual"):
-        top_jpeg, wrist_jpeg = await asyncio.gather(
-            bridge.get_frame("top", denoise=True),
-            bridge.get_frame("wrist", denoise=True),
-        )
-        q = await srv._live_arm_q(None, "wrist")
-        det = await localize_object_3d_dual(
-            top_jpeg=top_jpeg,
-            wrist_jpeg=wrist_jpeg,
-            query=req.query,
-            calib=srv._calib,
-            q_rad=q,
-            use_gemini=req.use_gemini,
-            model=req.model,
-            provider=req.provider,
-        )
-    else:
-        jpeg = await bridge.get_frame(req.camera, denoise=True)
-        q = await srv._live_arm_q(None, req.camera)
-        det = await localize_object_3d(
-            jpeg_bytes=jpeg,
-            query=req.query,
-            calib=srv._calib,
-            camera=req.camera,
-            q_rad=q,
-            use_gemini=req.use_gemini,
-            model=req.model,
-            provider=req.provider,
-        )
+        raise HTTPException(status_code=400, detail="camera='both' is disabled: dual-camera localization is pending the epipolar step")
+    bridge = await srv._get_bridge()
+    jpeg = await bridge.get_frame(req.camera, denoise=True)
+    q = await srv._live_arm_q(None, req.camera)
+    det = await localize_object_3d(
+        jpeg_bytes=jpeg,
+        query=req.query,
+        calib=srv._calib,
+        camera=req.camera,
+        q_rad=q,
+        use_gemini=req.use_gemini,
+        model=req.model,
+        provider=req.provider,
+    )
     _last_detection = det
     fb = f" ({det['fallback_reason']})" if det.get("fallback_reason") else ""
-    mode = f" [{det['fusion_mode']}]" if det.get("fusion_mode") else ""
-    _log_event("LOCALIZE", f"{req.query} via {det['backend']}{mode}{fb} -> {det['world']}", ok=det["found"])
+    _log_event("LOCALIZE", f"{req.query} via {det['backend']}{fb} -> {det['world']}", ok=det["found"])
     return det
 
 

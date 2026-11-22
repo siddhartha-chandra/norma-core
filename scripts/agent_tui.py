@@ -611,8 +611,8 @@ class RobotAgentTUI(App):
         Binding("ctrl+p", "open_placement", "Placement"),
         Binding("ctrl+k", "open_keys", "API Keys"),
         Binding("ctrl+v", "voice_command", "Voice"),
-        Binding("ctrl+e", "trigger_estop", "E-STOP"),
-        Binding("f12", "trigger_estop", "E-STOP"),
+        Binding("ctrl+e", "trigger_estop", "E-STOP", priority=True),
+        Binding("f12", "trigger_estop", "E-STOP", priority=True),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -716,7 +716,7 @@ class RobotAgentTUI(App):
             "[bold]=== DESK-CORE Voice & Vision Agent Guide (F1 to toggle) ===[/bold]\n"
             f"{mode_hint}\n"
             "[b]Controls:[/b] Type + [b]Enter[/b] | [b]Ctrl+V[/b] Voice (4s) | [b]Ctrl+K[/b] API Keys | [b]Show Camera Views[/b] | [b]Ctrl+E / F12[/b] E-STOP\n"
-            "[b]Try:[/b] [i]\"What objects do you see from both cameras?\"[/i] | [i]\"Show 3D positions of all objects\"[/i] | [i]\"Move red_cube closer to mug\"[/i]"
+            "[b]Try:[/b] [i]\"What objects do you see from the top camera?\"[/i] | [i]\"Show 3D positions of all objects\"[/i] | [i]\"Move red_cube closer to mug\"[/i]"
         )
 
     async def on_mount(self) -> None:
@@ -1026,6 +1026,8 @@ class RobotAgentTUI(App):
         if self.session is None:
             return
         await self.session.call_tool("mock_reset_scene", {})
+        if hasattr(self, "_overlay_markers"):
+            self._overlay_markers.clear()
         log.write("[cyan]Reset synthetic 3D scene to defaults.[/cyan]")
         await self._refresh_camera_views()
 
@@ -1161,12 +1163,33 @@ class RobotAgentTUI(App):
             return
         self.run_worker(self._execute_command(cmd), group="agent", exclusive=False, name="agent")
 
+    async def _run_plan(self, plan: dict[str, Any]) -> None:
+        log = self.query_one("#chat-log", RichLog)
+        log.write(f"[cyan]Jev plan: {plan['template']} {json.dumps(plan['slots'])}[/cyan]")
+        res = await self._call_mcp_tool("execute_sequence", {"steps": plan["steps"]})
+        if isinstance(res, dict) and res.get("ok") is True:
+            log.write("[bold green]Done.[/bold green]")
+            reply = "Done."
+        else:
+            log.write(f"[bold red]Plan failed:[/bold red] {res}")
+            reply = "The plan failed."
+        mode = str(self.query_one("#output-mode", Select).value or "audio_text")
+        if mode in ("audio_text", "audio_only"):
+            voice = str(self.query_one("#voice-select", Select).value or "female")
+            await asyncio.to_thread(speak_text_sync, reply, voice)
+
     async def _execute_command(self, cmd: str) -> None:
         log = self.query_one("#chat-log", RichLog)
         log.write(f"\n[b]You:[/b] {cmd}")
         self._active_cmd = cmd
         if hasattr(self, "_overlay_markers"):
             self._overlay_markers.clear()
+        plan = await self._call_mcp_tool("plan_command", {"command": cmd})
+        if isinstance(plan, dict) and plan.get("route") == "motion":
+            await self._run_plan(plan)
+            return
+        if isinstance(plan, dict) and plan.get("route") in ("unsupported", "not_found", "unavailable"):
+            log.write(f"[dim]Jev: {plan.get('reason')}. Using the LLM agent.[/dim]")
         val = str(self.query_one("#model-select", Select).value or "gemini:gemini-4-hydrogen")
         provider, _, model_id = val.partition(":")
         try:
