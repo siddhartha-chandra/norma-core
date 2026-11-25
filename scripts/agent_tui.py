@@ -68,17 +68,21 @@ MOTION_TOOLS = {
     "go_home",
     "move_to_home",
     "move_to_pose",
-    "move_flange",
     "pick_at",
     "place_at",
     "pick_pixel",
-    "aim_wrist",
-    "capture_wrist_stereo",
     "retract_to_hover",
     "move_to_drop",
-    "master_pick_place",
     "robo_jev_guard",
     "execute_sequence",
+}
+
+# Tools that only move the arm when called with execute=True (dry-run planning is read-only)
+EXECUTE_GATED_TOOLS = {
+    "move_flange",
+    "aim_wrist",
+    "capture_wrist_stereo",
+    "master_pick_place",
 }
 
 
@@ -1119,7 +1123,8 @@ class RobotAgentTUI(App):
         if self.session is None:
             return {"error": "MCP not connected"}
         armed = self.query_one("#arm-motion", Checkbox).value
-        if name in MOTION_TOOLS and not armed:
+        needs_arm = name in MOTION_TOOLS or (name in EXECUTE_GATED_TOOLS and bool(args.get("execute")))
+        if needs_arm and not armed:
             msg = f"Blocked `{name}`: check Arm Motion first."
             log.write(f"[yellow]{msg}[/yellow]")
             return {"ok": False, "error": msg}
