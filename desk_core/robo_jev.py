@@ -349,7 +349,8 @@ async def guarded_recover(
     if report["ok"]:
         return {"ok": True, "action": "proceed", "target_xy": list(target_xy) if target_xy else None, "report": report}
 
-    # Immediate safe pause
+    # Immediate safe pause; remember if a manual E-STOP was already latched
+    was_aborted = bool(getattr(bridge, "_aborted", False))
     await bridge.abort()
 
     # Case 1: Transient obstacle in path -> pause and poll until obstacle moves out
@@ -366,7 +367,7 @@ async def guarded_recover(
                 camera=camera,
             )
             if rep_retry["ok"]:
-                if hasattr(bridge, "rearm"):
+                if not was_aborted and hasattr(bridge, "rearm"):
                     bridge.rearm()
                 return {
                     "ok": True,
@@ -412,7 +413,7 @@ async def guarded_recover(
             }
 
         gatekeeper.arm_watch(jpeg_bytes=jpeg, pixel=new_px, query=query, depth_m=depth_m)
-        if hasattr(bridge, "rearm"):
+        if not was_aborted and hasattr(bridge, "rearm"):
             bridge.rearm()
         return {
             "ok": True,
