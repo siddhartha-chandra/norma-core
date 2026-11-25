@@ -349,13 +349,15 @@ async def guarded_recover(
         camera=camera,
     )
 
+    def _can_rearm() -> bool:
+        return getattr(bridge, "_abort_source", "manual") != "manual" and hasattr(bridge, "rearm")
+
     if report["ok"]:
-        if getattr(bridge, "_aborted", False) and getattr(bridge, "_abort_source", "manual") != "manual" and hasattr(bridge, "rearm"):
+        if getattr(bridge, "_aborted", False) and _can_rearm() and (target_xy is not None or not _get_obs()):
             bridge.rearm()
         return {"ok": True, "action": "proceed", "target_xy": list(target_xy) if target_xy else None, "report": report}
 
-    # Immediate safe pause; preserve any pre-existing manual E-STOP latch
-    manual_estop = bool(getattr(bridge, "_aborted", False)) and getattr(bridge, "_abort_source", "manual") == "manual"
+    # Immediate safe pause; preserve any pre-existing or mid-recovery manual E-STOP latch
     try:
         await bridge.abort(source="reflex")
     except TypeError:
@@ -375,7 +377,7 @@ async def guarded_recover(
                 camera=camera,
             )
             if rep_retry["ok"]:
-                if not manual_estop and hasattr(bridge, "rearm"):
+                if _can_rearm():
                     bridge.rearm()
                 return {
                     "ok": True,
@@ -421,7 +423,7 @@ async def guarded_recover(
             }
 
         gatekeeper.arm_watch(jpeg_bytes=jpeg, pixel=new_px, query=query, depth_m=depth_m)
-        if not manual_estop and hasattr(bridge, "rearm"):
+        if _can_rearm():
             bridge.rearm()
         return {
             "ok": True,
