@@ -1188,10 +1188,28 @@ class RobotAgentTUI(App):
             self._chat_history.append(("assistant", msg))
             return
         obs = await self._call_mcp_tool("observe", {})
-        if isinstance(obs, dict) and obs.get("ok") is False:
-            reply = str(obs.get("error") or "Preflight observe failed.")
-            log.write(f"[red]Agent:[/red] {reply}")
-            self._chat_history.append(("assistant", reply))
+        preflight_err: str | None = None
+        if isinstance(obs, dict):
+            if obs.get("ok") is False or obs.get("error"):
+                preflight_err = str(obs.get("error") or "Preflight observe failed.")
+        elif isinstance(obs, str):
+            if "[camera " in obs and "unavailable:" in obs:
+                preflight_err = f"Preflight observe failed: camera unavailable ({obs.splitlines()[-1]})"
+            else:
+                try:
+                    summary = json.loads(obs)
+                except Exception:
+                    preflight_err = f"Preflight observe failed: {obs[:180]}"
+                else:
+                    link = summary.get("link") if isinstance(summary, dict) else None
+                    if isinstance(link, dict):
+                        if link.get("socket_up") is False or link.get("resyncing") is True:
+                            preflight_err = f"Preflight observe failed: station link not ready ({link})"
+                        elif link.get("rx_age_ms") is not None and float(link["rx_age_ms"]) > 5000.0:
+                            preflight_err = f"Preflight observe failed: stale telemetry ({link['rx_age_ms']} ms)"
+        if preflight_err:
+            log.write(f"[red]Agent:[/red] {preflight_err}")
+            self._chat_history.append(("assistant", preflight_err))
             return
         res = await self._call_mcp_tool("execute_sequence", {"steps": plan["steps"]})
         if isinstance(res, dict) and res.get("ok") is True:
