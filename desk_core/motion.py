@@ -295,7 +295,11 @@ async def move_joints_smooth(bridge: StationBridge, calib: CalibrationStore, q_g
     duration = max(limits.min_duration_s, 1.875 * travel / math.radians(limits.joint_speed_deg_s))
     run = await stream_joint_path(bridge, calib, path, duration, limits)
     if run["ok"]:
-        await correct_final_pose(bridge, calib, path, limits)
+        corr = await correct_final_pose(bridge, calib, path, limits)
+        run["correction"] = corr
+        if corr["off_target_mm"] and corr["off_target_mm"][-1] > limits.correct_tol_mm:
+            run["ok"] = False
+            run["reason"] = f"final flange error {corr['off_target_mm'][-1]} mm exceeds {limits.correct_tol_mm} mm"
     return run
 
 
