@@ -457,10 +457,17 @@ class MainControl:
 
     ### 7. Pick, then lift and recheck the gripper.
     async def _require_held(self):
-        gripper = (await self._motor_state()).motors[-1]
+        state = await self._motor_state()
+        gripper = state.motors[-1]
         close = int(self.calib.data["gripper"]["close_ticks"])
-        if 0 <= gripper.range_min < gripper.range_max and (gripper.range_min, gripper.range_max) != (0, 4095):
-            close = max(gripper.range_min, min(gripper.range_max, close))
+        if hasattr(self.bridge, "_effective_motor_range"):
+            lo, hi = self.bridge._effective_motor_range(state.bus_serial, gripper)
+        elif 0 <= gripper.range_min < gripper.range_max and (gripper.range_min, gripper.range_max) != (0, 4095):
+            lo, hi = gripper.range_min, gripper.range_max
+        else:
+            lo, hi = 0, 4095
+        if 0 <= lo < hi and (lo, hi) != (0, 4095):
+            close = max(lo, min(hi, close))
         if gripper.position - close <= GRIPPER_SLACK_STEPS:
             raise ValueError("Object is no longer held.")
 
