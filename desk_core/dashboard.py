@@ -57,7 +57,7 @@ def _log_event(kind: str, detail: str, ok: bool = True) -> None:
 
 class LocalizeReq(BaseModel):
     query: str = "keys"
-    camera: str = "both"
+    camera: str = "top"
     use_gemini: bool = True
     provider: str = "auto"
     model: str | None = None
@@ -615,9 +615,9 @@ DASHBOARD_HTML = """<!doctype html>
       <div class="row">
         <input id="loc-query" type="text" value="keys" placeholder="Object query (keys, mug, marker...)" />
         <select id="loc-camera" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;">
-          <option value="both">Both Views (Top + Gripper)</option>
-          <option value="top">Top View</option>
+          <option value="top" selected>Top View</option>
           <option value="wrist">Gripper View (wrist)</option>
+          <option value="both" disabled>Both Views (Top + Gripper — disabled)</option>
         </select>
         <select id="loc-provider" onchange="syncVisionModels()" style="background:#0b1220;color:var(--text);border:1px solid #334155;border-radius:6px;padding:7px 8px;font-size:13px;">
           <option value="auto">Auto (Env/Keystore)</option>
