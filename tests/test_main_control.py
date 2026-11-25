@@ -75,7 +75,7 @@ def test_full_workflow_passes_capture_and_ik_results_to_motion(workflow):
     moves = [call.args[0] for call in workflow._move_checked.await_args_list]
     assert moves[1] == [0.01] * 7 and moves[2] == [0.0] * 7
     assert np.allclose(moves[3], asyncio.run(workflow._drop_goal()))
-    assert workflow.tools["release"].await_count == 2
+    assert workflow.tools["release"].await_count == 3
     workflow._home_gripper.assert_awaited_once_with(1256)
 
 
@@ -84,8 +84,14 @@ def test_grasp_without_contact_stops_before_place(workflow):
     result = asyncio.run(workflow.master_pick_place("keys", execute=True, tool=TOOL))
     assert not result["ok"] and result["failed_step"] == "pick", result
     workflow.tools["estop"].assert_awaited_once()
-    workflow.tools["release"].assert_awaited_once()
+    assert workflow.tools["release"].await_count == 2
     workflow._home_gripper.assert_not_awaited()
+
+
+def test_dry_run_does_not_open_gripper(workflow):
+    result = asyncio.run(workflow.master_pick_place("keys", execute=False, tool=TOOL))
+    assert result["ok"] and not result["executed"], result
+    workflow.tools["release"].assert_not_awaited()
 
 
 def test_lift_allows_initial_object_support_and_requires_final_clearance(monkeypatch):

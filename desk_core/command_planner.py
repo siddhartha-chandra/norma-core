@@ -108,6 +108,8 @@ async def plan_command(command: str, localize: Localize, timeout_s: float = 8.0)
         found = await localize(name)
         if not found.get("found"):
             return {"route": "not_found", "reason": f"could not locate {name!r}"}
+        if found.get("backend") == "opencv-fallback":
+            return {"route": "not_found", "reason": f"could not semantically confirm {name!r} (opencv-fallback)"}
         grounded[role] = _point(found)
 
     return {

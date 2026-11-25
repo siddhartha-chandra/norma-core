@@ -1182,6 +1182,17 @@ class RobotAgentTUI(App):
     async def _run_plan(self, plan: dict[str, Any]) -> None:
         log = self.query_one("#chat-log", RichLog)
         log.write(f"[cyan]Jev plan: {plan['template']} {json.dumps(plan['slots'])}[/cyan]")
+        if not self.query_one("#arm-motion", Checkbox).value:
+            msg = "Blocked `execute_sequence`: check Arm Motion first."
+            log.write(f"[yellow]{msg}[/yellow]")
+            self._chat_history.append(("assistant", msg))
+            return
+        obs = await self._call_mcp_tool("observe", {})
+        if isinstance(obs, dict) and obs.get("ok") is False:
+            reply = str(obs.get("error") or "Preflight observe failed.")
+            log.write(f"[red]Agent:[/red] {reply}")
+            self._chat_history.append(("assistant", reply))
+            return
         res = await self._call_mcp_tool("execute_sequence", {"steps": plan["steps"]})
         if isinstance(res, dict) and res.get("ok") is True:
             log.write("[bold green]Done.[/bold green]")

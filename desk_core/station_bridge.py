@@ -173,7 +173,7 @@ class StationBridge(Protocol):
     async def set_torque(self, enable: bool, motor_ids: list[int] | None = None) -> bool: ...
     async def wait_settle(self, targets: dict[int, int], tol_ticks: int = 25, timeout_s: float = 3.0) -> bool: ...
     async def grasp_with_verify(self, close_ticks: int | None = None, open_ticks: int | None = None) -> dict: ...
-    async def abort(self) -> dict: ...
+    async def abort(self, source: str = "manual") -> dict: ...
     def rearm(self) -> None: ...
 
 
@@ -186,6 +186,7 @@ class MockStationBridge:
         self.num_joints = num_joints
         self._torque_on = True
         self._aborted = False
+        self._abort_source: str | None = None
         self._frame_overrides: dict[str, bytes] = {}
         self._motors: dict[int, MotorState] = {
             mid: MotorState(
@@ -477,12 +478,15 @@ class MockStationBridge:
             "current_ma": 180,
         }
 
-    async def abort(self) -> dict:
+    async def abort(self, source: str = "manual") -> dict:
+        if not self._aborted or source == "manual":
+            self._abort_source = source
         self._aborted = True
-        return {"aborted": True, "positions": {k: v.position for k, v in self._motors.items()}}
+        return {"aborted": True, "source": self._abort_source, "positions": {k: v.position for k, v in self._motors.items()}}
 
     def rearm(self) -> None:
         self._aborted = False
+        self._abort_source = None
 
     def link_status(self) -> dict:
         return {"bridge": "mock", "station": None, "socket_up": True, "resyncing": False, "rx_age_ms": None}
@@ -527,6 +531,7 @@ class LiveStationBridge:
         self._bus_voltage: dict[str, float] = {}
         self._torque_started: set[int] = set()
         self._aborted = False
+        self._abort_source: str | None = None
         self._follow_motor_rx = follow_motor_rx
         self._station_ranges: dict[str, dict[int, tuple[int, int]]] = {}
         self._ranges_polled_mono: float | None = None
@@ -1200,7 +1205,12 @@ class LiveStationBridge:
         return motor, stamp
 
     ### 7. Close and verify the grasp
-    async def grasp_with_verify(self, close_ticks: int | None = None, open_ticks: int | None = None) -> dict:
+    async def grasp_with_verify(
+        self,
+        close_ticks: int | None = None,
+        open_ticks: int | None = None,
+        clamp_to_range: bool = False,
+    ) -> dict:
         result = {"ok": False, "holding": False}
         try:
             state = await self.get_state()
@@ -1210,6 +1220,9 @@ class LiveStationBridge:
             lo, hi = self._effective_motor_range(bus, motor)
             target = lo if close_ticks is None else int(close_ticks)
             open_target = hi if open_ticks is None else int(open_ticks)
+            if clamp_to_range:
+                target = max(lo, min(hi, target))
+                open_target = max(lo, min(hi, open_target))
             if not lo <= target <= hi or not lo <= open_target <= hi or open_target == target:
                 raise ValueError("Gripper targets must be distinct and inside the calibrated range")
             direction = 1 if target > open_target else -1
@@ -1256,8 +1269,10 @@ class LiveStationBridge:
         except (RuntimeError, ValueError, IndexError) as exc:
             return {**result, "reason": str(exc)}
 
-    async def abort(self) -> dict:
+    async def abort(self, source: str = "manual") -> dict:
         # Latch first so in-flight motion loops cannot send another target while the hold is applied.
+        if not self._aborted or source == "manual":
+            self._abort_source = source
         self._aborted = True
         # Hold Position uses live PresentPosition when fresh (prevents jumping
         # by unseen drift); if telemetry is stale, drop torque safely instead
@@ -1276,10 +1291,11 @@ class LiveStationBridge:
         hold = {m.id: m.position.to_bytes(2, "little") for m in st.motors}
         cmd = self._sync_write(st.bus_serial, RAM_GOAL_POSITION, hold)
         await self._send_commands(self.client, [cmd])
-        return {"aborted": True, "mode": "hold", "positions": st.positions()}
+        return {"aborted": True, "mode": "hold", "source": self._abort_source, "positions": st.positions()}
 
     def rearm(self) -> None:
         self._aborted = False
+        self._abort_source = None
 
 
 def _load_hardware_fallback() -> dict[str, str]:

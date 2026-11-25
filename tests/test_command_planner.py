@@ -127,3 +127,16 @@ def test_missing_key_reports_unavailable(monkeypatch):
 
     assert plan["route"] == "unavailable"
     assert loc.calls == []
+
+
+def test_opencv_fallback_detection_is_rejected(monkeypatch):
+    async def loc(name: str):
+        return {
+            "found": True,
+            "backend": "opencv-fallback",
+            "world": {"x": 0.3, "y": 0.1, "z": 0.05},
+        }
+
+    plan = _run("place keys next to the red box", _answers(0.95, "place_next_to"), loc, monkeypatch)
+    assert plan["route"] == "not_found"
+    assert "opencv-fallback" in plan["reason"]

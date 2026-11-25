@@ -459,6 +459,8 @@ class MainControl:
     async def _require_held(self):
         gripper = (await self._motor_state()).motors[-1]
         close = int(self.calib.data["gripper"]["close_ticks"])
+        if 0 <= gripper.range_min < gripper.range_max and (gripper.range_min, gripper.range_max) != (0, 4095):
+            close = max(gripper.range_min, min(gripper.range_max, close))
         if gripper.position - close <= GRIPPER_SLACK_STEPS:
             raise ValueError("Object is no longer held.")
 
@@ -566,6 +568,11 @@ class MainControl:
             if not execute:
                 return {"ok": True, "executed": False, "found": True, "detection": detection,
                         "aim": aim, "trace": trace, "next_step": "capture_wrist_stereo"}
+            stage = "open_gripper"
+            opened = _require(await self.tools["release"]())
+            if opened.get("released") is False:
+                raise ValueError("Gripper did not open before wrist stereo.")
+            complete(stage)
             stage = "capture_wrist_stereo"
             capture = _require(await self.capture_wrist_stereo(target, execute=True))
             capture_id = capture["capture_id"]

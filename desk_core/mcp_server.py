@@ -257,11 +257,16 @@ async def move_joints(targets: dict[str, int], max_step: int = DEFAULT_MAX_STEP,
 async def grasp(close_ticks: int | None = None) -> dict:
     """Close gripper jaws and verify grasp via jaw encoder slack + motor current."""
     bridge = await _get_bridge()
+    from_default = False
     if close_ticks is None and _calib.data.get("calibrated"):
         grp = _calib.data.get("gripper") or {}
         if "close_ticks" in grp:
             close_ticks = int(grp["close_ticks"])
-    return await bridge.grasp_with_verify(close_ticks=close_ticks)
+            from_default = True
+    try:
+        return await bridge.grasp_with_verify(close_ticks=close_ticks, clamp_to_range=from_default)
+    except TypeError:
+        return await bridge.grasp_with_verify(close_ticks=close_ticks)
 
 
 ### 7 and 8. Open the gripper before the pick and during placement
