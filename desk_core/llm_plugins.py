@@ -767,24 +767,36 @@ async def run_agent_command(
         if step.thought:
             history.append(f"Thought: {step.thought}")
 
+        step_failed = False
         for tc in step.tool_calls:
             try:
                 res = await call_tool_fn(tc.tool, tc.args)
             except Exception as exc:
                 res = {"ok": False, "error": str(exc)}
-            if isinstance(res, dict) and res.get("ok") is False and res.get("error"):
-                last_error = str(res["error"])
-            elif isinstance(res, str) and "Error" in res:
-                last_error = res[:180]
+            failed = (
+                res is False
+                or (isinstance(res, dict) and res.get("ok") is False)
+                or (isinstance(res, str) and "Error" in res)
+            )
+            if failed:
+                step_failed = True
+                if isinstance(res, dict):
+                    last_error = str(res.get("error") or res.get("reason") or f"{tc.tool} failed")
+                elif isinstance(res, str):
+                    last_error = res[:180]
+                else:
+                    last_error = f"{tc.tool} returned False"
             executed.append({"tool": tc.tool, "args": tc.args, "result": res})
             history.append(f"Tool {tc.tool}({json.dumps(tc.args)}) -> {json.dumps(res, default=str)[:1200]}")
+            if failed:
+                break
 
-        if step.reply and (step.done or not step.tool_calls):
+        if not step_failed and step.reply and (step.done or not step.tool_calls):
             cleaned = _sanitize_reply(step.reply, step.thought)
             if cleaned:
                 final_reply = cleaned
 
-        if not step.tool_calls or step.done:
+        if not step.tool_calls or (step.done and not step_failed):
             completed = True
             break
 
