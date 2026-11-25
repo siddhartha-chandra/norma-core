@@ -60,13 +60,24 @@ from desk_core.llm_plugins import (
 )
 
 MOTION_TOOLS = {
+    "set_torque",
     "move_joints",
     "move_joint",
+    "grasp",
+    "release",
     "go_home",
+    "move_to_home",
     "move_to_pose",
+    "move_flange",
     "pick_at",
     "place_at",
     "pick_pixel",
+    "aim_wrist",
+    "capture_wrist_stereo",
+    "retract_to_hover",
+    "move_to_drop",
+    "master_pick_place",
+    "robo_jev_guard",
     "execute_sequence",
 }
 
