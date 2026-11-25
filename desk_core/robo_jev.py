@@ -366,6 +366,8 @@ async def guarded_recover(
                 camera=camera,
             )
             if rep_retry["ok"]:
+                if hasattr(bridge, "rearm"):
+                    bridge.rearm()
                 return {
                     "ok": True,
                     "action": "resumed_after_obstacle",
@@ -410,6 +412,8 @@ async def guarded_recover(
             }
 
         gatekeeper.arm_watch(jpeg_bytes=jpeg, pixel=new_px, query=query, depth_m=depth_m)
+        if hasattr(bridge, "rearm"):
+            bridge.rearm()
         return {
             "ok": True,
             "action": "recalibrated",
