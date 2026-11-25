@@ -465,9 +465,12 @@ class MockStationBridge:
                 d_xy = ((other["x"] - held["x"]) ** 2 + (other["y"] - held["y"]) ** 2) ** 0.5
                 if d_xy < (held.get("radius_m", 0.025) + other.get("radius_m", 0.025)) and other.get("z", 0.0) >= held.get("z", 0.0) + held_h * 0.5:
                     self._held_riders.append(other_name)
+        if best_name is not None:
+            m.position = max(m.position, min(m.range_max, m.range_min + GRIPPER_SLACK_STEPS + 80))
+            gap = abs(m.position - m.range_min)
         return {
             "ok": True,
-            "holding": gap > GRIPPER_SLACK_STEPS,
+            "holding": bool(best_name is not None or gap > GRIPPER_SLACK_STEPS),
             "held_object": best_name,
             "gripper_id": gid,
             "position": m.position,
