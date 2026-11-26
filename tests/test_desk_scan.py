@@ -1,11 +1,20 @@
 import asyncio
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 
 from desk_core import desk_scan, mcp_server, vision_3d
 from desk_core.sightings import SightingsStore
 from desk_core.station_bridge import LiveStationBridge
+
+
+def test_opencv_scene_detection_on_a_saturated_mat():
+    frame = np.full((240, 320, 3), (0, 180, 0), dtype=np.uint8)
+    frame[30:70, 40:100] = (220, 50, 20)
+    frame[150:190, 200:260] = (20, 30, 220)
+    detections = vision_3d._localize_scene_opencv(frame)
+    assert sorted(tuple(det["point"]) for det in detections) == [(206, 217), (706, 717)]
 
 
 def test_scene_scan_never_uses_wrist_as_overhead(monkeypatch):
