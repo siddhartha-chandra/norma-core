@@ -886,7 +886,14 @@ def main() -> None:
     port = int(os.environ.get("DASHBOARD_PORT", "8765"))
     if host not in _LOOPBACK_HOSTS and not os.environ.get("DASHBOARD_TOKEN", "").strip():
         raise SystemExit(f"Refusing to serve the dashboard on {host} without DASHBOARD_TOKEN; set one or bind 127.0.0.1.")
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    certfile = os.environ.get("DASHBOARD_SSL_CERTFILE", "").strip() or None
+    keyfile = os.environ.get("DASHBOARD_SSL_KEYFILE", "").strip() or None
+    if host not in _LOOPBACK_HOSTS and not certfile and os.environ.get("DASHBOARD_ALLOW_HTTP") != "1":
+        raise SystemExit(f"Refusing plain HTTP on {host}: set DASHBOARD_SSL_CERTFILE/KEYFILE, use an SSH tunnel, "
+                         "or set DASHBOARD_ALLOW_HTTP=1 on a trusted network.")
+    # Access logs would record the ?token= sign-in URL.
+    uvicorn.run(app, host=host, port=port, log_level="info", ssl_certfile=certfile, ssl_keyfile=keyfile,
+                access_log=not os.environ.get("DASHBOARD_TOKEN", "").strip())
 
 
 if __name__ == "__main__":
