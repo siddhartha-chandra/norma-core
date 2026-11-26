@@ -212,7 +212,7 @@ async def api_estop() -> dict[str, Any]:
 
 @app.post("/api/localize")
 async def api_localize(req: LocalizeReq) -> dict[str, Any]:
-    global _last_detection, _detection_positions
+    global _last_detection, _detection_positions, _wrist_watch_stale
     if req.camera in ("both", "dual"):
         raise HTTPException(status_code=400, detail="camera='both' is disabled: dual-camera localization is pending the epipolar step")
     bridge = await srv._get_bridge()
@@ -231,6 +231,7 @@ async def api_localize(req: LocalizeReq) -> dict[str, Any]:
     )
     _last_detection = det
     _detection_positions = positions
+    _wrist_watch_stale = False
     fb = f" ({det['fallback_reason']})" if det.get("fallback_reason") else ""
     _log_event("LOCALIZE", f"{req.query} via {det['backend']}{fb} -> {det['world']}", ok=det["found"])
     return det
@@ -250,14 +251,13 @@ async def api_arm_watch() -> dict[str, Any]:
         cam = "top"
     global _armed_camera, _armed_positions, _wrist_watch_stale
     ref = _detection_positions if cam == "wrist" else None
-    if ref is not None and _arm_moved_since(ref, await _arm_joint_positions(await srv._get_bridge())):
+    if ref is not None and (_wrist_watch_stale or _arm_moved_since(ref, await _arm_joint_positions(await srv._get_bridge()))):
         msg = "The arm moved since the wrist detection; run Localize again before arming."
         _log_event("ROBO-JEV", msg, ok=False)
         raise HTTPException(status_code=409, detail=msg)
     res = await srv.robo_jev_arm_watch(*px, query=q, camera=cam, depth_m=d)
     _armed_camera = cam
     _armed_positions = ref
-    _wrist_watch_stale = False
     _log_event("ROBO-JEV", f"Armed watch on {q} @ {res['ref_pixel']}")
     return res
 
