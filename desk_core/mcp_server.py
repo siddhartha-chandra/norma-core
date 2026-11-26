@@ -23,6 +23,7 @@ import io
 import json
 import os
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,11 +35,12 @@ from fastmcp.utilities.types import Image
 from PIL import Image as PILImage
 
 from .calib_store import CalibrationStore, TICKS_PER_RAD
+from .hive import HIVE_SHAPE, POSITION_TOL_M, Layout, Obstacle, Tile, plan_hive
 from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
 from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
-from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, StationBridge, create_bridge
+from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, MockStationBridge, StationBridge, create_bridge
 from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
 from .vision_3d import localize_object_3d
@@ -914,12 +916,15 @@ async def mock_add_object(
     color: str = "blue",
     shape: str = "cube",
     radius_m: float = 0.025,
+    insect: str | None = None,
 ) -> dict:
-    """Add or update a synthetic 3D object at known (x, y, z) meters in the mock tabletop scene."""
+    """Add a synthetic 3D object in meters. Use shape='hive_tile' and set insect for a Hive tile."""
     bridge = await _get_bridge()
     if not hasattr(bridge, "add_mock_object"):
         return {"ok": False, "error": "mock_add_object is only available in --mock mode"}
-    return {"ok": True, **bridge.add_mock_object(name=name, x=x, y=y, z=z, color=color, shape=shape, radius_m=radius_m)}
+    return {"ok": True, **bridge.add_mock_object(
+        name=name, x=x, y=y, z=z, color=color, shape=shape, radius_m=radius_m, insect=insect,
+    )}
 
 
 @mcp.tool()
@@ -940,6 +945,68 @@ async def mock_reset_scene() -> dict:
     if not hasattr(bridge, "reset_mock_scene"):
         return {"ok": False, "error": "mock_reset_scene is only available in --mock mode"}
     return {"ok": True, **bridge.reset_mock_scene()}
+
+
+@mcp.tool()
+@_traced
+@_motion_tool
+async def hive_sort(execute: bool = False, tiles: list[Tile] | None = None) -> dict:
+    """Plan cream/black Hive piles by insect. Execute only in mock mode, using its tile inventory.
+
+    For a dry run from measured coordinates, pass tiles with x, y and base z in meters.
+    Use insect=null for unreadable tiles. Without tiles, read the mock scene inventory.
+    """
+    if execute and tiles is not None:
+        return {"ok": False, "error": "Hive simulation execution reads tiles from the mock scene"}
+    obstacles = [Obstacle(obj.x, obj.y, obj.radius_m) for obj in _obstacles.values()]
+    if tiles is None:
+        bridge = await _get_bridge()
+        if not isinstance(bridge, MockStationBridge):
+            return {"ok": False, "error": "Hive sorting requires the Station mock; measured tiles support dry runs only"}
+        scene = bridge.get_mock_scene_state()
+        if scene["held_object"] is not None:
+            return {"ok": False, "error": "Release the held object before planning a Hive sort"}
+        tiles = []
+        for name, obj in scene["objects"].items():
+            if obj["shape"] == HIVE_SHAPE:
+                tiles.append(Tile(name, obj["color"], obj["insect"], obj["x"], obj["y"], obj["z"]))
+            else:
+                obstacles.append(Obstacle(obj["x"], obj["y"], obj["radius_m"]))
+    try:
+        plan = plan_hive(tiles, Layout.load(), tuple(obstacles))
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+    report = {"ok": True, "executed": execute, **asdict(plan), "completed": 0}
+    if not execute or not plan.moves:
+        return report
+
+    observation = await observe()
+    if any(isinstance(frame, str) for frame in observation[1:]):
+        return {**report, "ok": False, "executed": False, "error": "Hive sort could not observe both mock cameras"}
+    hover_m = 0.06
+    for step in plan.moves:
+        if not (await release()).get("released"):
+            return {**report, "ok": False, "error": f"could not open gripper before picking {step.name}"}
+        x, y, z = step.source
+        bridge.set_mock_ee_pose(x, y, z + hover_m)
+        bridge.set_mock_ee_pose(x, y, z)
+        grip = await grasp()
+        if not grip.get("ok") or not grip.get("holding") or grip.get("held_object") != step.name:
+            return {**report, "ok": False, "error": f"could not pick {step.name}"}
+        bridge.set_mock_ee_pose(x, y, z + hover_m)
+
+        x, y, z = step.destination
+        bridge.set_mock_ee_pose(x, y, z + hover_m)
+        bridge.set_mock_ee_pose(x, y, z)
+        released = await release()
+        placed = bridge.get_mock_scene_state()["objects"][step.name]
+        if not released.get("released") or released.get("released_object") != step.name or any(
+            abs(placed[axis] - target) > POSITION_TOL_M for axis, target in zip(("x", "y", "z"), step.destination)
+        ):
+            return {**report, "ok": False, "error": f"could not place {step.name} at its planned position"}
+        bridge.set_mock_ee_pose(x, y, z + hover_m)
+        report["completed"] += 1
+    return report
 
 
 async def _resolve_grasp_pose(
@@ -1359,6 +1426,7 @@ _SEQ_TOOLS = {
     "pick_at": pick_at,
     "place_at": place_at,
     "pick_pixel": pick_pixel,
+    "hive_sort": hive_sort,
     ## added by Abhi
     "detect_requested_object": detect_requested_object,
     "aim_wrist": aim_wrist,

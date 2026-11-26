@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import struct
 import sys
@@ -27,9 +28,11 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from PIL import Image, ImageChops, ImageDraw, ImageStat
+
+from .hive import HIVE_SHAPE, TILE_RADIUS_M, TILE_THICKNESS_M
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -203,6 +206,21 @@ class MockStationBridge:
         self._held_riders: list[str] = []
         self._scene_objects: dict[str, dict[str, Any]] = {}
         self.reset_mock_scene()
+        if seed := os.environ.get("DESK_MOCK_HIVE_SEED"):
+            self.seed_mock_hive(int(seed))
+
+    def seed_mock_hive(self, seed: int) -> None:
+        spots = [(x, y) for x in (0.17, 0.225, 0.28, 0.335, 0.39) for y in (-0.05, 0.0, 0.05)]
+        rng = random.Random(seed)
+        rng.shuffle(spots)
+        self._scene_objects.clear()
+        for color in ("cream", "black"):
+            for insect in ("ant", "bee", "beetle"):
+                for number in (1, 2):
+                    x, y = spots.pop()
+                    self.add_mock_object(
+                        f"{color}-{insect}-{number}", x, y, color=color, shape=HIVE_SHAPE, insect=insect,
+                    )
 
     def reset_mock_scene(self) -> dict[str, Any]:
         self._ee_pos = [0.28, 0.0, 0.25]
@@ -225,15 +243,19 @@ class MockStationBridge:
         color: str = "blue",
         shape: str = "cube",
         radius_m: float = 0.025,
+        insect: str | None = None,
     ) -> dict[str, Any]:
+        shape = shape.strip().lower()
         self._scene_objects[name] = {
             "x": round(float(x), 4),
             "y": round(float(y), 4),
             "z": round(float(z), 4),
             "color": color.strip().lower(),
-            "shape": shape.strip().lower(),
-            "radius_m": float(radius_m),
+            "shape": shape,
+            "radius_m": TILE_RADIUS_M if shape == HIVE_SHAPE else float(radius_m),
         }
+        if shape == HIVE_SHAPE:
+            self._scene_objects[name]["insect"] = insect
         return self.get_mock_scene_state()
 
     @staticmethod
@@ -241,7 +263,7 @@ class MockStationBridge:
         heights = {
             "cylinder": 0.09, "mug": 0.09, "pen": 0.012, "wallet": 0.025,
             "airpods": 0.025, "wired_earphones": 0.015, "mobile_phone": 0.010,
-            "sphere": 0.048, "cube": 0.045,
+            "sphere": 0.048, "cube": 0.045, HIVE_SHAPE: TILE_THICKNESS_M,
         }
         return heights.get("mug" if name == "mug" else obj.get("shape", "cube"), 0.04)
 
@@ -335,6 +357,8 @@ class MockStationBridge:
             "pink": (225, 105, 165),
             "brown": (125, 78, 48),
             "orange": (230, 125, 40),
+            "cream": (244, 224, 175),
+            "black": (38, 38, 42),
         }
         img = Image.new("RGB", (640, 480), (234, 232, 226) if camera == "top" else (34, 38, 46))
         d = ImageDraw.Draw(img)
@@ -356,6 +380,7 @@ class MockStationBridge:
             v = 240.0 - ((wx - cx_cam) / dz) * f_px
             return u, v, dz
 
+        hive_layers: dict[tuple[float, float], int] = {}
         for name, obj in sorted(self._scene_objects.items(), key=lambda kv: kv[1].get("z", 0.0)):
             u, v, dz = _proj(obj["x"], obj["y"], obj["z"])
             r_px = max(8, int(round((obj.get("radius_m", 0.025) / dz) * f_px)))
@@ -365,7 +390,16 @@ class MockStationBridge:
             shape = obj.get("shape", "cube")
             # Subtle drop shadow
             d.ellipse([u - r_px + 4, v - r_px + 5, u + r_px + 4, v + r_px + 5], fill=(185, 183, 177))
-            if shape == "cylinder" or name == "mug":
+            if shape == HIVE_SHAPE:
+                d.regular_polygon((u, v, r_px), 6, fill=rgb, outline=(70, 65, 58))
+                key = (obj["x"], obj["y"])
+                layers = hive_layers[key] = hive_layers.get(key, 0) + 1
+                ink = (255, 255, 255) if obj["color"] == "black" else (35, 35, 35)
+                d.text((u, v - 5 if layers > 1 else v), obj.get("insect") or "?", anchor="mm", fill=ink)
+                if layers > 1:
+                    d.text((u, v + 6), f"x{layers}", anchor="mm", fill=ink)
+                continue
+            elif shape == "cylinder" or name == "mug":
                 d.ellipse([u - r_px, v - r_px, u + r_px, v + r_px], fill=rgb, outline=(40, 40, 40), width=2)
                 inner = max(3, int(r_px * 0.6))
                 d.ellipse([u - inner, v - inner, u + inner, v + inner], fill=(70, 42, 26))
