@@ -1465,7 +1465,8 @@ def desk_operator_skill() -> str:
         "If Robo-Jev has already latched the emergency stop, re-`observe()` without replacing the reflex latch "
         "with a manual stop. Call `robo_jev_guard` and stop if it fails. "
         "Use its `world` result if it re-localized the target; otherwise obtain fresh world coordinates via "
-        "`localize_3d` before planning. Plan from the stopped pose; never resume the interrupted trajectory."
+        "`localize_3d` before planning. Use its coordinates only if it reports `found: true`; otherwise stay stopped. "
+        "Plan from the stopped pose; never resume the interrupted trajectory."
     )
 
 

@@ -230,12 +230,16 @@ def test_operator_skill_does_not_treat_guard_proceed_as_fresh_localization(mock_
     async def simulate():
         await srv.estop()
         await srv.observe(views=["top"], denoise=False)
-        return await srv.robo_jev_guard()
+        recovery = await srv.robo_jev_guard()
+        localization = await srv.localize_3d(query="blue keys", use_gemini=False, denoise=False)
+        return recovery, localization
 
-    recovery = asyncio.run(simulate())
+    recovery, localization = asyncio.run(simulate())
     assert recovery["ok"] and recovery["action"] == "proceed" and recovery["target_xy"] is None
+    assert localization["found"] is False and localization["world"].keys() == {"x", "y", "z"}
     assert "fresh world coordinates" in srv.desk_operator_skill()
     assert "`localize_3d` before planning" in srv.desk_operator_skill()
+    assert "Use its coordinates only if it reports `found: true`; otherwise stay stopped" in srv.desk_operator_skill()
 
 
 @pytest.mark.parametrize("trigger_camera", ["top", "wrist"])
