@@ -43,6 +43,8 @@ from .vision_3d import (
 app = FastAPI(title="DESK-CORE Mission Control")
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _armed_camera = "top"
+_armed_positions: dict[int, int] | None = None
+WRIST_WATCH_MOVE_TICKS = 15
 
 
 @app.middleware("http")
@@ -230,9 +232,10 @@ async def api_arm_watch() -> dict[str, Any]:
         q = "center-roi"
         d = 0.62
         cam = "top"
-    global _armed_camera
+    global _armed_camera, _armed_positions
     res = await srv.robo_jev_arm_watch(*px, query=q, camera=cam, depth_m=d)
     _armed_camera = cam
+    _armed_positions = (await (await srv._get_bridge()).get_state()).positions() if cam == "wrist" else None
     _log_event("ROBO-JEV", f"Armed watch on {q} @ {res['ref_pixel']}")
     return res
 
@@ -240,6 +243,12 @@ async def api_arm_watch() -> dict[str, Any]:
 @app.post("/api/robo_jev/check")
 async def api_check_reflex() -> dict[str, Any]:
     bridge = await srv._get_bridge()
+    if _armed_camera == "wrist" and _armed_positions is not None:
+        now = (await bridge.get_state()).positions()
+        if any(abs(now.get(mid, pos) - pos) > WRIST_WATCH_MOVE_TICKS for mid, pos in _armed_positions.items()):
+            # The wrist camera moved with the arm, so the armed reference pixel no longer applies.
+            _log_event("ROBO-JEV", "wrist watch stale after arm motion; re-arm", ok=False)
+            return {"ok": False, "aborted": False, "reason": "wrist_moved_rearm_watch", "latency_ms": 0.0}
     res = await check_reflex_and_abort(
         gatekeeper=srv._robo_jev,
         bridge=bridge,
