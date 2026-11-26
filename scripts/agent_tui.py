@@ -84,6 +84,7 @@ EXECUTE_GATED_TOOLS = {
     "capture_wrist_stereo",
     "master_pick_place",
     "hive_sort",
+    "sweep_aside",
 }
 
 
