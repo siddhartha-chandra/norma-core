@@ -534,3 +534,32 @@ def test_cli_dry_run_clear_preserves_calibration(tmp_path: Path):
     assert data["removed"] is True
     assert data["saved"] is False
     assert "H_table" in json.loads(calib_file.read_text(encoding="utf-8"))
+
+
+def test_cli_mock_without_explicit_calib_does_not_overwrite_default_rig(tmp_path: Path):
+    """--mock without --calib must default to dry-run so it never overwrites live rig_calib.json."""
+    real_raw = json.loads((REPO_ROOT / "calib" / "rig_calib.json").read_text(encoding="utf-8"))
+    calib_file = tmp_path / "rig_calib.json"
+    calib_file.write_text(json.dumps(real_raw), encoding="utf-8")
+
+    H_w2i = _make_tilted_camera_homography()
+    anchor_world = [[-0.15, 0.14], [0.15, 0.14], [0.15, 0.34], [-0.15, 0.34]]
+    anchor_px = _proj_pts(H_w2i, np.array(anchor_world)).tolist()
+
+    env = dict(os.environ)
+    env["DESK_MOCK_SYNTHETIC"] = "1"
+    env["DESK_CALIB_PATH"] = str(calib_file)
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "reanchor_plane.py"),
+        "--mock",
+        "--pixels", json.dumps(anchor_px),
+        "--world-points", json.dumps(anchor_world),
+        "--json",
+    ]
+    proc = subprocess.run(cmd, cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["ok"] is True
+    assert data["saved"] is False
+    assert "H_table" not in json.loads(calib_file.read_text(encoding="utf-8"))

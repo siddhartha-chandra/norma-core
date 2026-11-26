@@ -15,9 +15,9 @@ Examples:
   uv run --offline --managed-python python scripts/reanchor_plane.py \\
       --image calib_frames/scene_1/scene.jpg --checkerboard 7 5 --square-size-m 0.025
 
-  # 4. Offline mock simulation re-anchor + move-above-pixel (<1 cm) verification
+  # 4. Offline mock simulation re-anchor + move-above-pixel (<1 cm) verification (--mock implies --dry-run unless --calib is passed)
   DESK_MOCK_SYNTHETIC=1 uv run --offline --managed-python python scripts/reanchor_plane.py \\
-      --mock --pixels "110.8,135.4;529.2,135.4;529.2,344.6;110.8,344.6" \\
+      --mock --dry-run --pixels "110.8,135.4;529.2,135.4;529.2,344.6;110.8,344.6" \\
       --world-points "0.38,0.20;0.38,-0.20;0.18,-0.20;0.18,0.20" \\
       --verify-pixel 382.8 250.5 --move-test
 
@@ -305,6 +305,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         fit_obj = None
 
+    effective_dry_run = bool(args.dry_run or (args.mock and args.calib is None))
     result = reanchor_plane(
         pixel_points=pixel_points,
         world_points=world_points,
@@ -313,10 +314,10 @@ def main(argv: list[str] | None = None) -> int:
         max_error_m=max_error_m,
         allow_high_error=args.allow_high_error,
         method_label=method_label,
-        save=not args.dry_run,
+        save=not effective_dry_run,
     )
 
-    if not args.dry_run:
+    if not effective_dry_run:
         calib.reload()
     else:
         calib.data["H_table"] = result["H_table"]
