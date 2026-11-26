@@ -442,10 +442,11 @@ class SightingsStore:
         if conn is None:
             return []
         try:
+            conn.create_function("CASEFOLD", 1, lambda s: s.casefold() if isinstance(s, str) else s)
             clauses: list[str] = []
             params: list[Any] = []
             if label is not None:
-                clauses.append("LOWER(label) = LOWER(?)")
+                clauses.append("CASEFOLD(label) = CASEFOLD(?)")
                 params.append(label.strip())
             if before_time is not None:
                 clauses.append("time <= ?")
@@ -515,8 +516,8 @@ def _filter_and_sort(
 ) -> list[Sighting]:
     out = sightings
     if label is not None:
-        want = label.strip().lower()
-        out = [s for s in out if s.label.lower() == want]
+        want = label.strip().casefold()
+        out = [s for s in out if s.label.casefold() == want]
     if before_time is not None:
         cutoff = float(before_time)
         out = [s for s in out if s.time <= cutoff]

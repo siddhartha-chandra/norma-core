@@ -157,6 +157,16 @@ def test_sqlite_fallback_when_normfs_disabled(tmp_path, monkeypatch):
     )
 
 
+def test_sqlite_unicode_case_insensitive_label_filter(tmp_path, monkeypatch):
+    monkeypatch.setenv("DESK_SIGHTINGS_NORMFS", "0")
+    store = SightingsStore(db_path=tmp_path / "sightings.db")
+    asyncio.run(store.record("café", 0.25, 0.05, time_s=1700000100.0, frame_ref="mock://top#1"))
+
+    matches = store.read_sqlite(label="CAFÉ")
+    assert len(matches) == 1
+    assert matches[0].label == "café"
+
+
 @pytest.mark.parametrize(
     "client,expected_reason",
     [
