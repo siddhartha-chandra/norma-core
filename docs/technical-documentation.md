@@ -222,7 +222,7 @@ Call again with `execute=True` to move, then re-observe to confirm the marker ar
 return confirms arm motion, not the marker's position. Calibrate the tabletop to the mat surface first.
 
 The rolling-marker contact test can be run without hardware with `uv run pytest -s tests/test_sweep_aside.py`.
-It drives the ElRobot collision geometry with the same joint commands the tool sends to Station.
+It drives the ElRobot collision geometry with the live bridge's single-joint commands and simulated encoder feedback.
 
 ### 4.2 Motion lock and run log
 

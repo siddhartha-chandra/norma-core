@@ -1,6 +1,7 @@
 import asyncio
 import math
 import os
+import time
 from pathlib import Path
 
 import mujoco
@@ -10,7 +11,12 @@ from fastmcp import Client
 from PIL import Image
 
 from desk_core import mcp_server
-from desk_core.station_bridge import MockStationBridge
+from desk_core.station_bridge import (
+    DEFAULT_MAX_STEP,
+    LiveStationBridge,
+    MockStationBridge,
+    RobotState,
+)
 
 
 class MarkerTwin(MockStationBridge):
@@ -77,6 +83,7 @@ class MarkerTwin(MockStationBridge):
 
     async def send_joint_targets(self, targets, max_step):
         before = np.array(self.calib.ticks_to_rad(list(self._motors.values())))
+        assert 8 not in targets and sum(self._motors[mid].position != tick for mid, tick in targets.items()) == 1
         outcome = await super().send_joint_targets(targets, max_step)
         goal = np.array(self.calib.ticks_to_rad(list(self._motors.values())))
         count = max(1, math.ceil(np.max(np.abs(goal - before)) / 0.0009))
@@ -84,6 +91,38 @@ class MarkerTwin(MockStationBridge):
             self.step(q, (goal - before) / (count * self.model.opt.timestep))
         self.writes += 1
         return outcome
+
+    def attach_live_bridge(self, monkeypatch):
+        bus = self.calib.data["hardware"]["bus_serial"]
+        bridge = LiveStationBridge(target_bus=bus, follow_motor_rx=True)
+        bridge._torque_started = set(self._motors) - {8}
+
+        async def get_state():
+            now = time.monotonic()
+            bridge._last_rx_mono = now
+            bridge.rx_received_at.update({(bus, mid): now for mid in self._motors})
+            return RobotState(bus, list(self._motors.values()))
+
+        def sync_write(bus_serial, address, values):
+            assert bus_serial == bus
+            return {mid: int.from_bytes(value, "little") for mid, value in values.items()}
+
+        async def send_commands(client, commands):
+            for targets in commands:
+                assert await self.send_joint_targets(targets, DEFAULT_MAX_STEP) == targets
+
+        async def wait_settle(targets, tol_ticks, *, moving_from):
+            state = await get_state()
+            assert all(state.positions()[mid] == value for mid, value in targets.items())
+            return state
+
+        monkeypatch.setattr(bridge, "get_state", get_state)
+        monkeypatch.setattr(bridge, "_sync_write", sync_write)
+        monkeypatch.setattr(bridge, "_send_commands", send_commands)
+        monkeypatch.setattr(bridge, "wait_preflight_settle", wait_settle)
+        monkeypatch.setattr(mcp_server, "_bridge", bridge)
+        monkeypatch.setattr(mcp_server, "_calib", self.calib)
+        return bridge
 
     def settle(self):
         q = np.array(self.calib.ticks_to_rad(list(self._motors.values())))
@@ -187,22 +226,23 @@ def test_mock_sweep_moves_only_pens_in_the_swept_corridor(monkeypatch):
 def test_sweep_aside_moves_two_rolling_markers_into_side_zone(calib, monkeypatch):
     markers = [
         ("blue", -0.008, 0.205, 13, (0.1, 0.35, 0.95)),
-        ("orange", 0.013, 0.273, -11, (0.95, 0.32, 0.08)),
+        ("orange", 0.013, 0.255, -11, (0.95, 0.32, 0.08)),
     ]
     zone = (0.043, 0.155, 0.162, 0.345)
     twin = MarkerTwin(calib)
-    monkeypatch.setattr(mcp_server, "_bridge", twin)
+    bridge = twin.attach_live_bridge(monkeypatch)
     monkeypatch.setattr(mcp_server, "_obstacles", {})
 
     async def run():
-        initial = await twin.get_state()
+        initial = await bridge.get_state()
+        initial_gripper_ticks = initial.positions()[8]
         twin.build(initial, markers, zone)
         twin.settle()
         before = {name: twin.position(name) for name, *_ in markers}
         twin.screenshot("sweep-before")
         expected_writes = 0
         async with Client(mcp_server.mcp) as client:
-            for start, end, y in ((-0.064, 0.063, 0.205), (-0.045, 0.073, 0.273)):
+            for start, end, y in ((-0.064, 0.063, 0.205), (-0.045, 0.073, 0.255)):
                 moved = await client.call_tool("sweep_aside", {"start_xy": [start, y], "end_xy": [end, y],
                                                                "z_mm": 6, "execute": True})
                 assert moved.data["ok"] and moved.data["executed"], moved.data
@@ -223,6 +263,6 @@ def test_sweep_aside_moves_two_rolling_markers_into_side_zone(calib, monkeypatch
         assert twin.pen_hits == set(before)
         assert twin.writes == expected_writes
         assert twin.mat_contacts == 0 and clearance > 0.002
-        assert (await twin.get_state()).positions()[8] == initial.positions()[8]
+        assert (await bridge.get_state()).positions()[8] == initial_gripper_ticks
 
     asyncio.run(run())
