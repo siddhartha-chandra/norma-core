@@ -177,11 +177,26 @@ def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_
     args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
     send = bridge._send_commands
     shoulder_loaded = False
+    retained_targets = {}
+    last_segment = None
+    checked_residual = False
+    validate_segment = MuJoCoPlanner.validate_segment
+
+    def record_segment(self, start, goal):
+        nonlocal last_segment
+        last_segment = (start, goal)
+        return validate_segment(self, start, goal)
 
     async def send_with_shoulder_sag(client, commands):
-        nonlocal shoulder_loaded
+        nonlocal shoulder_loaded, checked_residual
         before = state.positions()
         assert all(sum(tick != before[mid] for mid, tick in command.items()) <= 1 for command in commands)
+        for command in commands:
+            retained_targets.update(command)
+            segment_start, segment_goal = last_segment
+            assert segment_start.tolist() == calib.ticks_to_rad(state.motors)
+            assert calib.rad_to_ticks(segment_goal.tolist(), state.motors) == retained_targets
+            checked_residual |= 2 not in command and before[2] != retained_targets[2]
         previous = state.positions()[2]
         await send(client, commands)
         shoulder_loaded |= state.motors[1].position > previous
@@ -189,6 +204,7 @@ def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_
             state.motors[1].position -= 1
 
     monkeypatch.setattr(bridge, "_send_commands", send_with_shoulder_sag)
+    monkeypatch.setattr(MuJoCoPlanner, "validate_segment", record_segment)
 
     async def run():
         start_ticks = state.positions()
@@ -204,6 +220,7 @@ def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_
         assert len(packets) == moved["waypoints"] - 1
         assert all(8 not in target for target in packets)
         assert all(len(target) == 1 for target in packets[1:])
+        assert checked_residual
         assert state.positions()[2] > start_ticks[2]
         planned = calib.rad_to_ticks(moved["joints_rad"], state.motors)
         assert state.positions()[2] == planned[2] - 1

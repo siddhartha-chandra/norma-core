@@ -199,12 +199,12 @@ and zeros, the same effective motor ranges, and an unloaded gripper within 25 ti
 of its calibrated open limit. MuJoCo uses the measured jaw opening and holds it fixed for the move.
 Live execution also requires arm torque to be already enabled. The planner uses the same tick↔radian
 conversion as Desk Core FK; Station refuses to clamp or send
-a target from a different measured pose. The next segment is checked from the stable measured pose,
-which must be within the same 15-tick tolerance used by the flange-motion stream. Each live waypoint
-moves one joint at a time. After the first command establishes the inactive joints' initial targets,
-each later command updates only the moving joint; the others keep their last targets instead of
-following measured sag. The planned motion does not depend on synchronized rates, but the model
-does not account for physical overshoot.
+a target from a different measured pose. After the first command establishes the inactive joints'
+initial targets, each later command updates only one joint; the others keep their last targets instead
+of following measured sag. The planner samples each segment from the stable measured pose to the full
+commanded vector, including any residual error toward retained targets. Settling uses the same 15-tick
+tolerance as the flange-motion stream. The model does not account for physical overshoot or different
+rates of residual motion.
 On a stall or an unconfirmed target write, Station attempts to hold the measured position.
 The model does not account for payload or dynamic torque. A simulation budget is not a hardware rating.
 To request just the MuJoCo IK solution, pass the same limit to `solve_ik`; without it the existing IK

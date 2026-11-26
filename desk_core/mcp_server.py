@@ -962,9 +962,7 @@ async def plan_and_move(
                         raise PlanningError("Measured elbow/wrist tuck did not reduce shoulder torque")
                 axis, = np.flatnonzero(plan.waypoints[index] != plan.waypoints[index - 1])
                 mid = expected.motors[axis].id
-                waypoint = measured.copy()
-                waypoint[axis] = plan.waypoints[index, axis]
-                peak = planner.validate_segment(measured, waypoint)
+                peak = planner.validate_segment(measured, plan.waypoints[index])
                 result["peak_shoulder_torque_nm"] = max(peak, result["peak_shoulder_torque_nm"])
                 if index > 1:
                     target = {mid: planned_target[mid]}
