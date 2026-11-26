@@ -77,6 +77,19 @@ def test_refuses_collisions_and_out_of_workspace_piles():
         plan_hive([tile] * 13, layout)
 
 
+def test_hive_sort_refuses_to_carry_a_non_hive_object(mock_bridge, monkeypatch):
+    from desk_core import mcp_server
+
+    monkeypatch.setattr(mcp_server, "_bridge", mock_bridge)
+    mock_bridge.seed_mock_hive(42)
+    tile = mock_bridge.get_mock_scene_state()["objects"]["cream-ant-1"]
+    mock_bridge.add_mock_object("rider", tile["x"], tile["y"], TILE_THICKNESS_M, radius_m=0.005)
+    before = mock_bridge.get_mock_scene_state()
+    result = asyncio.run(mcp_server.hive_sort(execute=True))
+    assert result == {"ok": False, "error": "Hive tile 'cream-ant-1' is blocked by 'rider'"}
+    assert mock_bridge.get_mock_scene_state() == before
+
+
 @pytest.mark.parametrize("seed", [42, 73])
 def test_hive_sorts_a_randomized_station_mock_scene(seed):
     async def run():

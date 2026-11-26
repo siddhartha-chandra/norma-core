@@ -959,10 +959,12 @@ async def hive_sort(execute: bool = False, tiles: list[Tile] | None = None) -> d
     if execute and tiles is not None:
         return {"ok": False, "error": "Hive simulation execution reads tiles from the mock scene"}
     obstacles = [Obstacle(obj.x, obj.y, obj.radius_m) for obj in _obstacles.values()]
+    mock = None
     if tiles is None:
         bridge = await _get_bridge()
         if not isinstance(bridge, MockStationBridge):
             return {"ok": False, "error": "Hive sorting requires the Station mock; measured tiles support dry runs only"}
+        mock = bridge
         scene = bridge.get_mock_scene_state()
         if scene["held_object"] is not None:
             return {"ok": False, "error": "Release the held object before planning a Hive sort"}
@@ -976,6 +978,11 @@ async def hive_sort(execute: bool = False, tiles: list[Tile] | None = None) -> d
         plan = plan_hive(tiles, Layout.load(), tuple(obstacles))
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
+    if mock is not None:
+        for step in plan.moves:
+            for rider in mock.get_mock_riders(step.name):
+                if scene["objects"][rider]["shape"] != HIVE_SHAPE:
+                    return {"ok": False, "error": f"Hive tile {step.name!r} is blocked by {rider!r}"}
     report = {"ok": True, "executed": execute, **asdict(plan), "completed": 0}
     if not execute or not plan.moves:
         return report

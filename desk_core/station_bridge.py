@@ -472,6 +472,17 @@ class MockStationBridge:
     async def wait_settle(self, targets: dict[int, int], tol_ticks: int = 25, timeout_s: float = 3.0) -> bool:
         return True
 
+    def get_mock_riders(self, name: str) -> list[str]:
+        held = self._scene_objects[name]
+        min_z = held["z"] + self._obj_height(name, held) * 0.5
+        return [
+            other_name
+            for other_name, other in sorted(self._scene_objects.items(), key=lambda kv: kv[1].get("z", 0.0))
+            if other_name != name and other["z"] >= min_z
+            and math.hypot(other["x"] - held["x"], other["y"] - held["y"])
+            < held["radius_m"] + other["radius_m"]
+        ]
+
     async def grasp_with_verify(self, close_ticks: int | None = None, open_ticks: int | None = None) -> dict:
         gid = max(self._motors)
         m = self._motors[gid]
@@ -490,16 +501,7 @@ class MockStationBridge:
                 best_dist_3d = d_3d
                 best_name = name
         self._held_object = best_name
-        self._held_riders = []
-        if best_name and best_name in self._scene_objects:
-            held = self._scene_objects[best_name]
-            held_h = self._obj_height(best_name, held)
-            for other_name, other in sorted(self._scene_objects.items(), key=lambda kv: kv[1].get("z", 0.0)):
-                if other_name == best_name:
-                    continue
-                d_xy = ((other["x"] - held["x"]) ** 2 + (other["y"] - held["y"]) ** 2) ** 0.5
-                if d_xy < (held.get("radius_m", 0.025) + other.get("radius_m", 0.025)) and other.get("z", 0.0) >= held.get("z", 0.0) + held_h * 0.5:
-                    self._held_riders.append(other_name)
+        self._held_riders = self.get_mock_riders(best_name) if best_name is not None else []
         if best_name is not None:
             m.position = max(m.position, min(m.range_max, m.range_min + GRIPPER_SLACK_STEPS + 80))
             gap = abs(m.position - m.range_min)
