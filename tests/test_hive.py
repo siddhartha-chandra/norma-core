@@ -94,7 +94,8 @@ def test_hive_sort_refuses_to_carry_a_non_hive_object(mock_bridge, monkeypatch):
 def test_hive_sorts_a_randomized_station_mock_scene(seed):
     async def run():
         env = {**os.environ, "DESK_MOCK": "1", "DESK_NO_DOTENV": "1", "DESK_RUNLOG": "0",
-               "DESK_MOCK_SYNTHETIC": "1", "DESK_MOCK_HIVE_SEED": str(seed)}
+               "DESK_MOCK_HIVE_SEED": str(seed)}
+        env.pop("DESK_MOCK_SYNTHETIC", None)
         params = StdioServerParameters(
             command=sys.executable, args=["-m", "desk_core.mcp_server"], cwd=str(REPO), env=env,
         )
@@ -107,7 +108,13 @@ def test_hive_sorts_a_randomized_station_mock_scene(seed):
                     assert not response.is_error, response
                     return response.structured_content
 
+                async def top_frame():
+                    response = await client.call_tool("get_frame", {"camera": "top", "denoise": False})
+                    assert not response.is_error, response
+                    return next(block.data for block in response.content if block.type == "image")
+
                 before = await call("mock_scene_state")
+                before_frame = await top_frame()
                 measured = [{"name": "measured", "color": "cream", "insect": "ant", "x": 0.28, "y": 0.0}]
                 direct = await call("hive_sort", tiles=measured)
                 dry_run = await call("execute_sequence", steps=[{"tool": "hive_sort", "args": {"tiles": measured}}])
@@ -120,6 +127,7 @@ def test_hive_sorts_a_randomized_station_mock_scene(seed):
                 command = await call("plan_command", command="sort Hive tiles")
                 result = await call("execute_sequence", steps=command["steps"])
                 assert result["ok"], result
+                assert await top_frame() != before_frame
                 sorted_scene = await call("mock_scene_state")
                 assert sorted_scene["held_object"] is None
                 assert sorted_scene["objects"].keys() == before["objects"].keys()

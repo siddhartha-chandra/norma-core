@@ -339,7 +339,8 @@ class MockStationBridge:
     async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
         if camera in self._frame_overrides:
             return self._frame_overrides[camera]
-        if os.environ.get("DESK_MOCK_SYNTHETIC") != "1":
+        hive_active = any(obj["shape"] == HIVE_SHAPE for obj in self._scene_objects.values())
+        if not hive_active and os.environ.get("DESK_MOCK_SYNTHETIC") != "1":
             env_key = "DESK_MOCK_TOP_IMAGE" if camera == "top" else "DESK_MOCK_WRIST_IMAGE"
             candidates = []
             if os.environ.get(env_key, "").strip():
