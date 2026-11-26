@@ -17,9 +17,13 @@ shared/libcamera/library/
 .claude/settings.local.json
 station_data/
 runs/
-calib_frames/
+calib_frames/*
+!calib_frames/board_check/
+!calib_frames/hand_eye_1/
+!calib_frames/hand_eye_combined/
+!calib_frames/scene_1/
+!calib_frames/session1/
 cam_*.jpg
 logs/
 *.mcap
-go.work.sum
 .coverage

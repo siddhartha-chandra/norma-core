@@ -27,7 +27,7 @@ All **verified** today unless marked.
 
 | Item | State |
 | --- | --- |
-| Repository | `/Users/siddhartha/playarea/hackathons/normacore_hackathon/norma-core` |
+| Repository | repository root (`norma-core`) |
 | Branch | `fix/live-ik-and-agent-tui` |
 | Last commit | `965bde1`, the merge of `origin/feat/final`. Local only, not pushed. |
 | Uncommitted | Two small fixes (below) and this document. |

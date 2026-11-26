@@ -288,16 +288,19 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
                     return {"ok": False, "aborted": f"lag {lag} at t={t:.2f}s", "hold": hold, "cycles": cycles}
                 cycles += 1
                 await asyncio.sleep(max(0.0, start + cycles * period - time.monotonic()))
+            settled = False
             if reflex is None or reflex.report is None:
                 await bridge.send_joint_targets(ticks_at(1.0, commanded), max_step=limits.max_step_ticks)
-                await bridge.wait_settle(ticks_at(1.0), tol_ticks=FLANGE_SETTLE_TOL_TICKS, timeout_s=1.0)
+                settled = await bridge.wait_settle(ticks_at(1.0), tol_ticks=FLANGE_SETTLE_TOL_TICKS, timeout_s=1.0)
             if reflex is None or reflex.report is None:
                 state = await bridge.get_state()
                 final = state.positions()
-                result = {"ok": True, "cycles": cycles, "elapsed_s": round(time.monotonic() - start, 2),
+                result = {"ok": settled or correct, "settled": settled, "cycles": cycles, "elapsed_s": round(time.monotonic() - start, 2),
                           "worst_lag_ticks": worst_lag, "final_ticks": [final[mid] for mid in arm_ids]}
                 if correct:
-                    result["correction"] = await correct_final_pose(bridge, calib, path, limits, reflex=reflex)
+                    corr = result["correction"] = await correct_final_pose(bridge, calib, path, limits, reflex=reflex)
+                    off = corr.get("off_target_mm") or []
+                    result["ok"] = settled or bool(off and off[-1] <= limits.correct_tol_mm)
     except EStopLatched:
         if reflex is None or reflex.report is None:
             raise

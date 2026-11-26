@@ -170,6 +170,7 @@ class SightingsStore:
         db_path: str | os.PathLike | None = None,
         normfs_enabled: bool | None = None,
         timeout_s: float = 5.0,
+        write_timeout_s: float = 0.5,
     ):
         self._normfs_client = normfs_client
         self._client_provider = client_provider
@@ -177,6 +178,7 @@ class SightingsStore:
         self._db_path = Path(db_path) if db_path is not None else None
         self._normfs_enabled = normfs_enabled
         self.timeout_s = float(timeout_s)
+        self.write_timeout_s = float(write_timeout_s)
         self._sqlite_initialized: set[Path] = set()
 
     @property
@@ -294,9 +296,13 @@ class SightingsStore:
         try:
             entry_id = await asyncio.wait_for(
                 client.enqueue(self.queue_id, sighting.to_bytes()),
-                timeout=self.timeout_s,
+                timeout=self.write_timeout_s,
             )
-            rec_id = entry_id.hex() if isinstance(entry_id, (bytes, bytearray)) else str(entry_id)
+            rec_id = (
+                bytes(entry_id).hex()
+                if isinstance(entry_id, (bytes, bytearray, memoryview))
+                else str(entry_id)
+            )
             return SightingWriteResult(
                 sighting=sighting,
                 backend="normfs",
@@ -347,6 +353,39 @@ class SightingsStore:
             confidence=confidence,
         )
 
+    async def _drain_queue_read(
+        self, qr: Any, deadline: float
+    ) -> tuple[list[Sighting], bytes | None, bytes | None, int]:
+        entries: list[Sighting] = []
+        first_id: bytes | None = None
+        last_id: bytes | None = None
+        raw_count = 0
+        finished = False
+        try:
+            while (remaining := deadline - time.monotonic()) > 0:
+                try:
+                    entry = await asyncio.wait_for(qr.data.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+                if entry is None:
+                    finished = True
+                    break
+                raw_count += 1
+                raw_id = getattr(getattr(entry, "ID", None), "ID", None)
+                if isinstance(raw_id, (bytes, bytearray, memoryview)):
+                    b_id = bytes(raw_id)
+                    if first_id is None:
+                        first_id = b_id
+                    last_id = b_id
+                try:
+                    entries.append(Sighting.from_bytes(entry.Data))
+                except Exception as exc:
+                    log.debug("Skipping malformed NormFS sighting entry: %s", exc)
+        finally:
+            if not finished and hasattr(qr, "aclose"):
+                await qr.aclose()
+        return entries, first_id, last_id, raw_count
+
     async def read_normfs(
         self,
         limit: int = 1000,
@@ -361,58 +400,36 @@ class SightingsStore:
         if client is None:
             return []
 
+        deadline = time.monotonic() + self.timeout_s
         filtered = label is not None or before_time is not None
-        fetch_limit = max(limit, 1000) if filtered else limit
-        buf_size = min(max(fetch_limit, 16), 256)
+        page_size = max(limit, 1000) if filtered else limit
+        buf_size = min(max(page_size, 16), 256)
         page_back = False
         if hasattr(client, "read_from_tail"):
-            offset = (fetch_limit - 1).to_bytes(8, "little") if fetch_limit > 1 else b"\x00"
-            qr = client.read_from_tail(self.queue_id, offset=offset, limit=fetch_limit, step=1, buf_size=buf_size)
+            offset = (page_size - 1).to_bytes(8, "little") if page_size > 1 else b"\x00"
+            qr = client.read_from_tail(self.queue_id, offset=offset, limit=page_size, step=1, buf_size=buf_size)
             page_back = filtered and hasattr(client, "read_from_offset")
         elif hasattr(client, "read_from_offset"):
-            qr = client.read_from_offset(self.queue_id, offset=b"\x00", limit=fetch_limit, step=1, buf_size=buf_size)
+            qr = client.read_from_offset(self.queue_id, offset=b"\x00", limit=page_size, step=1, buf_size=buf_size)
         else:
             return []
 
-        deadline = time.monotonic() + self.timeout_s
-        matches: list[Sighting] = []
-        previous_end = None
-        while True:
-            entries: list[Sighting] = []
-            first_id = None
-            finished = False
-            try:
-                while (remaining := deadline - time.monotonic()) > 0:
-                    try:
-                        entry = await asyncio.wait_for(qr.data.get(), timeout=remaining)
-                    except asyncio.TimeoutError:
-                        break
-                    if entry is None:
-                        finished = True
-                        break
-                    if page_back and first_id is None:
-                        first_id = bytes(entry.ID.ID)
-                    try:
-                        entries.append(Sighting.from_bytes(entry.Data))
-                    except Exception as exc:
-                        log.debug("Skipping malformed NormFS sighting entry: %s", exc)
-            finally:
-                if not finished and hasattr(qr, "aclose"):
-                    await qr.aclose()
-
-            matches = _filter_and_sort(matches + entries, limit=limit, label=label, before_time=before_time)
-            if not first_id or time.monotonic() >= deadline:
-                break
-            end = int.from_bytes(first_id, "little")
-            if end == 0 or (previous_end is not None and end >= previous_end):
-                break
-            start = max(0, end - fetch_limit)
-            previous_end = end
+        page, first_id, _, _ = await self._drain_queue_read(qr, deadline)
+        matches = _filter_and_sort(page, limit=limit, label=label, before_time=before_time)
+        if not page_back or not first_id:
+            return matches
+        end = int.from_bytes(first_id, "little")
+        while end > 0 and time.monotonic() < deadline:
+            start = max(0, end - page_size)
             qr = client.read_from_offset(
                 self.queue_id, offset=start.to_bytes(len(first_id), "little"),
                 limit=end - start, step=1, buf_size=buf_size,
             )
-
+            page, _, _, raw_count = await self._drain_queue_read(qr, deadline)
+            if not raw_count:
+                break
+            matches = _filter_and_sort(matches + page, limit=limit, label=label, before_time=before_time)
+            end = start
         return matches
 
     def read_sqlite(
@@ -429,10 +446,11 @@ class SightingsStore:
         if conn is None:
             return []
         try:
+            conn.create_function("CASEFOLD", 1, lambda s: s.casefold() if isinstance(s, str) else s)
             clauses: list[str] = []
             params: list[Any] = []
             if label is not None:
-                clauses.append("LOWER(label) = LOWER(?)")
+                clauses.append("CASEFOLD(label) = CASEFOLD(?)")
                 params.append(label.strip())
             if before_time is not None:
                 clauses.append("time <= ?")
@@ -502,8 +520,8 @@ def _filter_and_sort(
 ) -> list[Sighting]:
     out = sightings
     if label is not None:
-        want = label.strip().lower()
-        out = [s for s in out if s.label.lower() == want]
+        want = label.strip().casefold()
+        out = [s for s in out if s.label.casefold() == want]
     if before_time is not None:
         cutoff = float(before_time)
         out = [s for s in out if s.time <= cutoff]

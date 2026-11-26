@@ -79,6 +79,7 @@ MOTION_TOOLS = {
 
 # Tools that only move the arm when called with execute=True (dry-run planning is read-only)
 EXECUTE_GATED_TOOLS = {
+    "plan_and_move",
     "move_flange",
     "aim_wrist",
     "capture_wrist_stereo",
@@ -95,6 +96,9 @@ def _server_params(live: bool) -> StdioServerParameters:
         env.pop("DESK_MOCK", None)
         env.pop("DESK_NO_DOTENV", None)
     else:
+        from desk_core import DOTENV_KEYS
+        for key in DOTENV_KEYS:
+            env.pop(key, None)
         env["DESK_MOCK"] = "1"
         env["DESK_MOCK_SYNTHETIC"] = "1"
         env["DESK_NO_DOTENV"] = "1"
@@ -937,7 +941,7 @@ class RobotAgentTUI(App):
         try:
             r_top, r_wrist = await asyncio.gather(
                 self.session.call_tool("get_frame", {
-                    "camera": "top", "denoise": False, "save_npy": False, "show_overlay": True,
+                    "camera": "top", "denoise": False, "save_npy": False, "show_overlay": True, "log_frame": False,
                 }),
                 self.session.call_tool("get_frame", {"camera": "wrist", "denoise": False, "save_npy": False}),
             )
@@ -1099,6 +1103,8 @@ class RobotAgentTUI(App):
         log = self.query_one("#chat-log", RichLog)
         res = await self._call_mcp_tool("go_home", {"look_at_table": True})
         if isinstance(res, dict) and res.get("ok") is False:
+            if "error" not in res:
+                log.write(f"[red]Reset Home did not reach home:[/red] {res}")
             return
         log.write(f"[green]Rig reset to table-view home:[/green] {res}")
 
