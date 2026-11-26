@@ -203,7 +203,8 @@ a target from a different measured pose. After the first command establishes the
 initial targets, each later command updates only one joint; the others keep their last targets instead
 of following measured sag. The planner samples each segment from the stable measured pose to the full
 commanded vector, including any residual error toward retained targets. Settling uses the same 15-tick
-tolerance as the flange-motion stream. The model does not account for physical overshoot or different
+tolerance as the flange-motion stream and requires measured progress unless the active joint settles
+within one encoder tick of its target. The model does not account for physical overshoot or different
 rates of residual motion.
 On a stall or an unconfirmed target write, Station attempts to hold the measured position.
 The model does not account for payload or dynamic torque. A simulation budget is not a hardware rating.

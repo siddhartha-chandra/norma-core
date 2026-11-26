@@ -57,6 +57,7 @@ FULL_STATE_LEN = 0x47
 GRIPPER_SLACK_STEPS = 120
 GRIPPER_CONTACT_CURRENT_MA = 20
 RAW_RX_MAX_AGE_S = 0.5
+PREFLIGHT_DEADBAND_TICKS = 1
 DEFAULT_MAX_STEP = int(os.environ.get("ROBOT_MAX_STEP_TICKS", "400"))
 DEFAULT_SPEED = int(os.environ.get("ROBOT_GOAL_SPEED", "600"))
 DEFAULT_ACCEL = int(os.environ.get("ROBOT_GOAL_ACCEL", "20"))
@@ -1221,7 +1222,8 @@ class LiveStationBridge:
             pos = state.positions()
             samples = {mid: self.rx_received_at[(state.bus_serial, mid)] for mid in targets}
             if (all(mid in pos and abs(pos[mid] - tick) <= tol_ticks for mid, tick in targets.items())
-                    and all(start == targets[mid] or abs(pos[mid] - targets[mid]) < abs(start - targets[mid])
+                    and all(abs(pos[mid] - targets[mid]) <= PREFLIGHT_DEADBAND_TICKS
+                            or abs(pos[mid] - targets[mid]) < abs(start - targets[mid])
                             for mid, start in moving_from.items())):
                 if previous is None or previous[0] != pos:
                     previous = (pos, samples)

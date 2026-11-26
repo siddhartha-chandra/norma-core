@@ -245,10 +245,11 @@ def test_live_bridge_refuses_pose_drift_and_clamping_before_writing(live_station
     asyncio.run(run())
 
 
-def test_live_waypoint_within_tolerance_still_requires_progress(live_station):
+@pytest.mark.parametrize("step_ticks", [2, 5])
+def test_live_waypoint_within_tolerance_still_requires_progress(live_station, step_ticks):
     bridge, state, _ = live_station
     start = state.positions()[2]
-    target = {2: start + 5}
+    target = {2: start + step_ticks}
 
     async def run():
         assert await bridge.wait_preflight_settle(target, 15, moving_from={2: start}, timeout_s=0.2) is None
@@ -256,6 +257,14 @@ def test_live_waypoint_within_tolerance_still_requires_progress(live_station):
         assert await bridge.wait_preflight_settle(target, 15, moving_from={2: start}, timeout_s=0.2) is state
 
     asyncio.run(run())
+
+
+def test_live_waypoint_one_tick_short_can_settle_without_progress(live_station):
+    bridge, state, _ = live_station
+    start = state.positions()[2]
+    settled = asyncio.run(bridge.wait_preflight_settle({2: start + 1}, 15, moving_from={2: start}, timeout_s=0.2))
+    assert settled is state
+    assert settled.positions()[2] == start
 
 
 @pytest.mark.parametrize("write_uncertain", [False, True])
