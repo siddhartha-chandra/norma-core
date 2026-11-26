@@ -26,6 +26,7 @@ HEIGHT_CHECK_LINKS = ("ST3215_3_v1_1", "ST3215_5_v1_1", "ST3215_7_v1_1", TOOL_FR
 RANGE_MARGIN_TICKS = 50
 GRAVITY_FF_PATH = Path(__file__).resolve().parents[1] / "calib" / "gravity_ff.json"
 GRAVITY_FF_MAX_RAD = 0.15
+FLANGE_SETTLE_TOL_TICKS = 15
 # Allowed ranges for agent-supplied settings; the pace ceilings are the fastest settings tested on the arm.
 AGENT_BOUNDS = {
     "speed_cm_s": (0.1, 6.0),
@@ -270,7 +271,7 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
             cycles += 1
             await asyncio.sleep(max(0.0, start + cycles * period - time.monotonic()))
         await bridge.send_joint_targets(ticks_at(1.0, commanded), max_step=limits.max_step_ticks)
-        await bridge.wait_settle(ticks_at(1.0), tol_ticks=15, timeout_s=1.0)
+        await bridge.wait_settle(ticks_at(1.0), tol_ticks=FLANGE_SETTLE_TOL_TICKS, timeout_s=1.0)
     except BaseException as exc:
         log.warning("flange stream aborted: %r", exc)
         await bridge.abort()

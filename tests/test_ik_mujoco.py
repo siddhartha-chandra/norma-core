@@ -1,0 +1,364 @@
+import asyncio
+from dataclasses import replace
+import time
+
+import mujoco
+import numpy as np
+import pytest
+
+from desk_core import mcp_server
+from desk_core.ik_mujoco import MAX_WAYPOINT_STEP_RAD, MuJoCoPlanner, PlanningError
+from desk_core.ik_tracik import TOOL_FRAME
+from desk_core.interfaces import SceneObstacle
+from desk_core.station_bridge import EStopLatched, MAX_ANGLE_STEP, LiveStationBridge, MockStationBridge, RobotState
+
+
+@pytest.fixture
+def scene(calib):
+    bridge = MockStationBridge(num_joints=8)
+    state = asyncio.run(bridge.get_state())
+
+    def planner(obstacles=(), limit=0.6, table_z=None):
+        return MuJoCoPlanner(calib.urdf_path(), calib.z_table() if table_z is None else table_z,
+                             list(obstacles), limit, calib.bounds_rad(state.motors))
+
+    return planner, bridge, np.asarray(calib.ticks_to_rad(state.motors))
+
+
+def test_fk_and_analytical_torque_match_reference_models(calib, scene):
+    make_planner, _, start = scene
+    planner = make_planner()
+    for q in (start, start + [0.2, -0.2, 0.12, -0.12, 0.15, -0.2, 0.3]):
+        position, rotation = planner.flange_pose(q)
+        expected = calib.fk_ee_pose(q, TOOL_FRAME)
+        np.testing.assert_allclose(position, expected[:3, 3], atol=1e-9)
+        np.testing.assert_allclose(rotation.as_matrix(), expected[:3, :3], atol=1e-9)
+        holding_torque = planner.shoulder_torque(q)
+        mujoco.mj_forward(planner.model, planner.data)
+        shoulder_dof = planner.model.jnt_dofadr[planner.shoulder]
+        assert holding_torque == pytest.approx(planner.data.qfrc_bias[shoulder_dof], abs=1e-9)
+
+
+@pytest.mark.parametrize("shape", ["cylinder", "box"])
+def test_rejects_swept_collision_with_clear_endpoints(scene, shape):
+    make_planner, _, q = scene
+    midpoint, _ = make_planner().flange_pose(q)
+    obstacle = SceneObstacle("sweep", shape, *midpoint, radius_m=0.03, height_m=0.04,
+                             size_xyz=(0.06, 0.06, 0.06))
+    planner = make_planner([obstacle])
+    start, goal = q.copy(), q.copy()
+    start[0], goal[0] = -0.4, 0.4
+    assert planner.plan_trajectory(start, start).peak_shoulder_torque_nm < 0.6
+    assert planner.plan_trajectory(goal, goal).peak_shoulder_torque_nm < 0.6
+    with pytest.raises(PlanningError, match=r"Waypoint \d+: Collision clearance violated: .*sweep"):
+        planner.plan_trajectory(start, goal)
+
+
+def test_table_collision_and_torque_limit_are_hard_constraints(scene):
+    make_planner, _, q = scene
+    with pytest.raises(PlanningError, match=r"Collision clearance violated: .*table"):
+        make_planner(table_z=0.22).plan_trajectory(q, q)
+    with pytest.raises(PlanningError, match="Shoulder torque"):
+        make_planner(limit=0.5).plan_trajectory(q, q)
+
+
+def test_ik_lift_tucks_elbow_and_wrist_before_shoulder(scene):
+    make_planner, _, start = scene
+    planner = make_planner()
+    target = start.copy()
+    target[1] -= 0.2
+    position, rotation = planner.flange_pose(target)
+    goal = planner.solve_ik(position, rotation.as_quat(), start)
+    actual_position, actual_rotation = planner.flange_pose(goal)
+    np.testing.assert_allclose(actual_position, position, atol=0.0005)
+    assert (actual_rotation * rotation.inv()).magnitude() < np.deg2rad(0.3)
+    plan = planner.plan_trajectory(start, goal)
+    assert 0 < plan.tuck_end < len(plan.waypoints) - 1
+    tuck = plan.waypoints[plan.tuck_end]
+    np.testing.assert_array_equal(plan.waypoints[:plan.tuck_end + 1, 1], start[1])
+    assert np.all(np.abs(tuck[2:4] - start[2:4]) > 0)
+    assert abs(planner.shoulder_torque(tuck)) < abs(planner.shoulder_torque(start))
+    assert np.max(np.abs(np.diff(plan.waypoints, axis=0))) <= MAX_WAYPOINT_STEP_RAD
+    assert plan.peak_shoulder_torque_nm <= 0.6
+
+
+def test_plan_and_move_preflights_before_sending_any_mock_targets(scene, monkeypatch):
+    make_planner, bridge, start = scene
+    monkeypatch.setattr(mcp_server, "_bridge", bridge)
+    monkeypatch.setattr(mcp_server, "_obstacles", {})
+    send = bridge.send_joint_targets
+    sent = []
+
+    async def track_targets(targets, max_step):
+        sent.append(targets)
+        return await send(targets, max_step)
+
+    monkeypatch.setattr(bridge, "send_joint_targets", track_targets)
+    target = start.copy()
+    target[1] -= 0.2
+    xyz, rotation = make_planner().flange_pose(target)
+    args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
+
+    async def run():
+        initial_ticks = (await bridge.get_state()).positions()
+        preview = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6)
+        assert preview["ok"] and not preview["executed"]
+        assert not sent
+        solution = await mcp_server.solve_ik(**args, shoulder_torque_limit_nm=0.6)
+        assert len(solution) == 7
+        await mcp_server.update_scene_obstacle("blocker", *xyz, radius_m=0.03, height_m=0.04)
+        blocked = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True)
+        assert not blocked["ok"] and not blocked["executed"]
+        assert "Collision" in blocked["problems"][0]
+        await mcp_server.update_scene_obstacle("blocker", *xyz, remove=True)
+        overloaded = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.5, execute=True)
+        assert not overloaded["ok"] and not overloaded["executed"]
+        assert "Shoulder torque" in overloaded["problems"][0]
+        assert not sent
+        assert (await bridge.get_state()).positions() == initial_ticks
+        moved = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True)
+        assert moved["ok"] and moved["executed"]
+        assert len(sent) == moved["waypoints"] - 1
+        tuck = moved["tuck_end_waypoint"]
+        assert tuck and all(command[2] == initial_ticks[2] for command in sent[:tuck])
+        assert sent[tuck - 1][3] != initial_ticks[3] and sent[tuck - 1][4] != initial_ticks[4]
+        assert sent[tuck][2] != initial_ticks[2]
+        assert (await bridge.get_state()).positions() == {**initial_ticks, **sent[-1]}
+
+    asyncio.run(run())
+
+
+@pytest.fixture
+def live_station(scene, calib, monkeypatch):
+    _, mock, _ = scene
+    motors = [replace(m) for m in asyncio.run(mock.get_state()).motors]
+    motors[-1].position = motors[-1].range_max
+    bus = calib.data["hardware"]["bus_serial"]
+    state = RobotState(bus, motors)
+    bridge = LiveStationBridge(target_bus=bus, follow_motor_rx=True)
+    bridge._torque_started = {m.id for m in motors[:-1]}
+    packets = []
+
+    async def get_state():
+        now = time.monotonic()
+        bridge._last_rx_mono = now
+        bridge.rx_received_at.update({(bus, m.id): now for m in motors})
+        return state
+
+    def sync_write(bus_serial, address, values):
+        assert bus_serial == bus
+        return {mid: int.from_bytes(value, "little") for mid, value in values.items()}
+
+    async def send_commands(client, commands):
+        packets.extend(commands)
+        for targets in commands:
+            for motor in motors:
+                if motor.id in targets:
+                    motor.position = targets[motor.id]
+
+    monkeypatch.setattr(bridge, "get_state", get_state)
+    monkeypatch.setattr(bridge, "_sync_write", sync_write)
+    monkeypatch.setattr(bridge, "_send_commands", send_commands)
+    monkeypatch.setattr(mcp_server, "_bridge", bridge)
+    monkeypatch.setattr(mcp_server, "_calib", calib)
+    monkeypatch.setattr(mcp_server, "_obstacles", {})
+    return bridge, state, packets
+
+
+def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_station, calib, monkeypatch):
+    bridge, state, packets = live_station
+    monkeypatch.setitem(calib.data["joint_signs"], "2", -1)
+    monkeypatch.setitem(calib.data["joint_zero_ticks"], "2", 2057)
+    planner = mcp_server._mujoco_planner(state, [], 0.6)
+    start = np.asarray(calib.ticks_to_rad(state.motors))
+    target = start.copy()
+    target[1] -= 0.2
+    xyz, rotation = planner.flange_pose(target)
+    args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
+    send = bridge._send_commands
+    shoulder_loaded = False
+    retained_targets = {}
+    last_segment = None
+    checked_residual = False
+    validate_segment = MuJoCoPlanner.validate_segment
+
+    def record_segment(self, start, goal):
+        nonlocal last_segment
+        last_segment = (start, goal)
+        return validate_segment(self, start, goal)
+
+    async def send_with_shoulder_sag(client, commands):
+        nonlocal shoulder_loaded, checked_residual
+        before = state.positions()
+        assert all(sum(tick != before[mid] for mid, tick in command.items()) <= 1 for command in commands)
+        for command in commands:
+            retained_targets.update(command)
+            segment_start, segment_goal = last_segment
+            assert segment_start.tolist() == calib.ticks_to_rad(state.motors)
+            assert calib.rad_to_ticks(segment_goal.tolist(), state.motors) == retained_targets
+            checked_residual |= 2 not in command and before[2] != retained_targets[2]
+        previous = state.positions()[2]
+        await send(client, commands)
+        shoulder_loaded |= state.motors[1].position > previous
+        if shoulder_loaded and any(2 in command for command in commands):
+            state.motors[1].position -= 1
+
+    monkeypatch.setattr(bridge, "_send_commands", send_with_shoulder_sag)
+    monkeypatch.setattr(MuJoCoPlanner, "validate_segment", record_segment)
+
+    async def run():
+        start_ticks = state.positions()
+        await mcp_server.update_scene_obstacle("blocker", *xyz, radius_m=0.03, height_m=0.04)
+        blocked = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True)
+        assert not blocked["ok"] and "Collision" in blocked["problems"][0]
+        await mcp_server.update_scene_obstacle("blocker", *xyz, remove=True)
+        overloaded = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.5, execute=True)
+        assert not overloaded["ok"] and "Shoulder torque" in overloaded["problems"][0]
+        assert not packets and state.positions() == start_ticks
+        moved = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True)
+        assert moved["ok"] and moved["executed"]
+        assert len(packets) == moved["waypoints"] - 1
+        assert all(8 not in target for target in packets)
+        assert all(len(target) == 1 for target in packets[1:])
+        assert checked_residual
+        assert state.positions()[2] > start_ticks[2]
+        planned = calib.rad_to_ticks(moved["joints_rad"], state.motors)
+        assert state.positions()[2] == planned[2] - 1
+        assert calib.ticks_to_rad(state.motors) == moved["measured_joints_rad"]
+
+    asyncio.run(run())
+
+
+def test_live_bridge_refuses_pose_drift_and_clamping_before_writing(live_station):
+    bridge, state, packets = live_station
+    snapshot = replace(state, motors=[replace(m) for m in state.motors])
+
+    async def run():
+        await bridge.get_state()
+        with pytest.raises(RuntimeError, match="exact preflighted waypoint"):
+            await bridge.send_joint_targets({1: 2500}, max_step=5, preflight_start=snapshot)
+        state.motors[-1].position -= 1
+        with pytest.raises(RuntimeError, match="no longer matches"):
+            await bridge.send_joint_targets({1: 2050}, preflight_start=snapshot)
+        assert not packets
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("step_ticks", [2, 5])
+def test_live_waypoint_within_tolerance_still_requires_progress(live_station, step_ticks):
+    bridge, state, _ = live_station
+    start = state.positions()[2]
+    target = {2: start + step_ticks}
+
+    async def run():
+        assert await bridge.wait_preflight_settle(target, 15, moving_from={2: start}, timeout_s=0.2) is None
+        state.motors[1].position = target[2] - 1
+        assert await bridge.wait_preflight_settle(target, 15, moving_from={2: start}, timeout_s=0.2) is state
+
+    asyncio.run(run())
+
+
+def test_live_waypoint_one_tick_short_can_settle_without_progress(live_station):
+    bridge, state, _ = live_station
+    start = state.positions()[2]
+    settled = asyncio.run(bridge.wait_preflight_settle({2: start + 1}, 15, moving_from={2: start}, timeout_s=0.2))
+    assert settled is state
+    assert settled.positions()[2] == start
+
+
+@pytest.mark.parametrize("write_uncertain", [False, True])
+def test_live_failure_replaces_active_target_with_present_position(live_station, calib, monkeypatch, write_uncertain):
+    bridge, state, packets = live_station
+    planner = mcp_server._mujoco_planner(state, [], 0.6)
+    goal = np.asarray(calib.ticks_to_rad(state.motors))
+    goal[1] -= 0.2
+    xyz, rotation = planner.flange_pose(goal)
+    args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
+
+    async def stall(targets, tol_ticks, *, moving_from):
+        state.motors[2].position -= 1
+        return None
+
+    send = bridge._send_commands
+
+    async def lose_confirmation(client, commands):
+        await send(client, commands)
+        if len(packets) == 1:
+            state.motors[2].position -= 1
+            raise ConnectionError("write acknowledgement lost")
+
+    if write_uncertain:
+        monkeypatch.setattr(bridge, "_send_commands", lose_confirmation)
+    else:
+        monkeypatch.setattr(bridge, "wait_preflight_settle", stall)
+    result = asyncio.run(mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True))
+    assert not result["ok"] and result["executed"] is not write_uncertain
+    assert result["hold"]["mode"] == "hold"
+    assert len(packets) == 2
+    assert packets[1][3] == packets[0][3] - 1
+    assert packets[1] == state.positions()
+
+    async def frame(camera, denoise):
+        return b""
+
+    monkeypatch.setattr(bridge, "get_frame", frame)
+    monkeypatch.setattr(mcp_server._robo_jev, "evaluate", lambda **kwargs: {"ok": True})
+
+    async def check_latch():
+        assert (await mcp_server.robo_jev_guard())["ok"]
+        with pytest.raises(EStopLatched):
+            await bridge.send_joint_targets({1: state.positions()[1]})
+        assert len(packets) == 2
+
+    asyncio.run(check_latch())
+
+
+def test_live_gripper_models_open_tolerance(live_station, calib):
+    bridge, state, _ = live_station
+    state.motors[-1].position -= 25
+
+    async def run():
+        assert (await mcp_server.release())["ok"]
+        snapshot = mcp_server._live_preflight_state(bridge, await bridge.get_state())
+        position = np.asarray(calib.ticks_to_rad(snapshot.motors))
+        open_model = mcp_server._mujoco_planner(snapshot, [], 0.6)
+        gripper = snapshot.motors[-1]
+        measured_model = mcp_server._mujoco_planner(snapshot, [], 0.6, gripper.to_norm())
+
+        def jaw_gap(model):
+            _, rotation = model.flange_pose(position)
+            slide_axis = np.array([-0.999697, 0.0173, 0.017525])
+            axis = rotation.apply(slide_axis / np.linalg.norm(slide_axis))
+            jaw_01 = model.data.body("Gripper_Jaw_01_v1_1").xpos
+            jaw_02 = model.data.body("Gripper_Jaw_02_v1_1").xpos
+            return np.dot(jaw_02 - jaw_01, axis)
+
+        expected_gap_reduction = 2 * 0.0115 * 2.2028 * 25 / (gripper.range_max - gripper.range_min)
+        assert jaw_gap(open_model) - jaw_gap(measured_model) == pytest.approx(expected_gap_reduction, abs=1e-8)
+        state.motors[-1].position -= 1
+        with pytest.raises(PlanningError, match="open calibrated gripper"):
+            mcp_server._live_preflight_state(bridge, await bridge.get_state())
+
+    asyncio.run(run())
+
+
+def test_live_preview_uses_same_fallback_ranges_as_execution(live_station, calib):
+    bridge, state, packets = live_station
+    bridge._elrobot_range_bus = state.bus_serial
+    goal = np.asarray(calib.ticks_to_rad(state.motors))
+    goal[1] -= 0.2
+    xyz, rotation = mcp_server._mujoco_planner(state, [], 0.6).flange_pose(goal)
+    args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
+    for motor in state.motors:
+        motor.range_min, motor.range_max = 0, MAX_ANGLE_STEP
+
+    async def run():
+        preview = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6)
+        assert preview["ok"] and not preview["executed"] and not packets
+        result = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True)
+        assert result["ok"] and result["executed"]
+        assert preview["joints_rad"] == result["joints_rad"]
+        assert preview["waypoints"] == result["waypoints"]
+
+    asyncio.run(run())

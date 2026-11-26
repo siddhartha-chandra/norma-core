@@ -60,6 +60,7 @@ FULL_STATE_LEN = 0x47
 GRIPPER_SLACK_STEPS = 120
 GRIPPER_CONTACT_CURRENT_MA = 20
 RAW_RX_MAX_AGE_S = 0.5
+PREFLIGHT_DEADBAND_TICKS = 1
 DEFAULT_MAX_STEP = int(os.environ.get("ROBOT_MAX_STEP_TICKS", "400"))
 DEFAULT_SPEED = int(os.environ.get("ROBOT_GOAL_SPEED", "600"))
 DEFAULT_ACCEL = int(os.environ.get("ROBOT_GOAL_ACCEL", "20"))
@@ -164,6 +165,10 @@ class RobotState:
 
 class EStopLatched(RuntimeError):
     """A motion command was issued while E-STOP is latched; call `rearm()` (via `observe()`) first."""
+
+
+class PreflightWriteUncertain(RuntimeError):
+    """Station did not confirm whether a preflighted target was sent."""
 
 
 @runtime_checkable
@@ -1177,7 +1182,8 @@ class LiveStationBridge:
             return ELROBOT_MOTOR_RANGES[motor.id]
         return 0, MAX_ANGLE_STEP
 
-    async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP) -> dict[int, int]:
+    async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP, *,
+                                 preflight_start: RobotState | None = None) -> dict[int, int]:
         if self._aborted:
             raise EStopLatched("E-STOP latched: call observe() before moving")
         if hasattr(self.client, "read_from_tail"):
@@ -1192,6 +1198,14 @@ class LiveStationBridge:
         by_id = {m.id: m for m in st.motors}
         applied: dict[int, int] = {}
         self._require_fresh_motor_rx(st, targets)
+        if preflight_start is not None:
+            self._require_fresh_motor_rx(st, preflight_start.positions())
+            actual_ranges = {m.id: self._effective_motor_range(st.bus_serial, m) for m in st.motors}
+            if (st.bus_serial != preflight_start.bus_serial or st.positions() != preflight_start.positions()
+                    or actual_ranges != preflight_start.ranges() or any(m.error_status for m in st.motors)):
+                raise RuntimeError("Station no longer matches the preflighted starting state")
+            if not targets.keys() <= self._torque_started:
+                raise RuntimeError("Enable arm torque before executing a preflighted move")
 
         for raw_mid, raw_tgt in targets.items():
             mid = int(raw_mid)
@@ -1210,6 +1224,8 @@ class LiveStationBridge:
                 raise RuntimeError(f"Motor {mid} cannot enter its calibrated range within one safe step")
             applied[mid] = stepped
 
+        if preflight_start is not None and (self._aborted or applied != targets):
+            raise RuntimeError("Station cannot send the exact preflighted waypoint")
         if applied:
             need_start = [mid for mid in applied if mid not in self._torque_started]
             if need_start:
@@ -1219,7 +1235,12 @@ class LiveStationBridge:
                 RAM_GOAL_POSITION,
                 {mid: val.to_bytes(2, "little") for mid, val in applied.items()},
             )
-            await self._send_commands(self.client, [cmd])
+            try:
+                await self._send_commands(self.client, [cmd])
+            except Exception as exc:
+                if preflight_start is None:
+                    raise
+                raise PreflightWriteUncertain(f"Station waypoint write unconfirmed: {exc}") from exc
         return applied
 
     async def wait_settle(self, targets: dict[int, int], tol_ticks: int = 25, timeout_s: float = 3.0) -> bool:
@@ -1231,6 +1252,28 @@ class LiveStationBridge:
                 return True
             await asyncio.sleep(0.08)
         return False
+
+    async def wait_preflight_settle(self, targets: dict[int, int], tol_ticks: int, *,
+                                    moving_from: dict[int, int], timeout_s: float = 3.0) -> RobotState | None:
+        deadline = time.monotonic() + timeout_s
+        previous = None
+        while time.monotonic() < deadline and not self._aborted:
+            state = await self.get_state()
+            self._require_fresh_motor_rx(state, targets)
+            pos = state.positions()
+            samples = {mid: self.rx_received_at[(state.bus_serial, mid)] for mid in targets}
+            if (all(mid in pos and abs(pos[mid] - tick) <= tol_ticks for mid, tick in targets.items())
+                    and all(abs(pos[mid] - targets[mid]) <= PREFLIGHT_DEADBAND_TICKS
+                            or abs(pos[mid] - targets[mid]) < abs(start - targets[mid])
+                            for mid, start in moving_from.items())):
+                if previous is None or previous[0] != pos:
+                    previous = (pos, samples)
+                elif all(stamp > previous[1][mid] for mid, stamp in samples.items()):
+                    return state
+            else:
+                previous = None
+            await asyncio.sleep(0.08)
+        return None
 
     ### 7. Verify grip after bounded closing steps
     ## added by Abhi

@@ -23,7 +23,7 @@ import io
 import json
 import os
 import time
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -41,7 +41,8 @@ from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
 from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
-from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, MockStationBridge, StationBridge, create_bridge
+from .station_bridge import (DEFAULT_MAX_STEP, MAX_ANGLE_STEP, REPO_ROOT, LiveStationBridge, MockStationBridge,
+                             PreflightWriteUncertain, RobotState, StationBridge, create_bridge)
 from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
 from .vision_3d import localize_object_3d
@@ -275,6 +276,9 @@ async def grasp(close_ticks: int | None = None) -> dict:
 
 ### 7 and 8. Open the gripper before the pick and during placement
 # Existing MCP tool
+GRIPPER_OPEN_TOL_TICKS = 25
+
+
 @mcp.tool()
 @_traced
 @_motion_tool
@@ -296,7 +300,7 @@ async def release() -> dict:
         motor = next((m for m in state.motors if m.id == gripper_id), None)
         if state.bus_serial != st.bus_serial or motor is None or motor.error_status:
             return {**result, "reason": "Gripper telemetry changed while opening"}
-        if abs(motor.position - target_open) <= 25:
+        if abs(motor.position - target_open) <= GRIPPER_OPEN_TOL_TICKS:
             released = bridge.release_mock_object() if hasattr(bridge, "release_mock_object") else None
             return {**result, "ok": True, "released": True, "released_object": released}
         before = motor.position
@@ -542,6 +546,21 @@ async def get_frame(
     return [json.dumps(meta), Image(data=jpeg, format="jpeg")]
 
 
+def _mujoco_planner(st: RobotState, obstacles: list[SceneObstacle], shoulder_torque_limit_nm: float,
+                    gripper_open_fraction: float = 1.0):
+    from .ik_mujoco import MuJoCoPlanner, PlanningError
+    from .urdf_fk import DEFAULT_ARM_JOINTS
+
+    if (_calib.world_frame() != "base_link" or tuple(_calib.joint_names()) != DEFAULT_ARM_JOINTS
+            or _calib.num_arm_joints(len(st.motors)) != len(DEFAULT_ARM_JOINTS)
+            or len(st.motors) != 8 or [m.id for m in st.motors] != list(range(1, 9))):
+        raise PlanningError("MuJoCo requires the calibrated seven-joint ElRobot model")
+    if any(not m.range_min <= m.position <= m.range_max or m.range_max <= m.range_min for m in st.motors):
+        raise PlanningError("Invalid calibrated motor ranges or current ticks")
+    return MuJoCoPlanner(_calib.urdf_path(), _calib.z_table(), obstacles, shoulder_torque_limit_nm,
+                         _calib.bounds_rad(st.motors), gripper_open_fraction)
+
+
 ### 6. Solve the flange pose with the configured IK backend
 # Existing MCP tool
 @mcp.tool()
@@ -555,13 +574,22 @@ async def solve_ik(
     qz: float = 0.0,
     qw: float = 1.0,
     seed_joints_rad: list[float] | None = None,
+    shoulder_torque_limit_nm: float | None = None,
 ) -> list[float]:
-    """Solve IK for a metric target pose with an xyzw quaternion."""
+    """Solve a metric flange pose (xyzw). Supply a shoulder torque limit to use MuJoCo IK."""
     bridge = await _get_bridge()
     st = await bridge.get_state()
     ## added by Abhi
     if seed_joints_rad is None:
         seed_joints_rad = _calib.ticks_to_rad(st.motors)
+    if shoulder_torque_limit_nm is not None:
+        obstacles = list(_obstacles.values())
+
+        def solve_in_sim() -> list[float]:
+            planner = _mujoco_planner(st, obstacles, shoulder_torque_limit_nm)
+            return planner.solve_ik([x, y, z], [qx, qy, qz, qw], seed_joints_rad).tolist()
+
+        return await asyncio.to_thread(solve_in_sim)
     n_arm = _calib.num_arm_joints(len(st.motors))
     valid_bounds = all(m.range_max > m.range_min and m.range_min <= m.position <= m.range_max for m in st.motors[:n_arm])
     return await asyncio.to_thread(
@@ -764,6 +792,7 @@ async def update_scene_obstacle(
     radius_m: float = 0.045,
     height_m: float = 0.10,
     remove: bool = False,
+    size_xyz: tuple[float, float, float] | None = None,
 ) -> dict:
     """Register or remove a 3D obstacle (e.g. mug, departure_tray) for IK/planner collision checks."""
     if remove:
@@ -771,7 +800,7 @@ async def update_scene_obstacle(
     else:
         _obstacles[name] = SceneObstacle(
             name=name, shape=shape, x=float(x), y=float(y), z=float(z),
-            radius_m=float(radius_m), height_m=float(height_m),
+            radius_m=float(radius_m), height_m=float(height_m), size_xyz=size_xyz,
         )
     return {"obstacles": sorted(_obstacles.keys())}
 
@@ -812,6 +841,172 @@ async def reload_config() -> dict:
 # =============================================================================
 # 4. Composite Execution Tools & Declarative Pipeline Runner
 # =============================================================================
+
+
+def _live_preflight_state(bridge: LiveStationBridge, state: RobotState) -> RobotState:
+    from .ik_mujoco import PlanningError
+
+    hardware = _calib.data.get("hardware") or {}
+    bus = hardware.get("bus_serial")
+    if not (_calib.data.get("calibrated") and _calib.data.get("arm_type") == "elrobot"
+            and bus and bus == bridge.target_bus == state.bus_serial):
+        raise PlanningError("Live preflight requires the bus named in the calibrated ElRobot rig")
+    if not bridge._follow_motor_rx:
+        raise PlanningError("Live preflight requires fresh raw motor telemetry")
+    for name, low, high in (("joint_signs", -1, 1), ("joint_zero_ticks", 0, MAX_ANGLE_STEP)):
+        values = _calib.data.get(name)
+        if isinstance(values, dict):
+            values = [values.get(str(mid)) for mid in range(1, 8)]
+        if not isinstance(values, list) or len(values) < 7 or any(
+            not isinstance(v, (int, float)) or not low <= v <= high or (name == "joint_signs" and abs(v) != 1)
+            for v in values[:7]
+        ):
+            raise PlanningError(f"Explicit calibrated {name} required for all arm joints")
+    if "z_table" not in _calib.data:
+        raise PlanningError("Live preflight requires a calibrated table height")
+    motors = []
+    for m in state.motors:
+        lo, hi = bridge._effective_motor_range(state.bus_serial, m)
+        if m.error_status or (lo, hi) == (0, MAX_ANGLE_STEP):
+            raise PlanningError(f"Motor {m.id} is faulted or lacks a calibrated range")
+        motors.append(replace(m, range_min=lo, range_max=hi))
+    gripper = _calib.data.get("gripper") or {}
+    if (not motors or gripper.get("motor_id") != 8 or motors[-1].id != 8
+            or gripper.get("open_ticks") != motors[-1].range_max
+            or abs(motors[-1].position - motors[-1].range_max) > GRIPPER_OPEN_TOL_TICKS):
+        raise PlanningError("Live preflight requires an open calibrated gripper; payloads are not modeled")
+    bridge._require_fresh_motor_rx(state, state.positions())
+    return replace(state, motors=motors)
+
+
+@mcp.tool()
+@_traced
+@_motion_tool
+async def plan_and_move(
+    x: float,
+    y: float,
+    z: float,
+    shoulder_torque_limit_nm: float,
+    qx: float = 0.0,
+    qy: float = 0.0,
+    qz: float = 0.0,
+    qw: float = 1.0,
+    execute: bool = False,
+) -> dict:
+    """Preflight a flange pose in MuJoCo. Live execution requires aligned, unloaded ElRobot hardware."""
+    from .ik_mujoco import PlanningError
+    from .motion import FLANGE_SETTLE_TOL_TICKS
+
+    bridge = await _get_bridge()
+    live = isinstance(bridge, LiveStationBridge)
+    if execute and not (live or isinstance(bridge, MockStationBridge)):
+        return {"ok": False, "executed": False, "problems": ["Unsupported Station bridge"]}
+    if isinstance(bridge, MockStationBridge) and bridge.get_mock_scene_state()["held_object"]:
+        return {"ok": False, "executed": False, "problems": ["Payloads are not modeled by the shoulder torque guard"]}
+    st = await bridge.get_state()
+    if live:
+        try:
+            st = _live_preflight_state(bridge, st)
+        except (PlanningError, RuntimeError) as exc:
+            return {"ok": False, "executed": False, "problems": [str(exc)]}
+    initial_ticks = st.positions()
+    motors = [replace(m) for m in st.motors]
+    obstacles = list(_obstacles.values())
+
+    def preflight():
+        fraction = motors[-1].to_norm() if live else 1.0
+        planner = _mujoco_planner(replace(st, motors=motors), obstacles, shoulder_torque_limit_nm, fraction)
+        start = np.asarray(_calib.ticks_to_rad(motors))
+        goal = planner.solve_ik([x, y, z], [qx, qy, qz, qw], start)
+
+        def quantize(q):
+            ticks = _calib.rad_to_ticks(q.tolist(), motors)
+            return np.asarray(_calib.ticks_to_rad([replace(m, position=ticks.get(m.id, m.position)) for m in motors]))
+
+        plan = planner.plan_trajectory(start, goal, quantize, sequential=live)
+        targets = [_calib.rad_to_ticks(q.tolist(), motors) for q in plan.waypoints]
+        if any(abs(second[mid] - tick) > DEFAULT_MAX_STEP for first, second in zip(targets, targets[1:])
+               for mid, tick in first.items()):
+            raise PlanningError("Preflight path exceeds Station's per-command step limit")
+        return planner, plan, targets
+
+    try:
+        planner, plan, targets = await asyncio.to_thread(preflight)
+    except PlanningError as exc:
+        return {"ok": False, "executed": False, "problems": [str(exc)]}
+    result = {"ok": True, "executed": False, "waypoints": len(targets),
+              "tuck_end_waypoint": plan.tuck_end, "peak_shoulder_torque_nm": plan.peak_shoulder_torque_nm,
+              "joints_rad": plan.waypoints[-1].tolist()}
+    if not execute:
+        return result
+    current = await bridge.get_state()
+    if current.bus_serial != st.bus_serial or current.positions() != initial_ticks or list(_obstacles.values()) != obstacles:
+        return {"ok": False, "executed": False, "problems": ["Start pose or obstacles changed during preflight"]}
+
+    async def stop_motion(problem: str, *, write_uncertain: bool = False) -> dict:
+        result.update(ok=False, problems=[problem])
+        if result["executed"] or write_uncertain:
+            try:
+                result["hold"] = await bridge.abort()
+            except Exception as exc:
+                result["problems"].append(f"Station hold failed: {exc}")
+        return result
+
+    expected = replace(st, motors=motors)
+    measured = plan.waypoints[0]
+    for index, planned_target in enumerate(targets[1:], start=1):
+        target = planned_target
+        try:
+            if live:
+                if plan.tuck_end is not None and index == plan.tuck_end + 1:
+                    initial = plan.waypoints[0]
+                    if (np.any(np.abs(measured[2:4] - initial[2:4]) < 1e-6)
+                            or abs(planner.shoulder_torque(measured)) >= abs(planner.shoulder_torque(initial))):
+                        raise PlanningError("Measured elbow/wrist tuck did not reduce shoulder torque")
+                axis, = np.flatnonzero(plan.waypoints[index] != plan.waypoints[index - 1])
+                mid = expected.motors[axis].id
+                peak = planner.validate_segment(measured, plan.waypoints[index])
+                result["peak_shoulder_torque_nm"] = max(peak, result["peak_shoulder_torque_nm"])
+                if index > 1:
+                    target = {mid: planned_target[mid]}
+                applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP, preflight_start=expected)
+            else:
+                applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP)
+        except PreflightWriteUncertain as exc:
+            return await stop_motion(str(exc), write_uncertain=True)
+        except (PlanningError, RuntimeError) as exc:
+            return await stop_motion(str(exc))
+        result["executed"] = True
+        if applied != target:
+            return await stop_motion("Station did not apply the preflighted waypoint")
+        if live:
+            try:
+                settled = await bridge.wait_preflight_settle(
+                    planned_target, tol_ticks=FLANGE_SETTLE_TOL_TICKS, moving_from={mid: expected.motors[axis].position}
+                )
+            except RuntimeError as exc:
+                return await stop_motion(str(exc))
+            if settled is None:
+                return await stop_motion("Station did not settle near the preflighted waypoint")
+            positions = settled.positions()
+            if (settled.bus_serial != expected.bus_serial or positions.keys() != expected.positions().keys()
+                    or positions[8] != initial_ticks[8]):
+                return await stop_motion("Station bus, motor inventory or gripper changed during execution")
+            expected = replace(expected, motors=[replace(m, position=positions[m.id]) for m in expected.motors])
+            measured = np.asarray(_calib.ticks_to_rad(expected.motors))
+            try:
+                torque = planner.validate_segment(measured, measured)
+            except PlanningError as exc:
+                return await stop_motion(str(exc))
+            result["peak_shoulder_torque_nm"] = max(torque, result["peak_shoulder_torque_nm"])
+    if live:
+        result["measured_joints_rad"] = measured.tolist()
+        final = expected.positions()
+        if any(abs(final[mid] - tick) > FLANGE_SETTLE_TOL_TICKS for mid, tick in targets[-1].items()):
+            return await stop_motion("Station did not finish within the planned joint tolerance")
+    if isinstance(bridge, MockStationBridge):
+        bridge.set_mock_ee_pose(*planner.flange_pose(plan.waypoints[-1])[0])
+    return result
 
 
 ### 7 and 8. Move to a flange pose through the configured IK backend
@@ -1431,6 +1626,7 @@ _SEQ_TOOLS = {
     "move_to_home": move_to_home,
     "estop": estop,
     "move_to_pose": move_to_pose,
+    "plan_and_move": plan_and_move,
     "move_flange": move_flange,
     "pick_at": pick_at,
     "place_at": place_at,
