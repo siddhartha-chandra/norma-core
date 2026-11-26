@@ -35,7 +35,7 @@ from dotenv import dotenv_values
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from PIL import Image as PILImage
-from pydantic import TypeAdapter
+from pydantic import StrictBool, TypeAdapter
 
 from .calib_store import CalibrationStore, TICKS_PER_RAD
 from .hive import HIVE_SHAPE, POSITION_TOL_M, Layout, Obstacle, Tile, plan_hive
@@ -912,7 +912,7 @@ async def sweep_aside(
     start_xy: tuple[float, float],
     end_xy: tuple[float, float],
     z_mm: float,
-    execute: bool = False,
+    execute: StrictBool = False,
     shoulder_torque_limit_nm: float = 0.6,
 ) -> dict:
     """Push a pen or marker sideways with the open gripper, without grasping it.
@@ -923,6 +923,9 @@ async def sweep_aside(
     other than the intended push target. Preview with execute=False (default),
     then execute with an empty open gripper and re-observe the object's location.
     """
+    if type(execute) is not bool:
+        return {"ok": False, "executed": False, "problems": ["execute must be a JSON boolean"]}
+
     from scipy.spatial.transform import Rotation
 
     from .ik_mujoco import CONTACT_MARGIN_M, JointPlan, PlanningError

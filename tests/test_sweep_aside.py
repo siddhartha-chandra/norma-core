@@ -150,6 +150,18 @@ def test_sweep_aside_previews_and_rejects_a_blocked_route_before_writes(monkeypa
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("execute", ["false", "true", 1])
+def test_sequence_rejects_non_boolean_sweep_execution_flag(execute, monkeypatch):
+    async def no_bridge():
+        pytest.fail("Malformed execute flag must be rejected before connecting")
+
+    monkeypatch.setattr(mcp_server, "_get_bridge", no_bridge)
+    args = {"start_xy": [-0.064, 0.205], "end_xy": [0.063, 0.205], "z_mm": 6, "execute": execute}
+    result = asyncio.run(mcp_server.execute_sequence([{"tool": "sweep_aside", "args": args}]))
+    assert not result["ok"] and result["failed_step"] == 0
+    assert "execute must be a JSON boolean" in str(result)
+
+
 def test_sweep_aside_moves_two_rolling_markers_into_side_zone(calib, monkeypatch):
     markers = [
         ("blue", -0.008, 0.205, 13, (0.1, 0.35, 0.95)),
