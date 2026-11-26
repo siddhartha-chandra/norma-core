@@ -6,7 +6,37 @@ import pytest
 
 from desk_core import mcp_server as srv
 from desk_core.calib_store import CalibrationStore
-from desk_core.robo_jev import RoboJevGatekeeper
+from desk_core.interfaces import SceneObstacle
+from desk_core.robo_jev import RoboJevGatekeeper, guarded_recover
+
+
+def test_recovery_rechecks_interrupted_path_without_caller_coordinates(calib, mock_bridge):
+    gatekeeper = RoboJevGatekeeper()
+    goal = (0.30, 0.0)
+    obstacles = []
+
+    async def simulate():
+        state = await mock_bridge.get_state()
+        start = calib.fk_ee_pose(calib.ticks_to_rad(state.motors))[:2, 3]
+        x, y = (start + goal) / 2
+        obstacles[:] = [SceneObstacle("mug", x=x, y=y, radius_m=0.04)]
+        gatekeeper.interruption = {**gatekeeper.evaluate(obstacles=obstacles, target_xy=goal, start_xy=start),
+                                   "target_xy": list(goal)}
+        await mock_bridge.abort(source="reflex")
+
+        async def recover():
+            return await guarded_recover(gatekeeper, mock_bridge, calib, obstacles_fn=lambda: obstacles,
+                                         obstacle_wait_timeout_s=0.03, poll_interval_s=0.01)
+
+        blocked = await recover()
+        assert not blocked["ok"] and blocked["reason"] == "obstacle_timeout", blocked
+        assert mock_bridge.abort_source == "reflex"
+        obstacles[:] = [SceneObstacle("mug", x=goal[0], y=goal[1] + 0.35, radius_m=0.04)]
+        recovered = await recover()
+        assert recovered["ok"] and recovered["target_xy"] == list(goal), recovered
+        assert mock_bridge.abort_source is None
+
+    asyncio.run(simulate())
 
 
 @pytest.mark.parametrize("trigger_camera", ["top", "wrist"])

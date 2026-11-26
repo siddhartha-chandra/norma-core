@@ -371,6 +371,7 @@ class ReflexMonitor:
                 except Exception:
                     report = {"ok": False, "reason": "reflex_camera_unavailable", "target_shifted": False}
                 if report is not None:
+                    report["target_xy"] = list(self.target_xy) if self.target_xy is not None else None
                     self.report = self.gatekeeper.interruption = report
                     report["abort_result"] = await self.bridge.abort(source="reflex")
                     report["total_roundtrip_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
@@ -441,6 +442,13 @@ async def guarded_recover(
         return list(obstacles_fn()) if callable(obstacles_fn) else list(obstacles_fn or [])
 
     pending = gatekeeper.interruption
+    start_xy = (0.15, 0.0)
+    if pending:
+        if pending.get("target_xy") is not None:
+            target_xy = tuple(pending["target_xy"])
+        if target_xy is not None:
+            motors = (await bridge.get_state()).motors
+            start_xy = tuple(calib.fk_ee_pose(calib.ticks_to_rad(motors))[:2, 3])
     if pending and pending["target_shifted"]:
         camera = "top" if gatekeeper.watch is not None else pending["camera"]
         if watch := gatekeeper.watches.get(camera):
@@ -452,6 +460,7 @@ async def guarded_recover(
         calib=calib,
         obstacles=_get_obs(),
         target_xy=target_xy,
+        start_xy=start_xy,
         camera=camera,
     )
 
@@ -462,7 +471,9 @@ async def guarded_recover(
         return {"ok": False, "action": "halted", "reason": "manual_estop", "report": report}
 
     if report["ok"] and not (pending and pending["target_shifted"]):
-        if _can_rearm() and (target_xy is not None or not _get_obs()):
+        if _can_rearm():
+            if target_xy is None and _get_obs():
+                return {"ok": False, "action": "halted", "reason": "recovery_target_required", "report": report}
             bridge.rearm()
             gatekeeper.interruption = None
         return {"ok": True, "action": "proceed", "target_xy": list(target_xy) if target_xy else None, "report": report}
@@ -484,6 +495,7 @@ async def guarded_recover(
                 calib=calib,
                 obstacles=_get_obs(),
                 target_xy=target_xy,
+                start_xy=start_xy,
                 camera=camera,
             )
             if rep_retry["ok"]:
