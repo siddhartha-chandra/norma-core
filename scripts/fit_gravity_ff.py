@@ -83,7 +83,7 @@ async def main(args):
     calib = CalibrationStore()
     hw = calib.hardware_config()
     bridge = LiveStationBridge(host=args.host, port=args.port, target_bus=hw["bus_serial"],
-                               cam_top=hw["camera_top"], cam_wrist=hw["camera_wrist"])
+                               cam_top=hw["camera_top"], cam_wrist=hw["camera_wrist"], follow_motor_rx=True)
     await bridge.connect()
     await asyncio.sleep(2.0)
     motors = (await bridge.get_state()).motors
@@ -105,11 +105,14 @@ async def main(args):
             continue
         duration = max(2.0, 1.875 * float(np.abs(q - q_prev).max()) / np.radians(15.0))
         run = await stream_joint_path(bridge, calib, path, duration, limits, gravity_ff=False)
-        if not run["ok"]:
+        if not run["ok"] and run.get("settled") is not False:  # an unsettled endpoint is the sag being fitted
             print("aborted:", run)
             return
         await asyncio.sleep(HOLD_S)
         state = await bridge.get_state()
+        if state.link_age_ms is None or state.link_age_ms > 500:
+            print(f"aborted: stale motor telemetry ({state.link_age_ms} ms old)")
+            return
         reached = np.array(calib.ticks_to_rad(state.motors))
         shortfall = q - reached
         samples.append({"goal": q.tolist(), "reached": reached.tolist(), "torque": gravity_torque(reached).tolist(),

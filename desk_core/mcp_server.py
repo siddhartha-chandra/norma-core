@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
-from dotenv import dotenv_values
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from PIL import Image as PILImage
@@ -54,11 +53,6 @@ from .wrist_ibvs import MAX_ROLL_STEP_RAD, MAX_START_ERROR_M, PERIOD_S, TIMEOUT_
 if TYPE_CHECKING:
     from .ik_mujoco import JointPlan, MuJoCoPlanner
     from .main_control import MainControl
-
-if os.environ.get("DESK_NO_DOTENV") != "1":
-    for _k, _v in dotenv_values(REPO_ROOT / ".env").items():
-        if _v is not None and not os.environ.get(_k, "").strip():
-            os.environ[_k] = _v
 
 _bridge: StationBridge | None = None
 _connect_lock = asyncio.Lock()
@@ -98,7 +92,7 @@ def _traced(fn):
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
-        if _logger is None:
+        if _logger is None or kwargs.get("log_frame") is False:
             return await fn(*args, **kwargs)
         t0 = time.perf_counter()
         call_args = dict(kwargs)
@@ -151,10 +145,14 @@ async def _get_bridge() -> StationBridge:
             raise RuntimeError("desk-core: Station still unreachable, retry in a few seconds.")
         ## added by Abhi
         bridge = create_bridge(follow_motor_rx=True)
+        tasks_before = asyncio.all_tasks()
         try:
             await bridge.connect()
         except Exception as exc:
             _connect_cooldown_until = time.monotonic() + 5.0
+            for task in asyncio.all_tasks() - tasks_before:
+                if getattr(task.get_coro(), "__qualname__", "").endswith("manage_connection"):
+                    task.cancel()
             mode = "mock" if (os.environ.get("DESK_MOCK") == "1" or not os.environ.get("STATION_HOST", "").strip()) else "live"
             raise RuntimeError(f"desk-core: {mode} bridge connect failed: {exc}") from exc
         _bridge = bridge
@@ -377,7 +375,7 @@ async def go_home(look_at_table: bool = True) -> dict:
     settled = False
     for _ in range(10):
         applied = await bridge.send_joint_targets(targets, max_step=300)
-        settled = await bridge.wait_settle(applied, tol_ticks=40, timeout_s=2.0)
+        await bridge.wait_settle(applied, tol_ticks=40, timeout_s=2.0)
         cur = {m.id: m.position for m in (await bridge.get_state()).motors[:n_arm]}
         if all(abs(cur.get(mid, tgt) - tgt) <= 40 for mid, tgt in targets.items()):
             settled = True
@@ -385,7 +383,7 @@ async def go_home(look_at_table: bool = True) -> dict:
 
     if hasattr(bridge, "set_mock_ee_pose"):
         bridge.set_mock_ee_pose(0.0, 0.27, 0.25 if look_at_table else 0.22)
-    return {"home": targets, "applied": applied, "look_at_table": look_at_table, "settled": settled}
+    return {"ok": settled, "home": targets, "applied": applied, "look_at_table": look_at_table, "settled": settled}
 
 
 ### 9. Return to the calibrated saved home
@@ -540,8 +538,9 @@ async def get_frame(
     max_dim: int = 0,
     save_npy: bool = True,
     show_overlay: bool = False,
+    log_frame: bool = True,
 ) -> list:
-    """Fetch a camera JPEG and RGB matrix reference; show_overlay draws X-Ray on the top view."""
+    """Fetch a camera JPEG and RGB matrix reference; show_overlay draws X-Ray on the top view. log_frame=False skips the replay log (live previews)."""
     global _frame_seq
     _frame_seq += 1
     bridge = await _get_bridge()
@@ -724,6 +723,13 @@ async def localize_3d(
         model=model,
         provider=provider,
     )
+    if res.get("found") and camera == "top" and isinstance(bridge, MockStationBridge) and res.get("pixel"):
+        world = res.get("world") or {}
+        xy = bridge.synthetic_top_unproject(*res["pixel"][:2], float(world.get("z", 0.0)))
+        if xy is not None:
+            res["world"] = {**world, "x": xy[0], "y": xy[1]}
+            if isinstance(res.get("pose_6d"), dict):
+                res["pose_6d"] = {**res["pose_6d"], "x": xy[0], "y": xy[1]}
     if res.get("found"):
         try:
             write_res = await _get_sightings_store().record_localization(
@@ -913,6 +919,8 @@ async def reload_config() -> dict:
     cal_status = _calib.reload()
     _main_control = None  # Captured poses use the calibration active when their images were taken.
     _ik.reload()
+    from .motion import gravity_gains
+    gravity_gains.cache_clear()
     if _bridge is not None and hasattr(_bridge, "apply_hardware_config"):
         hw = _calib.hardware_config()
         _bridge.apply_hardware_config(
