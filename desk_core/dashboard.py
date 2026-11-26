@@ -44,7 +44,19 @@ app = FastAPI(title="DESK-CORE Mission Control")
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _armed_camera = "top"
 _armed_positions: dict[int, int] | None = None
+_detection_positions: dict[int, int] | None = None
 WRIST_WATCH_MOVE_TICKS = 15
+
+
+async def _arm_joint_positions(bridge) -> dict[int, int]:
+    """Arm joint ticks without the gripper: the wrist camera only moves when these do."""
+    st = await bridge.get_state()
+    n = srv._calib.num_arm_joints(len(st.motors))
+    return {m.id: m.position for m in st.motors if m.id <= n}
+
+
+def _arm_moved_since(ref: dict[int, int], now: dict[int, int]) -> bool:
+    return any(abs(now.get(mid, pos) - pos) > WRIST_WATCH_MOVE_TICKS for mid, pos in ref.items())
 
 
 @app.middleware("http")
@@ -198,7 +210,7 @@ async def api_estop() -> dict[str, Any]:
 
 @app.post("/api/localize")
 async def api_localize(req: LocalizeReq) -> dict[str, Any]:
-    global _last_detection
+    global _last_detection, _detection_positions
     if req.camera in ("both", "dual"):
         raise HTTPException(status_code=400, detail="camera='both' is disabled: dual-camera localization is pending the epipolar step")
     bridge = await srv._get_bridge()
@@ -215,6 +227,7 @@ async def api_localize(req: LocalizeReq) -> dict[str, Any]:
         provider=req.provider,
     )
     _last_detection = det
+    _detection_positions = await _arm_joint_positions(bridge) if req.camera == "wrist" else None
     fb = f" ({det['fallback_reason']})" if det.get("fallback_reason") else ""
     _log_event("LOCALIZE", f"{req.query} via {det['backend']}{fb} -> {det['world']}", ok=det["found"])
     return det
@@ -233,9 +246,12 @@ async def api_arm_watch() -> dict[str, Any]:
         d = 0.62
         cam = "top"
     global _armed_camera, _armed_positions
+    ref = _detection_positions if cam == "wrist" else None
+    if ref is not None and _arm_moved_since(ref, await _arm_joint_positions(await srv._get_bridge())):
+        raise HTTPException(status_code=409, detail="The arm moved since the wrist detection; run Localize again before arming.")
     res = await srv.robo_jev_arm_watch(*px, query=q, camera=cam, depth_m=d)
     _armed_camera = cam
-    _armed_positions = (await (await srv._get_bridge()).get_state()).positions() if cam == "wrist" else None
+    _armed_positions = ref
     _log_event("ROBO-JEV", f"Armed watch on {q} @ {res['ref_pixel']}")
     return res
 
@@ -244,11 +260,14 @@ async def api_arm_watch() -> dict[str, Any]:
 async def api_check_reflex() -> dict[str, Any]:
     bridge = await srv._get_bridge()
     if _armed_camera == "wrist" and _armed_positions is not None:
-        now = (await bridge.get_state()).positions()
-        if any(abs(now.get(mid, pos) - pos) > WRIST_WATCH_MOVE_TICKS for mid, pos in _armed_positions.items()):
+        if _arm_moved_since(_armed_positions, await _arm_joint_positions(bridge)):
             # The wrist camera moved with the arm, so the armed reference pixel no longer applies.
-            _log_event("ROBO-JEV", "wrist watch stale after arm motion; re-arm", ok=False)
-            return {"ok": False, "aborted": False, "reason": "wrist_moved_rearm_watch", "latency_ms": 0.0}
+            srv._robo_jev.watches.pop("wrist", None)
+            res = {**srv._robo_jev.last_report, "ok": False, "aborted": False, "target_shifted": False,
+                   "reason": "wrist_moved_relocalize", "latency_ms": 0.0}
+            srv._robo_jev.last_report = res
+            _log_event("ROBO-JEV", "wrist watch stale after arm motion; run Localize and re-arm", ok=False)
+            return res
     res = await check_reflex_and_abort(
         gatekeeper=srv._robo_jev,
         bridge=bridge,
