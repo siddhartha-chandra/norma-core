@@ -455,6 +455,11 @@ def clear_plane_homography(
     raw = json.loads(target_path.read_text(encoding="utf-8"))
     removed = "H_table" in raw
     raw.pop("H_table", None)
+    for alias in ("top", "scene"):
+        block = raw.get(alias)
+        if isinstance(block, dict) and "H_table" in block:
+            block.pop("H_table", None)
+            removed = True
     if not keep_anchors:
         raw.pop("table_anchors", None)
     if removed or not keep_anchors:

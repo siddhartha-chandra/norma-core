@@ -495,3 +495,22 @@ def test_fit_homography_from_checkerboard_requires_origin_hint():
     dummy = np.zeros((120, 160, 3), dtype=np.uint8)
     with pytest.raises(ValueError, match="origin_hint_px is required"):
         fit_homography_from_checkerboard(dummy, (6, 4), 0.025)
+
+
+def test_clear_plane_homography_removes_nested_h_table(tmp_path: Path):
+    """clear_plane_homography must also remove nested top/scene H_table so reload() does not restore it."""
+    calib_file = tmp_path / "nested_rig.json"
+    calib_file.write_text(
+        json.dumps(
+            {
+                "H_table": np.eye(3).tolist(),
+                "scene": {"H_table": (2.0 * np.eye(3)).tolist()},
+                "top": {"H_table": (3.0 * np.eye(3)).tolist()},
+            }
+        ),
+        encoding="utf-8",
+    )
+    res = clear_plane_homography(calib_path=calib_file)
+    assert res["removed"] is True
+    cs = CalibrationStore(calib_file)
+    assert cs.data.get("H_table") is None
