@@ -7,7 +7,9 @@ import pytest
 from scipy.spatial.transform import Rotation
 
 from desk_core import mcp_server
+from desk_core.pose_estimation import pixels_on_plane
 from desk_core.station_bridge import MockStationBridge
+from desk_core.stereo_sweep import _blob_mask
 from desk_core.wrist_ibvs import alignment_step
 
 
@@ -52,6 +54,20 @@ def test_center_and_perpendicular_jaw_yaw_converge_with_camera_offset():
     assert abs(math.degrees(step.yaw_error_rad)) < 2
     np.testing.assert_allclose(flange[:3, 1], FLANGE[:3, 1], atol=1e-8)
     assert flange[2, 3] == FLANGE[2, 3]
+
+
+def test_plane_area_centroid_is_unbiased_with_a_tilted_camera():
+    camera = FLANGE @ MOUNT
+    camera[:3, :3] = Rotation.from_euler("x", 45, degrees=True).as_matrix() @ camera[:3, :3]
+    camera[:3, 3] = [0, -0.09, 0.09]
+    frame = frame_of_marker(camera, np.zeros(2), 90)
+    pixels = cv2.findNonZero(_blob_mask(frame, "color")).reshape(-1, 2)
+    image_weighted_centroid = pixels_on_plane(pixels, K, None, camera, 0.0).mean(axis=0)
+
+    assert np.linalg.norm(image_weighted_centroid) > 0.001
+    step = alignment_step(frame, K, None, camera, FLANGE, 0.0)
+    assert step.error_mm < 0.5
+    assert abs(math.degrees(step.yaw_error_rad)) < 0.5
 
 
 @pytest.mark.parametrize("color, message", [

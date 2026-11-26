@@ -26,12 +26,14 @@ class Alignment:
     rotation: Rotation
 
 
-def _marker_points(frame, center, K, dist, camera_pose, plane_z):
+def _marker_moments(frame, center, K, dist, camera_pose, plane_z, optical_xy):
     mask = _blob_mask(frame, "color")
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    contours, hierarchy = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
     h, w = mask.shape
     candidates = []
-    for contour in contours:
+    for index, contour in enumerate(contours):
+        if hierarchy[0, index, 3] != -1:
+            continue
         area = cv2.contourArea(contour)
         x, y, width, height = cv2.boundingRect(contour)
         if not 150 <= area <= 0.4 * h * w or x == 0 or y == 0 or x + width == w or y + height == h:
@@ -40,24 +42,35 @@ def _marker_points(frame, center, K, dist, camera_pose, plane_z):
         uv = np.array([m["m10"] / m["m00"], m["m01"] / m["m00"]])
         distance = np.linalg.norm(uv - center)
         if distance <= min(w, h) / 3:
-            candidates.append((distance, contour))
+            candidates.append((distance, index))
     if not candidates:
         raise ValueError("No complete colored marker near the wrist optical center.")
-    _, contour = min(candidates, key=lambda item: item[0])
-    x, y, w, h = cv2.boundingRect(contour)
-    component = np.zeros((h, w), dtype=np.uint8)
-    cv2.drawContours(component, [contour], 0, 255, cv2.FILLED, offset=(-x, -y))
-    pixels = cv2.findNonZero(cv2.bitwise_and(component, mask[y:y + h, x:x + w])).reshape(-1, 2) + [x, y]
-    return pixels_on_plane(pixels, K, dist, camera_pose, plane_z)[:, :2]
+    _, index = min(candidates, key=lambda item: item[0])
+
+    def area_moments(contour):
+        xy = pixels_on_plane(contour.reshape(-1, 2), K, dist, camera_pose, plane_z)[:, :2] - optical_xy
+        m = cv2.moments(xy.astype(np.float32))
+        return np.array([m[name] for name in ("m00", "m10", "m01", "m20", "m11", "m02")])
+
+    moments = area_moments(contours[index])
+    hole = hierarchy[0, index, 2]
+    while hole != -1:
+        moments -= area_moments(contours[hole])
+        hole = hierarchy[0, hole, 0]
+    area, sx, sy, sxx, sxy, syy = moments
+    if area <= 0:
+        raise ValueError("Marker has no positive area on the table plane.")
+    center_xy = np.array([sx, sy]) / area
+    covariance = np.array([[sxx, sxy], [sxy, syy]]) / area - np.outer(center_xy, center_xy)
+    return optical_xy + center_xy, covariance
 
 
 def alignment_step(frame, K, dist, camera_pose, flange_pose, plane_z) -> Alignment:
     """Compute a bounded XY correction and roll using a measured flange and optical pose."""
     center = K[:2, 2]
     optical_xy = pixels_on_plane([center], K, dist, camera_pose, plane_z)[0, :2]
-    points = _marker_points(frame, center, K, dist, camera_pose, plane_z)
-    target_xy = points.mean(axis=0)
-    variances, axes = np.linalg.eigh(np.cov(points.T))
+    target_xy, covariance = _marker_moments(frame, center, K, dist, camera_pose, plane_z, optical_xy)
+    variances, axes = np.linalg.eigh(covariance)
     if variances[-1] <= 2.25 * variances[0]:
         raise ValueError("Marker yaw is ambiguous; use an elongated marker.")
     axis = axes[:, -1]
