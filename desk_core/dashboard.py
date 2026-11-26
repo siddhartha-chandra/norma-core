@@ -70,7 +70,8 @@ async def _require_token(request: Request, call_next):
         return PlainTextResponse("Dashboard token required (open /?token=...)", status_code=401)
     response = await call_next(request)
     if request.query_params.get("token"):
-        response.set_cookie("dashboard_token", token, httponly=True, samesite="strict")
+        response.set_cookie("dashboard_token", token, httponly=True, samesite="strict",
+                            secure=request.url.scheme == "https")
     return response
 
 _action_log: deque[dict[str, Any]] = deque(maxlen=40)
