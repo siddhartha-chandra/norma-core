@@ -7,6 +7,8 @@ import pytest
 
 from desk_core import mcp_server as srv
 from desk_core.dashboard import api_frame
+from desk_core.heading_out import MOCK_KEYS_MASS_KG
+from desk_core.ik_mujoco import MuJoCoPlanner
 from desk_core.station_bridge import LiveStationBridge, MockStationBridge
 
 
@@ -108,6 +110,26 @@ def test_occupied_tray_is_rejected_before_any_mock_motion(desk, monkeypatch):
     assert not result["ok"] and not result["executed"]
     assert result["problems"] == ["Departure tray is occupied by wallet"]
     assert desk.get_mock_scene_state() == initial
+    send.assert_not_called()
+
+
+def test_overloaded_mock_carry_is_rejected_before_any_motion(desk, monkeypatch):
+    torque = MuJoCoPlanner.shoulder_torque
+
+    def shoulder_torque(planner, q, *, payload_mass_kg=0.0):
+        if payload_mass_kg:
+            assert payload_mass_kg == MOCK_KEYS_MASS_KG
+            return planner.torque_limit + 0.01
+        return torque(planner, q)
+
+    monkeypatch.setattr(MuJoCoPlanner, "shoulder_torque", shoulder_torque)
+    send = AsyncMock()
+    monkeypatch.setattr(desk, "send_joint_targets", send)
+
+    result = asyncio.run(srv.heading_out(execute=True))
+
+    assert not result["ok"] and not result["executed"]
+    assert any("Loaded shoulder torque" in problem for problem in result["problems"])
     send.assert_not_called()
 
 

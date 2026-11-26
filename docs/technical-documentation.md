@@ -170,7 +170,7 @@ To try **Sim-Before-Steel X-Ray**, run
 `DESK_MOCK=1 DESK_MOCK_HEADING_OUT=1 uv run python scripts/agent_tui.py --mock`,
 enable **Show Camera Views** and **Arm Motion**, and type **I'm heading out**. The mock starts with a mug
 between the keys and the Departure Tray. The routine registers the mug cylinder and tray box,
-preflights the approach and transfer in MuJoCo, and carries the keys around or over the mug
+preflights the approach and transfer in MuJoCo (including a 30 g mock payload), and carries the keys around or over the mug
 only if it finds a clear path. No model API key is needed for this mock scene.
 
 Via MCP, call `heading_out()` for a dry run or `heading_out(execute=True)` to run the

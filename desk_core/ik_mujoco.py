@@ -143,10 +143,15 @@ class MuJoCoPlanner:
         force = self.model.body_subtreemass[self.shoulder_body] * self.model.opt.gravity
         return -float(self.data.xaxis[self.shoulder] @ np.cross(lever, force))
 
-    def shoulder_torque(self, q: np.ndarray) -> float:
-        """Signed gravity holding torque about j2 in N·m."""
+    def shoulder_torque(self, q: np.ndarray, *, payload_mass_kg: float = 0.0) -> float:
+        """Signed gravity holding torque about j2 in N·m, with payload at the flange."""
         self._forward(q)
-        return self._shoulder_torque()
+        torque = self._shoulder_torque()
+        if payload_mass_kg:
+            lever = self.data.xpos[self.flange] - self.data.xanchor[self.shoulder]
+            force = payload_mass_kg * self.model.opt.gravity
+            torque -= float(self.data.xaxis[self.shoulder] @ np.cross(lever, force))
+        return torque
 
     def _check(self, q: np.ndarray) -> float:
         if (q.shape != self.lower.shape or not np.all(np.isfinite(q))

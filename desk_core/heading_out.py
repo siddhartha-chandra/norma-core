@@ -7,6 +7,7 @@ from .ik_mujoco import CONTACT_MARGIN_M, MuJoCoPlanner, PlanningError
 from .interfaces import SceneObstacle
 
 MOCK_TCP_DROP_M = 0.12
+MOCK_KEYS_MASS_KG = 0.03
 STACK_CLEARANCE_M = 0.005
 
 
@@ -76,6 +77,9 @@ def plan_transfer(planner: MuJoCoPlanner, start, source, destination, radius, he
             carry = np.vstack(segments)
             flange_path = np.array([planner.flange_pose(q)[0] for q in carry])
             _check_payload(flange_path, radius, height, obstacles, table_z)
+            peak = max(abs(planner.shoulder_torque(q, payload_mass_kg=MOCK_KEYS_MASS_KG)) for q in carry)
+            if peak > planner.torque_limit:
+                raise PlanningError(f"Loaded shoulder torque {peak:.3f} N·m exceeds {planner.torque_limit:.3f} N·m")
             return Transfer(approach, carry, detour, flange_path)
         except PlanningError as exc:
             failure = str(exc)
