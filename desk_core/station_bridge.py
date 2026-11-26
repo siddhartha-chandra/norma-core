@@ -1136,7 +1136,8 @@ class LiveStationBridge:
             return ELROBOT_MOTOR_RANGES[motor.id]
         return 0, MAX_ANGLE_STEP
 
-    async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP) -> dict[int, int]:
+    async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP, *,
+                                 preflight_start: RobotState | None = None) -> dict[int, int]:
         if self._aborted:
             raise EStopLatched("E-STOP latched: call observe() before moving")
         if hasattr(self.client, "read_from_tail"):
@@ -1151,6 +1152,14 @@ class LiveStationBridge:
         by_id = {m.id: m for m in st.motors}
         applied: dict[int, int] = {}
         self._require_fresh_motor_rx(st, targets)
+        if preflight_start is not None:
+            self._require_fresh_motor_rx(st, preflight_start.positions())
+            actual_ranges = {m.id: self._effective_motor_range(st.bus_serial, m) for m in st.motors}
+            if (st.bus_serial != preflight_start.bus_serial or st.positions() != preflight_start.positions()
+                    or actual_ranges != preflight_start.ranges() or any(m.error_status for m in st.motors)):
+                raise RuntimeError("Station no longer matches the preflighted starting state")
+            if not targets.keys() <= self._torque_started:
+                raise RuntimeError("Enable arm torque before executing a preflighted move")
 
         for raw_mid, raw_tgt in targets.items():
             mid = int(raw_mid)
@@ -1169,6 +1178,8 @@ class LiveStationBridge:
                 raise RuntimeError(f"Motor {mid} cannot enter its calibrated range within one safe step")
             applied[mid] = stepped
 
+        if preflight_start is not None and (self._aborted or applied != targets):
+            raise RuntimeError("Station cannot send the exact preflighted waypoint")
         if applied:
             need_start = [mid for mid in applied if mid not in self._torque_started]
             if need_start:

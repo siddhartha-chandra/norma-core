@@ -179,7 +179,7 @@ Tool names are the public contract. Agents should call them by name.
 | **Observation** | `observe(views, denoise)`, `get_state`, `get_frame(camera)`, `get_joint_angles(include_gripper)`, `get_calib_status`, `reload_config` |
 | **Bare-metal control** | `set_torque`, `move_joints(targets, max_step, wait)`, `move_joint(...)`, `grasp(close_ticks)`, `release`, `go_home`, `move_to_home(max_step, timeout_s)`, `estop` |
 | **Kinematics and 3D** | `solve_ik(x, y, z, qx, qy, qz, qw)`, `get_metric_depth(x, y, camera, q_rad)`, `pixel_to_world(...)`, `localize_3d(...)` |
-| **Composite motion** | `plan_and_move` (MuJoCo preflight; mock-only execution), `move_to_pose`, `move_flange` (dry run unless `execute=True`), `pick_at`, `place_at`, `pick_pixel(x, y, yaw)`, `execute_sequence(steps, stop_on_false)` |
+| **Composite motion** | `plan_and_move` (MuJoCo preflight; dry run unless `execute=True`), `move_to_pose`, `move_flange` (dry run unless `execute=True`), `pick_at`, `place_at`, `pick_pixel(x, y, yaw)`, `execute_sequence(steps, stop_on_false)` |
 | **Wrist-stereo pipeline** | `detect_requested_object`, `aim_wrist`, `capture_wrist_stereo`, `estimate_wrist_depth`, `measure_graspability`, `estimate_grasp_pose` (legacy), `plan_tolerant_grasp`, `retract_to_hover`, `move_to_drop`, `master_pick_place` |
 | **Safety and scene** | `update_scene_obstacle`, `robo_jev_arm_watch`, `robo_jev_check`, `robo_jev_guard`, `speak_status` |
 | **Mock helpers** | `mock_add_object`, `mock_scene_state`, `mock_reset_scene` |
@@ -193,11 +193,14 @@ tabletop and obstacles registered with `update_scene_obstacle` (center coordinat
 including the quantized tick targets. Lifts involving j2 first move j3 and j4 to reduce the shoulder load.
 It rejects paths that do not clear these checks without issuing a joint target.
 
-`execute=True` sends the checked targets only to `MockStationBridge`; live execution is disabled pending
-verified servo alignment (#5). The fixed-gripper model has no payload or dynamic torque model, and a
-simulation budget is not a safe hardware rating. To request just the MuJoCo IK solution, pass the same
-limit to `solve_ik`; without it the existing IK backend is unchanged. The other motion tools do not run
-this preflight.
+`execute=True` can send the checked targets to the mock bridge or the live ElRobot bus named in the
+rig calibration. Live execution requires fresh, fault-free telemetry, explicit calibrated joint signs
+and zeros, effective motor ranges, arm torque already enabled, and a fully open, unloaded gripper.
+The planner uses the same tick↔radian conversion as Desk Core FK; Station refuses to clamp or send
+a target from a different measured pose, and the next waypoint waits for an exact tick match.
+The model does not account for payload or dynamic torque. A simulation budget is not a hardware rating.
+To request just the MuJoCo IK solution, pass the same limit to `solve_ik`; without it the existing IK
+backend is unchanged. The other motion tools do not run this preflight.
 
 ### 4.2 Motion lock and run log
 

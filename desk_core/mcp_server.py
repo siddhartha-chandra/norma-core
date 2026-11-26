@@ -39,7 +39,8 @@ from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
 from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
-from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, MockStationBridge, RobotState, StationBridge, create_bridge
+from .station_bridge import (DEFAULT_MAX_STEP, MAX_ANGLE_STEP, REPO_ROOT, LiveStationBridge, MockStationBridge,
+                             RobotState, StationBridge, create_bridge)
 from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
 from .vision_3d import localize_object_3d
@@ -835,6 +836,41 @@ async def reload_config() -> dict:
 # =============================================================================
 
 
+def _live_preflight_state(bridge: LiveStationBridge, state: RobotState) -> RobotState:
+    from .ik_mujoco import PlanningError
+
+    hardware = _calib.data.get("hardware") or {}
+    bus = hardware.get("bus_serial")
+    if not (_calib.data.get("calibrated") and _calib.data.get("arm_type") == "elrobot"
+            and bus and bus == bridge.target_bus == state.bus_serial):
+        raise PlanningError("Live execution requires the bus named in the calibrated ElRobot rig")
+    if not bridge._follow_motor_rx:
+        raise PlanningError("Live execution requires fresh raw motor telemetry")
+    for name, low, high in (("joint_signs", -1, 1), ("joint_zero_ticks", 0, MAX_ANGLE_STEP)):
+        values = _calib.data.get(name)
+        if isinstance(values, dict):
+            values = [values.get(str(mid)) for mid in range(1, 8)]
+        if not isinstance(values, list) or len(values) < 7 or any(
+            not isinstance(v, (int, float)) or not low <= v <= high or (name == "joint_signs" and abs(v) != 1)
+            for v in values[:7]
+        ):
+            raise PlanningError(f"Explicit calibrated {name} required for all arm joints")
+    if "z_table" not in _calib.data:
+        raise PlanningError("Live execution requires a calibrated table height")
+    motors = []
+    for m in state.motors:
+        lo, hi = bridge._effective_motor_range(state.bus_serial, m)
+        if m.error_status or (lo, hi) == (0, MAX_ANGLE_STEP):
+            raise PlanningError(f"Motor {m.id} is faulted or lacks a calibrated range")
+        motors.append(replace(m, range_min=lo, range_max=hi))
+    gripper = _calib.data.get("gripper") or {}
+    if (not motors or gripper.get("motor_id") != 8 or motors[-1].id != 8
+            or gripper.get("open_ticks") != motors[-1].range_max or motors[-1].position != motors[-1].range_max):
+        raise PlanningError("Live execution requires a fully open calibrated gripper; payloads are not modeled")
+    bridge._require_fresh_motor_rx(state, state.positions())
+    return replace(state, motors=motors)
+
+
 @mcp.tool()
 @_traced
 @_motion_tool
@@ -849,15 +885,21 @@ async def plan_and_move(
     qw: float = 1.0,
     execute: bool = False,
 ) -> dict:
-    """Preflight a flange pose in MuJoCo. Execution is opt-in and mock-only pending #5."""
+    """Preflight a flange pose in MuJoCo. Live execution requires aligned, unloaded ElRobot hardware."""
     from .ik_mujoco import PlanningError
 
     bridge = await _get_bridge()
-    if execute and not isinstance(bridge, MockStationBridge):
-        return {"ok": False, "executed": False, "problems": ["Live execution requires servo alignment (#5)"]}
+    live = isinstance(bridge, LiveStationBridge)
+    if execute and not (live or isinstance(bridge, MockStationBridge)):
+        return {"ok": False, "executed": False, "problems": ["Unsupported Station bridge"]}
     if isinstance(bridge, MockStationBridge) and bridge.get_mock_scene_state()["held_object"]:
         return {"ok": False, "executed": False, "problems": ["Payloads are not modeled by the shoulder torque guard"]}
     st = await bridge.get_state()
+    if live and execute:
+        try:
+            st = _live_preflight_state(bridge, st)
+        except (PlanningError, RuntimeError) as exc:
+            return {"ok": False, "executed": False, "problems": [str(exc)]}
     initial_ticks = st.positions()
     motors = [replace(m) for m in st.motors]
     obstacles = list(_obstacles.values())
@@ -888,14 +930,31 @@ async def plan_and_move(
     if not execute:
         return result
     current = await bridge.get_state()
-    if current.positions() != initial_ticks or list(_obstacles.values()) != obstacles:
+    if current.bus_serial != st.bus_serial or current.positions() != initial_ticks or list(_obstacles.values()) != obstacles:
         return {"ok": False, "executed": False, "problems": ["Start pose or obstacles changed during preflight"]}
+    expected = replace(st, motors=motors)
     for target in targets[1:]:
+        try:
+            if live:
+                applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP, preflight_start=expected)
+            else:
+                applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP)
+        except RuntimeError as exc:
+            result.update(ok=False, problems=[str(exc)])
+            return result
         result["executed"] = True
-        if await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP) != target:
+        if applied != target:
             result.update(ok=False, problems=["Station did not apply the preflighted waypoint"])
             return result
-    bridge.set_mock_ee_pose(*position)
+        if live:
+            if not await bridge.wait_settle(target, tol_ticks=0):
+                result.update(ok=False, problems=["Station did not settle at the exact preflighted waypoint"])
+                return result
+            expected = replace(expected, motors=[
+                replace(m, position=target.get(m.id, m.position)) for m in expected.motors
+            ])
+    if isinstance(bridge, MockStationBridge):
+        bridge.set_mock_ee_pose(*position)
     return result
 
 

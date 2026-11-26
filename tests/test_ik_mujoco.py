@@ -1,4 +1,6 @@
 import asyncio
+from dataclasses import replace
+import time
 
 import mujoco
 import numpy as np
@@ -8,7 +10,7 @@ from desk_core import mcp_server
 from desk_core.ik_mujoco import MAX_WAYPOINT_STEP_RAD, MuJoCoPlanner, PlanningError
 from desk_core.ik_tracik import TOOL_FRAME
 from desk_core.interfaces import SceneObstacle
-from desk_core.station_bridge import MockStationBridge
+from desk_core.station_bridge import LiveStationBridge, MockStationBridge, RobotState
 
 
 @pytest.fixture
@@ -122,5 +124,88 @@ def test_plan_and_move_preflights_before_sending_any_mock_targets(scene, monkeyp
         assert sent[tuck - 1][3] != initial_ticks[3] and sent[tuck - 1][4] != initial_ticks[4]
         assert sent[tuck][2] != initial_ticks[2]
         assert (await bridge.get_state()).positions() == {**initial_ticks, **sent[-1]}
+
+    asyncio.run(run())
+
+
+@pytest.fixture
+def live_station(scene, calib, monkeypatch):
+    _, mock, _ = scene
+    motors = [replace(m) for m in asyncio.run(mock.get_state()).motors]
+    motors[-1].position = motors[-1].range_max
+    bus = calib.data["hardware"]["bus_serial"]
+    state = RobotState(bus, motors)
+    bridge = LiveStationBridge(target_bus=bus, follow_motor_rx=True)
+    bridge._torque_started = {m.id for m in motors[:-1]}
+    packets = []
+
+    async def get_state():
+        now = time.monotonic()
+        bridge._last_rx_mono = now
+        bridge.rx_received_at.update({(bus, m.id): now for m in motors})
+        return state
+
+    def sync_write(bus_serial, address, values):
+        assert bus_serial == bus
+        return {mid: int.from_bytes(value, "little") for mid, value in values.items()}
+
+    async def send_commands(client, commands):
+        packets.extend(commands)
+        for targets in commands:
+            for motor in motors:
+                if motor.id in targets:
+                    motor.position = targets[motor.id]
+
+    monkeypatch.setattr(bridge, "get_state", get_state)
+    monkeypatch.setattr(bridge, "_sync_write", sync_write)
+    monkeypatch.setattr(bridge, "_send_commands", send_commands)
+    monkeypatch.setattr(mcp_server, "_bridge", bridge)
+    monkeypatch.setattr(mcp_server, "_calib", calib)
+    monkeypatch.setattr(mcp_server, "_obstacles", {})
+    return bridge, state, packets
+
+
+def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_station, calib, monkeypatch):
+    _, state, packets = live_station
+    monkeypatch.setitem(calib.data["joint_signs"], "2", -1)
+    monkeypatch.setitem(calib.data["joint_zero_ticks"], "2", 2057)
+    planner = mcp_server._mujoco_planner(state, [], 0.6)
+    start = np.asarray(calib.ticks_to_rad(state.motors))
+    target = start.copy()
+    target[1] -= 0.2
+    xyz, rotation = planner.flange_pose(target)
+    args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
+
+    async def run():
+        start_ticks = state.positions()
+        await mcp_server.update_scene_obstacle("blocker", *xyz, radius_m=0.03, height_m=0.04)
+        blocked = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True)
+        assert not blocked["ok"] and "Collision" in blocked["problems"][0]
+        await mcp_server.update_scene_obstacle("blocker", *xyz, remove=True)
+        overloaded = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.5, execute=True)
+        assert not overloaded["ok"] and "Shoulder torque" in overloaded["problems"][0]
+        assert not packets and state.positions() == start_ticks
+        moved = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True)
+        assert moved["ok"] and moved["executed"]
+        assert len(packets) == moved["waypoints"] - 1
+        assert all(8 not in target for target in packets)
+        assert state.positions()[2] > start_ticks[2]
+        assert calib.ticks_to_rad(state.motors) == moved["joints_rad"]
+
+    asyncio.run(run())
+
+
+def test_live_bridge_refuses_pose_drift_and_clamping_before_writing(live_station):
+    bridge, state, packets = live_station
+    snapshot = replace(state, motors=[replace(m) for m in state.motors])
+
+    async def run():
+        await bridge.get_state()
+        with pytest.raises(RuntimeError, match="exact preflighted waypoint"):
+            await bridge.send_joint_targets({1: 2500}, max_step=5, preflight_start=snapshot)
+        state.motors[-1].position -= 1
+        with pytest.raises(RuntimeError, match="no longer matches"):
+            await bridge.send_joint_targets({1: 2050}, preflight_start=snapshot)
+        assert not packets
 
     asyncio.run(run())
