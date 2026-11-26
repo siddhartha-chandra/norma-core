@@ -1,0 +1,94 @@
+{
+  "poses": [
+    {
+      "pose": "pose-00",
+      "ticks": [
+        2101,
+        2640,
+        901,
+        893,
+        1915,
+        1103,
+        145
+      ],
+      "offset_mm_base_xyz": [
+        -4.9,
+        0.3,
+        -9.2
+      ],
+      "distance_mm": 10.5,
+      "rotation_deg": 3.35,
+      "reprojection_px": 0.19
+    },
+    {
+      "pose": "pose-01",
+      "ticks": [
+        2103,
+        1903,
+        1366,
+        967,
+        1908,
+        1056,
+        221
+      ],
+      "offset_mm_base_xyz": [
+        -2.1,
+        -2.4,
+        4.9
+      ],
+      "distance_mm": 5.9,
+      "rotation_deg": 0.44,
+      "reprojection_px": 0.19
+    },
+    {
+      "pose": "pose-02",
+      "ticks": [
+        2358,
+        1850,
+        1366,
+        965,
+        2068,
+        1054,
+        224
+      ],
+      "offset_mm_base_xyz": [
+        -7.4,
+        -4.8,
+        -9.4
+      ],
+      "distance_mm": 13.0,
+      "rotation_deg": 3.61,
+      "reprojection_px": 0.22
+    },
+    {
+      "pose": "pose-03",
+      "ticks": [
+        1851,
+        1998,
+        1252,
+        970,
+        1652,
+        1055,
+        221
+      ],
+      "offset_mm_base_xyz": [
+        -4.3,
+        0.9,
+        -3.4
+      ],
+      "distance_mm": 5.6,
+      "rotation_deg": 1.22,
+      "reprojection_px": 0.19
+    }
+  ],
+  "mean_offset_mm": [
+    -4.72,
+    -1.49,
+    -4.27
+  ],
+  "spread_mm": [
+    2.18,
+    2.63,
+    6.76
+  ]
+}

@@ -35,6 +35,14 @@ class QueueRead:
         self.id = stream_id
         self.data = data_channel
         self.err = error
+        self._task: Optional[asyncio.Task] = None
+        self._closed = False
+
+    async def aclose(self) -> None:
+        self._closed = True
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
 
 
 class Client:
@@ -63,7 +71,12 @@ class Client:
         self.ping_sequence = 0
 
         # Start connection management as a task in the provided loop
-        asyncio.create_task(self.manage_connection())
+        self._connection_task = asyncio.create_task(self.manage_connection())
+
+    async def close(self):
+        self._connection_task.cancel()
+        await asyncio.gather(self._connection_task, return_exceptions=True)
+        self.close_connection()
 
     async def wait_ready(self, timeout: Optional[float] = None):
         """
@@ -321,7 +334,7 @@ class Client:
         data_channel = asyncio.Queue(maxsize=buf_size if buf_size > 0 else 1)
         qr = QueueRead(stream_uuid, data_channel)
 
-        asyncio.create_task(self._read_async(qr, queue_id, offset, positive, limit, step, buf_size))
+        qr._task = asyncio.create_task(self._read_async(qr, queue_id, offset, positive, limit, step, buf_size))
         return qr
 
     async def _read_async(self, qr: QueueRead, queue_id: str, offset: bytes, positive: bool, limit: int, step: int, buf_size: int):
@@ -417,7 +430,8 @@ class Client:
             with self.pending_reads_lock:
                 if read_id in self.pending_reads:
                     del self.pending_reads[read_id]
-            await qr.data.put(None)  # Signal end of stream
+            if not qr._closed:
+                await qr.data.put(None)  # Signal end of stream
 
     def follow(self, queue_id: str, target: asyncio.Queue) -> asyncio.Queue:
         """
@@ -472,7 +486,11 @@ async def new_station_client(server: str, logger) -> StationClient:
         addr = f"{server}:8888"
 
     client = Client(addr, logger)
-    await client.wait_ready(timeout=10.0)
+    try:
+        await client.wait_ready(timeout=10.0)
+    except (Exception, asyncio.CancelledError):
+        await client.close()
+        raise
     return client
 
 

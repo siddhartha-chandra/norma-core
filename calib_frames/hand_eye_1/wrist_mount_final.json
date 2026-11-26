@@ -1,0 +1,133 @@
+{
+  "_notes": {
+    "transform_convention": "T_A_B is a 4x4 row-major matrix mapping points in frame B into frame A (p_A = T_A_B @ p_B), same as calib/rig_calib.json.",
+    "frames": {
+      "T_ee_cam_wrist": {
+        "parent": "Gripper_Base_v1_1",
+        "child": "wrist_camera_optical_frame",
+        "why_key_not_renamed": "'ee' is the URDF link Gripper_Base_v1_1 (the ee_link / wrist_mount_link in rig_calib.json). Key kept because desk_core/calib_store.py, scripts/recover_scene_to_base.py and scripts/verify_calib.py read 'T_ee_cam_wrist'."
+      },
+      "T_base_board": {
+        "parent": "base_link",
+        "child": "calib_board",
+        "why_key_not_renamed": "'base' is the URDF link base_link. Key kept to match the T_<parent>_<child> short names used across the scripts."
+      }
+    },
+    "non_urdf_frames": {
+      "wrist_camera_optical_frame": "Not in elrobot_follower.urdf. OpenCV optical convention: +X right, +Y down, +Z forward out of the lens. Suggested name if added to the URDF as a fixed child of Gripper_Base_v1_1.",
+      "calib_board": "Not in the URDF. Origin at the board inner corner whose outer square is dark; +X along the inner columns, +Y along the inner rows, +Z into the table."
+    },
+    "joint_mapping": "q_rad[j] = joint_signs[j] * (ticks[j] - joint_zero_ticks[j]) * 2*pi/4096 for URDF joints rev_motor_01..07 (keys '1'..'7'). The transforms are only valid with this mapping.",
+    "reproduce": "scripts/fit_joint_offsets.py calib_frames/hand_eye_1/samples.json --calibration calib_frames/session1/camera_calibration.json --ranges calib_frames/hand_eye_1/follower_ranges.json --rig-zeros --mount-output <this file>"
+  },
+  "T_ee_cam_wrist": [
+    [
+      0.9955838758331874,
+      0.03423720966569668,
+      -0.08741029490440458,
+      -0.005244625378141375
+    ],
+    [
+      0.09368951151962315,
+      -0.42107055277683014,
+      0.9021761829129767,
+      0.018792842110000565
+    ],
+    [
+      -0.005917906063993873,
+      -0.9063814887002722,
+      -0.42241872038215345,
+      0.0659886696509935
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "T_base_board": [
+    [
+      -0.9827816690433879,
+      -0.18441307458613937,
+      -0.011489513217699091,
+      0.11646534270543585
+    ],
+    [
+      -0.18441966212178423,
+      0.9828474680931525,
+      -0.0004926314708730294,
+      -0.29255794696026355
+    ],
+    [
+      0.011383286659819952,
+      0.0016347429663839457,
+      -0.9999338720136719,
+      0.0025802339523821774
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "translation_units": "meters",
+  "joint_zero_ticks": {
+    "1": 2048,
+    "2": 2048,
+    "3": 2048,
+    "4": 2048,
+    "5": 1845,
+    "6": 1927,
+    "7": 2200
+  },
+  "joint_signs": {
+    "1": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1
+  },
+  "fit_consistency": {
+    "board_origin_pairwise_rms_mm": 9.472524303276723,
+    "board_rotation_pairwise_rms_deg": 2.4319834728730094
+  },
+  "reprojection_rmse_px": {
+    "wrist-000.jpg": 6.95,
+    "wrist-001.jpg": 13.33,
+    "wrist-002.jpg": 10.62,
+    "wrist-003.jpg": 4.72,
+    "wrist-004.jpg": 10.88,
+    "wrist-005.jpg": 9.96,
+    "wrist-006.jpg": 6.57,
+    "wrist-007.jpg": 15.89,
+    "wrist-008.jpg": 22.95,
+    "wrist-009.jpg": 2.22,
+    "wrist-010.jpg": 18.84,
+    "wrist-011.jpg": 3.55,
+    "wrist-012.jpg": 13.85,
+    "wrist-013.jpg": 8.04,
+    "wrist-014.jpg": 3.3
+  },
+  "leave_one_out_rmse_px": {
+    "wrist-000.jpg": 7.73,
+    "wrist-001.jpg": 17.3,
+    "wrist-002.jpg": 12.52,
+    "wrist-003.jpg": 5.32,
+    "wrist-004.jpg": 13.59,
+    "wrist-005.jpg": 11.64,
+    "wrist-006.jpg": 9.13,
+    "wrist-007.jpg": 23.83,
+    "wrist-008.jpg": 26.04,
+    "wrist-009.jpg": 3.07,
+    "wrist-010.jpg": 21.71,
+    "wrist-011.jpg": 5.2,
+    "wrist-012.jpg": 15.84,
+    "wrist-013.jpg": 21.03,
+    "wrist-014.jpg": 5.94
+  },
+  "method": "bundle adjustment over all views, zeros from station viewer range-to-URDF-limit mapping"
+}

@@ -1,0 +1,230 @@
+[
+  {
+    "image": "../hand_eye_1/wrist-000.jpg",
+    "joint_ticks": [
+      2068,
+      2291,
+      922,
+      903,
+      1820,
+      1274,
+      346
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-001.jpg",
+    "joint_ticks": [
+      2279,
+      2296,
+      923,
+      905,
+      1916,
+      1184,
+      345
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-002.jpg",
+    "joint_ticks": [
+      2277,
+      2452,
+      921,
+      902,
+      1916,
+      1161,
+      345
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-003.jpg",
+    "joint_ticks": [
+      2175,
+      2453,
+      921,
+      902,
+      1922,
+      1160,
+      345
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-004.jpg",
+    "joint_ticks": [
+      2031,
+      2452,
+      921,
+      902,
+      1920,
+      1160,
+      345
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-005.jpg",
+    "joint_ticks": [
+      1919,
+      2452,
+      921,
+      902,
+      1837,
+      1161,
+      146
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-006.jpg",
+    "joint_ticks": [
+      1761,
+      2452,
+      921,
+      902,
+      1745,
+      1160,
+      146
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-007.jpg",
+    "joint_ticks": [
+      1761,
+      2281,
+      922,
+      905,
+      1737,
+      1162,
+      147
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-008.jpg",
+    "joint_ticks": [
+      1901,
+      2351,
+      915,
+      903,
+      1640,
+      1161,
+      669
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-009.jpg",
+    "joint_ticks": [
+      2123,
+      2344,
+      915,
+      903,
+      1640,
+      1160,
+      670
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-010.jpg",
+    "joint_ticks": [
+      2404,
+      2343,
+      915,
+      902,
+      2073,
+      1161,
+      138
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-011.jpg",
+    "joint_ticks": [
+      2169,
+      2512,
+      915,
+      902,
+      2074,
+      1061,
+      145
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-012.jpg",
+    "joint_ticks": [
+      2053,
+      2069,
+      916,
+      1182,
+      1872,
+      1137,
+      144
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-013.jpg",
+    "joint_ticks": [
+      2015,
+      1855,
+      918,
+      1380,
+      1873,
+      1045,
+      145
+    ]
+  },
+  {
+    "image": "../hand_eye_1/wrist-014.jpg",
+    "joint_ticks": [
+      1796,
+      2111,
+      916,
+      1143,
+      1596,
+      1044,
+      145
+    ]
+  },
+  {
+    "image": "../board_check/pose-00/wrist.jpg",
+    "joint_ticks": [
+      2101,
+      2640,
+      901,
+      893,
+      1915,
+      1103,
+      145
+    ]
+  },
+  {
+    "image": "../board_check/pose-01/wrist.jpg",
+    "joint_ticks": [
+      2103,
+      1903,
+      1366,
+      967,
+      1908,
+      1056,
+      221
+    ]
+  },
+  {
+    "image": "../board_check/pose-02/wrist.jpg",
+    "joint_ticks": [
+      2358,
+      1850,
+      1366,
+      965,
+      2068,
+      1054,
+      224
+    ]
+  },
+  {
+    "image": "../board_check/pose-03/wrist.jpg",
+    "joint_ticks": [
+      1851,
+      1998,
+      1252,
+      970,
+      1652,
+      1055,
+      221
+    ]
+  }
+]

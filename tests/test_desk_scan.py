@@ -1,0 +1,215 @@
+import asyncio
+import threading
+from unittest.mock import AsyncMock
+
+import numpy as np
+import pytest
+
+from desk_core import desk_scan, mcp_server, vision_3d
+from desk_core.sightings import SightingsStore
+from desk_core.station_bridge import LiveStationBridge
+
+
+def test_opencv_scene_detection_on_a_saturated_mat():
+    frame = np.full((240, 320, 3), (0, 180, 0), dtype=np.uint8)
+    frame[30:70, 40:100] = (220, 50, 20)
+    frame[150:190, 200:260] = (20, 30, 220)
+    detections = vision_3d._localize_scene_opencv(frame)
+    assert sorted(tuple(det["point"]) for det in detections) == [(206, 217), (706, 717)]
+
+
+def test_opencv_scene_finds_low_lab_contrast_items_on_a_neutral_mat():
+    frame = np.full((240, 320, 3), (45, 45, 45), dtype=np.uint8)
+    frame[30:70, 40:100] = (35, 37, 60)
+    frame[150:190, 200:260] = (42, 55, 38)
+    detections = vision_3d._localize_scene_opencv(frame)
+    assert sorted(tuple(det["point"]) for det in detections) == [(206, 217), (706, 717)]
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_scene_provider_distinguishes_empty_from_malformed(calib, mock_bridge, monkeypatch, invalid):
+    monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
+    payload = '{"detections": [{"found": true, "label": "phone", "point": "invalid"}]}' if invalid else '{"detections": []}'
+    monkeypatch.setattr(vision_3d, "_call_vlm_sync", lambda jpeg, query, provider, model: vision_3d._parse_vlm_json(payload, query))
+
+    async def scan():
+        jpeg = await mock_bridge.get_frame("top")
+        return await vision_3d.localize_frame_3d(jpeg, None, calib, provider="gemini")
+
+    detections = asyncio.run(scan())
+    if invalid:
+        assert detections
+        assert {det["backend"] for det in detections} == {"opencv-fallback"}
+    else:
+        assert detections == []
+
+
+def test_scene_provider_does_not_overlap_after_timeout(calib, mock_bridge, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def provider(jpeg, query, provider, model):
+        started.set()
+        assert release.wait(5)
+        return []
+
+    monkeypatch.setattr(vision_3d, "_call_vlm_sync", provider)
+    monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
+
+    async def check():
+        try:
+            jpeg = await mock_bridge.get_frame("top")
+            first = await vision_3d.localize_frame_3d(jpeg, None, calib, provider="gemini", timeout_s=0.1)
+            assert started.is_set()
+            assert first and all(det["backend"] == "opencv-fallback" for det in first)
+            next_scan = await vision_3d.localize_frame_3d(jpeg, None, calib, provider="gemini", timeout_s=1)
+            assert next_scan and all(
+                det["fallback_reason"] == "Previous scene vision request is still running." for det in next_scan
+            )
+        finally:
+            release.set()
+
+    asyncio.run(check())
+
+
+def test_scene_scan_never_uses_wrist_as_overhead(monkeypatch):
+    bridge = LiveStationBridge("localhost", 8888, cam_top="overhead-id", cam_wrist="wrist-id")
+    bridge._frames["wrist-id"] = b"wrist-frame"
+    bridge._frame_order.append("wrist-id")
+    monkeypatch.setattr(mcp_server, "_bridge", bridge)
+    monkeypatch.setattr(mcp_server, "_logger", None)
+
+    with pytest.raises(RuntimeError, match="No uniquely configured top camera"):
+        asyncio.run(mcp_server.localize_3d(provider="opencv"))
+
+
+@pytest.mark.parametrize("queue_advances", [False, True])
+def test_live_scan_waits_for_a_new_frame_on_startup(monkeypatch, queue_advances):
+    bridge = LiveStationBridge("localhost", 8888, cam_top="overhead-id", follow_motor_rx=True)
+    bridge.client = type("Client", (), {"read_from_tail": None})()
+    bridge._frames["overhead-id"] = b"archived"
+    bridge._key_to_qid["overhead-id"] = "usbvideo/overhead"
+    bridge._frame_order.append("overhead-id")
+    monkeypatch.setattr(mcp_server, "_bridge", bridge)
+    monkeypatch.setattr(mcp_server, "_logger", None)
+    archived = [("overhead-id", b"archived", 1, memoryview(b"1"))]
+    tail = AsyncMock(return_value=archived)
+    if queue_advances:
+        tail.side_effect = [archived, [("overhead-id", b"live", 2, memoryview(b"2"))]]
+    monkeypatch.setattr(bridge, "_fetch_tail_frames", tail)
+    localize = AsyncMock(return_value=[])
+    monkeypatch.setattr(mcp_server, "localize_frame_3d", localize)
+
+    result = asyncio.run(mcp_server.localize_3d(provider="opencv"))
+    assert all(call.kwargs["count"] == 1 for call in tail.await_args_list)
+    assert result["stale_frame"] is not queue_advances
+    if queue_advances:
+        assert localize.await_args.args[0] == b"live"
+        assert result["frame_ref"] == "normfs://usbvideo/overhead#32"
+    else:
+        localize.assert_not_awaited()
+
+
+def test_default_ten_minute_scan_in_mock_simulation(tmp_path, monkeypatch, mock_bridge):
+    monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
+    monkeypatch.setattr(mcp_server, "_bridge", mock_bridge)
+    monkeypatch.setattr(mcp_server, "_logger", None)
+    store = SightingsStore(db_path=tmp_path / "sightings.db", normfs_enabled=False)
+    monkeypatch.setattr(mcp_server, "_sightings", store)
+    motion = {}
+    for name in ("send_joint_targets", "set_torque", "grasp_with_verify", "abort"):
+        motion[name] = AsyncMock(side_effect=AssertionError(f"Unexpected motion: {name}"))
+        monkeypatch.setattr(mock_bridge, name, motion[name])
+    initial_positions = [m.position for m in asyncio.run(mock_bridge.get_state()).motors]
+    initial_scene = mock_bridge.get_mock_scene_state()
+    now = 0.0
+    frames = []
+
+    async def sleep(delay):
+        nonlocal now
+        rows = store.read_sqlite()
+        newest = rows[0].frame_ref
+        sightings = [row for row in rows if row.frame_ref == newest]
+        frames.append(newest)
+        assert now == 120 * (len(frames) - 1)
+        assert len(sightings) == len(initial_scene["objects"])
+        assert len(rows) == len(frames) * len(sightings)
+        assert len({(row.x, row.y) for row in sightings}) == len(sightings)
+        for obj in initial_scene["objects"].values():
+            assert any(
+                abs(row.x - obj["x"]) < 0.01 and abs(row.y - obj["y"]) < 0.01 for row in sightings
+            )
+        assert len({row.time for row in sightings}) == 1
+        assert {row.camera for row in sightings} == {"top"}
+        if now == 600:
+            raise asyncio.CancelledError
+        assert delay == 120
+        now += delay
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(desk_scan.run_desk_scan(provider="opencv", clock=lambda: now, sleep=sleep))
+
+    assert frames == [f"mock://top#{n}" for n in range(1, 7)]
+    for command in motion.values():
+        command.assert_not_called()
+    assert [m.position for m in asyncio.run(mock_bridge.get_state()).motors] == initial_positions
+    assert mock_bridge.get_mock_scene_state() == initial_scene
+
+
+def test_scene_scan_records_named_detections_and_skips_repeated_frame(tmp_path, monkeypatch, mock_bridge):
+    monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
+    monkeypatch.setattr(mcp_server, "_bridge", mock_bridge)
+    monkeypatch.setattr(mcp_server, "_logger", None)
+    monkeypatch.setattr(mock_bridge, "last_frame_ref", lambda camera: "mock://top#cached")
+    store = SightingsStore(db_path=tmp_path / "sightings.db", normfs_enabled=False)
+    monkeypatch.setattr(mcp_server, "_sightings", store)
+    calls = []
+
+    def call_vision(jpeg, query, provider, model):
+        calls.append((query, provider))
+        return vision_3d._parse_vlm_json(
+            """{"detections": [
+                {"found": true, "label": "blue keys", "point": [400, 200], "box_2d": [360, 180, 440, 220]},
+                {"found": true, "label": "phone", "point": "invalid"},
+                {"found": true, "label": "brown mug", "point": [600, 500], "box_2d": [550, 460, 650, 540]},
+                {"found": false, "label": "wallet"},
+                {"found": true, "label": "notebook"}
+            ]}""",
+            query,
+        )
+
+    monkeypatch.setattr(vision_3d, "_call_vlm_sync", call_vision)
+
+    async def scan_twice():
+        first = await mcp_server.localize_3d(provider="gemini", denoise=False)
+        second = await mcp_server.localize_3d(provider="gemini", denoise=False, after_frame_ref=first["frame_ref"])
+        return first, second
+
+    first, second = asyncio.run(scan_twice())
+    assert calls == [(None, "gemini")]
+    assert {det["label"] for det in first["detections"]} == {"blue keys", "brown mug"}
+    assert first["stale_frame"] is False
+    assert second == {"detections": [], "frame_ref": first["frame_ref"], "stale_frame": True}
+    rows = store.read_sqlite()
+    assert sorted(row.label for row in rows) == ["blue keys", "brown mug"]
+    assert {row.frame_ref for row in rows} == {first["frame_ref"]}
+
+
+def test_scan_retries_on_the_next_tick_after_a_failure(monkeypatch):
+    scan = AsyncMock(side_effect=[
+        RuntimeError("camera unavailable"),
+        {"detections": [], "frame_ref": "mock://top#1", "stale_frame": False},
+    ])
+    monkeypatch.setattr(desk_scan, "localize_3d", scan)
+    now = 0.0
+
+    async def sleep(delay):
+        nonlocal now
+        assert delay == 2.0
+        now += delay
+        if now == 4.0:
+            raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(desk_scan.run_desk_scan(2.0, clock=lambda: now, sleep=sleep))
+    assert scan.await_count == 2

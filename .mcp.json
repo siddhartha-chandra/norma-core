@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "desk-core": {
+      "command": "uv",
+      "args": ["run", "--offline", "--managed-python", "python", "-m", "desk_core.mcp_server"]
+    }
+  }
+}
