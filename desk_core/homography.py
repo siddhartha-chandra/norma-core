@@ -447,11 +447,12 @@ def clear_plane_homography(
     calib_path: Path | str | None = None,
     *,
     keep_anchors: bool = True,
+    save: bool = True,
 ) -> dict[str, Any]:
     """Remove ``H_table`` override from ``calib/rig_calib.json`` to revert to ``T_world_cam_top``."""
     target_path = Path(calib_path) if calib_path is not None else resolve_default_calib_path()
     if not target_path.exists():
-        return {"ok": True, "removed": False, "calib_path": str(target_path)}
+        return {"ok": True, "removed": False, "saved": False, "calib_path": str(target_path)}
     raw = json.loads(target_path.read_text(encoding="utf-8"))
     removed = "H_table" in raw
     raw.pop("H_table", None)
@@ -462,9 +463,11 @@ def clear_plane_homography(
             removed = True
     if not keep_anchors:
         raw.pop("table_anchors", None)
-    if removed or not keep_anchors:
+    wrote = False
+    if save and (removed or not keep_anchors):
         _atomic_write_json(target_path, raw)
-    return {"ok": True, "removed": removed, "calib_path": str(target_path)}
+        wrote = True
+    return {"ok": True, "removed": removed, "saved": wrote, "calib_path": str(target_path)}
 
 
 def draw_reanchor_overlay(

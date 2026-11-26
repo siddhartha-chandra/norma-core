@@ -244,11 +244,12 @@ def main(argv: list[str] | None = None) -> int:
     max_error_m = float(args.max_error_cm) / 100.0
 
     if args.clear:
-        res = clear_plane_homography(calib_path=calib_path)
+        res = clear_plane_homography(calib_path=calib_path, save=not args.dry_run)
         if args.json:
             print(json.dumps(res, indent=2))
         else:
-            print(f"Cleared H_table from {res['calib_path']} (removed={res['removed']})")
+            prefix = "[DRY-RUN] Would clear" if args.dry_run else "Cleared"
+            print(f"{prefix} H_table from {res['calib_path']} (removed={res['removed']}, saved={res['saved']})")
         return 0
 
     calib = CalibrationStore(calib_path)

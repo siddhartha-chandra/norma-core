@@ -514,3 +514,23 @@ def test_clear_plane_homography_removes_nested_h_table(tmp_path: Path):
     assert res["removed"] is True
     cs = CalibrationStore(calib_file)
     assert cs.data.get("H_table") is None
+
+
+def test_cli_dry_run_clear_preserves_calibration(tmp_path: Path):
+    """--dry-run --clear must leave rig_calib.json unchanged on disk."""
+    calib_file = tmp_path / "rig_calib.json"
+    calib_file.write_text(json.dumps({"H_table": np.eye(3).tolist()}), encoding="utf-8")
+    cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts" / "reanchor_plane.py"),
+        "--calib", str(calib_file),
+        "--dry-run",
+        "--clear",
+        "--json",
+    ]
+    proc = subprocess.run(cmd, cwd=str(REPO_ROOT), capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stderr
+    data = json.loads(proc.stdout)
+    assert data["removed"] is True
+    assert data["saved"] is False
+    assert "H_table" in json.loads(calib_file.read_text(encoding="utf-8"))
