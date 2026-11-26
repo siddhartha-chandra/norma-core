@@ -1,0 +1,16 @@
+{
+  "name": "drop_x",
+  "description": "Default drop location: the X on the white sticker, right of the arm in the scene camera view.",
+  "position_base_m": [0.1722, -0.0668, 0.00237],
+  "source": {
+    "camera": "top",
+    "pixel": [860, 427],
+    "image": "calib_frames/grasp_earbud/top_drop.jpg",
+    "method": "scene camera ray intersected with the table plane (z_table)"
+  },
+  "joint_ticks": {"1": 2591, "2": 2048, "3": 1093, "4": 949, "5": 1683, "6": 1076, "7": 994},
+  "joint_ticks_note": "Release pose above the X: jaw tips about 72 mm above the table, 20 deg tilt. Solved once from position_base_m; replay these ticks directly (no IK).",
+  "uncertainty_m": 0.02,
+  "refined_by_wrist": false,
+  "measured": "2026-11-22"
+}

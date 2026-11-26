@@ -148,6 +148,13 @@ def test_allowed_bounds_shrink_by_margin_but_include_current_pose(calib):
     assert min(abs(lower[2] - q_now[2]), abs(upper[2] - q_now[2])) < 1e-9
 
 
+def test_allowed_bounds_ignore_uncalibrated_full_span_ranges(calib):
+    calibrated = motors_at(FRONT_POSE_TICKS)
+    full_span = [replace(m, range_min=0, range_max=4095) for m in calibrated]
+    for a, b in zip(allowed_bounds_rad(calib, calibrated), allowed_bounds_rad(calib, full_span)):
+        assert np.allclose(a, b)
+
+
 def test_lowest_point_at_front_pose(calib):
     assert 0.10 < lowest_point_m(calib, rad(calib, FRONT_POSE_TICKS)) < 0.20
 

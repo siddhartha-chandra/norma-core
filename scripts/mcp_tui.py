@@ -104,7 +104,7 @@ DEFAULT_ARGS: dict[str, dict[str, Any]] = {
     "grasp": {},
     "release": {},
     "move_joints": {"targets": {"1": 2048}, "max_step": 150, "wait": True},
-    "move_joint": {"joints": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "max_step_rad": 0.2, "wait": True},
+    "move_joint": {"joints": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "wait": True},
     "go_home": {},
     "move_to_pose": {"x": 0.25, "y": 0.0, "z": 0.12, "qx": 0.0, "qy": 0.564687767, "qz": 0.0, "qw": 0.825335614},
     "pick_at": {"x": 0.25, "y": 0.0, "z": 0.05, "qx": 0.0, "qy": 0.707106781, "qz": 0.0, "qw": 0.707106781, "approach_dz": 0.06},

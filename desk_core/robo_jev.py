@@ -305,7 +305,10 @@ async def check_reflex_and_abort(
     aborted = False
     abort_res: dict[str, Any] | None = None
     if not report["ok"]:
-        abort_res = await bridge.abort()
+        try:
+            abort_res = await bridge.abort(source="reflex")
+        except TypeError:
+            abort_res = await bridge.abort()
         aborted = True
     report["aborted"] = aborted
     report["abort_result"] = abort_res
@@ -346,11 +349,19 @@ async def guarded_recover(
         camera=camera,
     )
 
+    def _can_rearm() -> bool:
+        return getattr(bridge, "_abort_source", "manual") != "manual" and hasattr(bridge, "rearm")
+
     if report["ok"]:
+        if getattr(bridge, "_aborted", False) and _can_rearm() and (target_xy is not None or not _get_obs()):
+            bridge.rearm()
         return {"ok": True, "action": "proceed", "target_xy": list(target_xy) if target_xy else None, "report": report}
 
-    # Immediate safe pause
-    await bridge.abort()
+    # Immediate safe pause; preserve any pre-existing or mid-recovery manual E-STOP latch
+    try:
+        await bridge.abort(source="reflex")
+    except TypeError:
+        await bridge.abort()
 
     # Case 1: Transient obstacle in path -> pause and poll until obstacle moves out
     if report.get("blocker") is not None or report.get("reason") == "will_tip":
@@ -366,6 +377,8 @@ async def guarded_recover(
                 camera=camera,
             )
             if rep_retry["ok"]:
+                if _can_rearm():
+                    bridge.rearm()
                 return {
                     "ok": True,
                     "action": "resumed_after_obstacle",
@@ -410,6 +423,8 @@ async def guarded_recover(
             }
 
         gatekeeper.arm_watch(jpeg_bytes=jpeg, pixel=new_px, query=query, depth_m=depth_m)
+        if _can_rearm():
+            bridge.rearm()
         return {
             "ok": True,
             "action": "recalibrated",

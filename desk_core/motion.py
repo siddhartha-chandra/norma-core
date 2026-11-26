@@ -15,7 +15,7 @@ from scipy.spatial.transform import Rotation
 
 from .calib_store import TICKS_PER_RAD, CalibrationStore
 from .ik_tracik import TOOL_FRAME, get_solver
-from .station_bridge import MotorState, StationBridge
+from .station_bridge import ELROBOT_MOTOR_RANGES, MAX_ANGLE_STEP, MotorState, StationBridge
 from .urdf_fk import load_urdf
 
 log = logging.getLogger(__name__)
@@ -131,11 +131,23 @@ def lowest_point_m(calib: CalibrationStore, q) -> float:
                      + [tip_z]))
 
 
+def calibrated_range(m: MotorState) -> tuple[int, int]:
+    """The motor's range, or the known ElRobot range when Station reports an uncalibrated full span."""
+    if m.range_min <= 0 and m.range_max >= MAX_ANGLE_STEP and m.id in ELROBOT_MOTOR_RANGES:
+        return ELROBOT_MOTOR_RANGES[m.id]
+    return m.range_min, m.range_max
+
+
 def allowed_bounds_rad(calib: CalibrationStore, motors: list[MotorState], margin: int = RANGE_MARGIN_TICKS):
-    """Motor ranges shrunk by a margin, widened to include the current pose so joints may move away from a limit."""
+    """Motor ranges shrunk by a margin, widened to include the current pose so joints may move away from a limit.
+
+    A full 0..4095 range (Station without range calibration) would let the planner drive joints into their
+    mechanical stops, so :func:`calibrated_range` substitutes the known ElRobot ranges.
+    """
     n_arm = calib.num_arm_joints(len(motors))
     arm = motors[:n_arm]
-    shrunk = [MotorState(m.id, m.position, m.current_ma, m.range_min + margin, m.range_max - margin) for m in arm]
+    shrunk = [MotorState(m.id, m.position, m.current_ma, calibrated_range(m)[0] + margin, calibrated_range(m)[1] - margin)
+              for m in arm]
     bounds = calib.bounds_rad(shrunk)
     q_now = calib.ticks_to_rad(arm)
     lower = np.minimum([b[0] for b in bounds], q_now)
@@ -266,6 +278,29 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
     final = (await bridge.get_state()).positions()
     return {"ok": True, "cycles": cycles, "elapsed_s": round(time.monotonic() - start, 2), "worst_lag_ticks": worst_lag,
             "final_ticks": [final[mid] for mid in arm_ids]}
+
+
+async def move_joints_smooth(bridge: StationBridge, calib: CalibrationStore, q_goal, limits: MotionLimits | None = None) -> dict:
+    """Move the arm in joint space to ``q_goal`` (radians) as one continuous minimum-jerk stream.
+
+    The peak joint speed is ``limits.joint_speed_deg_s`` (or ``limits.min_duration_s`` for short moves); the
+    arm never stops between waypoints. The end pose is then corrected for gravity sag.
+    """
+    limits = limits or MotionLimits()
+    motors = (await bridge.get_state()).motors
+    q0 = np.array(calib.ticks_to_rad(motors))
+    goal = np.asarray(q_goal, dtype=float)
+    path = np.vstack([q0, goal])
+    travel = float(np.max(np.abs(goal - q0)))
+    duration = max(limits.min_duration_s, 1.875 * travel / math.radians(limits.joint_speed_deg_s))
+    run = await stream_joint_path(bridge, calib, path, duration, limits)
+    if run["ok"]:
+        corr = await correct_final_pose(bridge, calib, path, limits)
+        run["correction"] = corr
+        if corr["off_target_mm"] and corr["off_target_mm"][-1] > limits.correct_tol_mm:
+            run["ok"] = False
+            run["reason"] = f"final flange error {corr['off_target_mm'][-1]} mm exceeds {limits.correct_tol_mm} mm"
+    return run
 
 
 async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, path: np.ndarray,

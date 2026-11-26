@@ -1,0 +1,8 @@
+{
+  "home": {
+    "description": "Home pose saved right after the joint calibration.",
+    "joint_ticks": {"1": 2137, "2": 2891, "3": 930, "4": 996, "5": 1866, "6": 1042, "7": 139},
+    "gripper_ticks": 1256,
+    "saved": "2026-11-22"
+  }
+}

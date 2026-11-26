@@ -60,14 +60,29 @@ from desk_core.llm_plugins import (
 )
 
 MOTION_TOOLS = {
+    "set_torque",
     "move_joints",
     "move_joint",
+    "grasp",
+    "release",
     "go_home",
+    "move_to_home",
     "move_to_pose",
     "pick_at",
     "place_at",
     "pick_pixel",
+    "retract_to_hover",
+    "move_to_drop",
+    "robo_jev_guard",
     "execute_sequence",
+}
+
+# Tools that only move the arm when called with execute=True (dry-run planning is read-only)
+EXECUTE_GATED_TOOLS = {
+    "move_flange",
+    "aim_wrist",
+    "capture_wrist_stereo",
+    "master_pick_place",
 }
 
 
@@ -589,8 +604,8 @@ class RobotAgentTUI(App):
     #key-status { height: auto; margin-bottom: 0; color: $text-muted; }
     #guide-panel { height: auto; border: solid $accent; background: $panel; padding: 0 1; margin-bottom: 1; }
     #camera-panel { height: 18; margin-bottom: 1; display: none; }
-    .cam-box { width: 1fr; height: 18; border: solid $success; padding: 0 1; margin-right: 1; }
-    .cam-img { width: 1fr; height: 15; }
+    .cam-box { width: 1fr; height: 18; border: solid $success; padding: 0 1; margin-right: 1; align-horizontal: center; }
+    .cam-img { width: auto; height: 15; }
     #chat-log { height: 1fr; border: solid $primary; padding: 0 1; margin-bottom: 1; }
     #input-bar { height: auto; align: left middle; }
     #cmd-input { width: 1fr; margin-right: 1; }
@@ -611,8 +626,8 @@ class RobotAgentTUI(App):
         Binding("ctrl+p", "open_placement", "Placement"),
         Binding("ctrl+k", "open_keys", "API Keys"),
         Binding("ctrl+v", "voice_command", "Voice"),
-        Binding("ctrl+e", "trigger_estop", "E-STOP"),
-        Binding("f12", "trigger_estop", "E-STOP"),
+        Binding("ctrl+e", "trigger_estop", "E-STOP", priority=True),
+        Binding("f12", "trigger_estop", "E-STOP", priority=True),
         Binding("q", "quit", "Quit"),
     ]
 
@@ -652,6 +667,7 @@ class RobotAgentTUI(App):
         with Horizontal(id="action-bar"):
             yield Button("Guide (F1)", id="btn-guide")
             yield Button("Placement (Ctrl+P)", variant="primary", id="btn-placement")
+            yield Button("Reset Rig (Home)", id="btn-home")
             yield Button("API Keys (Ctrl+K)", id="btn-keys")
             yield Button("E-STOP (Ctrl+E)", variant="error", id="btn-estop")
             yield Checkbox("Arm Motion", value=(not self.live), id="arm-motion")
@@ -715,12 +731,12 @@ class RobotAgentTUI(App):
             "[bold]=== DESK-CORE Voice & Vision Agent Guide (F1 to toggle) ===[/bold]\n"
             f"{mode_hint}\n"
             "[b]Controls:[/b] Type + [b]Enter[/b] | [b]Ctrl+V[/b] Voice (4s) | [b]Ctrl+K[/b] API Keys | [b]Show Camera Views[/b] | [b]Ctrl+E / F12[/b] E-STOP\n"
-            "[b]Try:[/b] [i]\"What objects do you see from both cameras?\"[/i] | [i]\"Show 3D positions of all objects\"[/i] | [i]\"Move red_cube closer to mug\"[/i]"
+            "[b]Try:[/b] [i]\"What objects do you see from the top camera?\"[/i] | [i]\"Show 3D positions of all objects\"[/i] | [i]\"Move red_cube closer to mug\"[/i]"
         )
 
     async def on_mount(self) -> None:
         self._refresh_status()
-        self._cam_timer = self.set_interval(0.9, self._poll_cameras)
+        self._cam_timer = self.set_interval(0.2, self._poll_cameras)
         self._mcp_task = asyncio.create_task(self._mcp_runner())
 
     def action_show_guide(self) -> None:
@@ -731,26 +747,215 @@ class RobotAgentTUI(App):
     def _on_guide_btn(self) -> None:
         self.action_show_guide()
 
-    async def _refresh_camera_views(self) -> None:
-        if self.session is None or not self.query_one("#show-cams", Checkbox).value:
+    def _project_xyz(self, cam: str, xyz: tuple[float, float, float], w: int, h: int) -> tuple[float, float] | None:
+        wx, wy, wz = xyz
+        if cam == "top":
+            cx_cam, cy_cam, cz_cam, f_px = 0.28, 0.0, 0.65, 680.0 * (w / 640.0)
+        else:
+            ex, ey, ez = getattr(self, "_last_ee_pos", (0.28, 0.0, 0.25))
+            cx_cam, cy_cam, cz_cam, f_px = ex, ey, max(0.12, ez), 520.0 * (w / 640.0)
+        dz = max(0.06, cz_cam - wz)
+        u = (w * 0.5) - ((wy - cy_cam) / dz) * f_px
+        v = (h * 0.5) - ((wx - cx_cam) / dz) * f_px
+        if u < -40 or u > w + 40 or v < -40 or v > h + 40:
+            return None
+        return u, v
+
+    def _draw_overlay_markers(self, cam: str, img: Image.Image) -> Image.Image:
+        markers = getattr(self, "_overlay_markers", None)
+        if not markers:
+            return img
+        now = time.monotonic()
+        expired = [k for k, m in markers.items() if now > float(m.get("expires_at", 0.0))]
+        for k in expired:
+            markers.pop(k, None)
+        active = [m for m in markers.values() if m.get("camera") in (cam, "both")]
+        if not active:
+            return img
+
+        out = img.convert("RGB").copy()
+        d = ImageDraw.Draw(out)
+        w, h = out.size
+        for m in active:
+            col = tuple(m.get("color", (0, 225, 255)))
+            views = m.get("views") or {}
+            v_det = views.get(cam) if isinstance(views, dict) else None
+            if isinstance(v_det, dict) and v_det.get("found"):
+                box = v_det.get("box_2d")
+                px = v_det.get("pixel")
+                iw, ih = v_det.get("image_size", [640, 480])
+                use_2d = True
+            else:
+                box = m.get("box_2d")
+                px = m.get("pixel")
+                iw, ih = m.get("image_size", [640, 480])
+                use_2d = m.get("camera") == cam
+            xyz = m.get("xyz")
+            x0 = y0 = x1 = y1 = None
+            if box and len(box) == 4 and use_2d:
+                ymin, xmin, ymax, xmax = box
+                x0, y0 = xmin / 1000.0 * w, ymin / 1000.0 * h
+                x1, y1 = xmax / 1000.0 * w, ymax / 1000.0 * h
+            elif px and len(px) == 2 and use_2d:
+                cx = float(px[0]) / max(1.0, float(iw)) * w
+                cy = float(px[1]) / max(1.0, float(ih)) * h
+                x0, y0, x1, y1 = cx - 26, cy - 26, cx + 26, cy + 26
+            elif xyz is not None:
+                proj = self._project_xyz(cam, tuple(xyz), w, h)
+                if proj is not None:
+                    cx, cy = proj
+                    x0, y0, x1, y1 = cx - 26, cy - 26, cx + 26, cy + 26
+
+            if x0 is None:
+                continue
+            x0, x1 = max(2, min(w - 3, x0)), max(2, min(w - 3, x1))
+            y0, y1 = max(2, min(h - 3, y0)), max(2, min(h - 3, y1))
+            cx, cy = (x0 + x1) * 0.5, (y0 + y1) * 0.5
+            d.rectangle([x0 - 1, y0 - 1, x1 + 1, y1 + 1], outline=(15, 15, 20), width=5)
+            d.rectangle([x0, y0, x1, y1], outline=col, width=3)
+            d.line([(cx - 8, cy), (cx + 8, cy)], fill=col, width=2)
+            d.line([(cx, cy - 8), (cx, cy + 8)], fill=col, width=2)
+            tri_suffix = " [TRI]" if m.get("fusion_mode") == "triangulated" else ""
+            tag = f" {m.get('label', 'target')}{tri_suffix} "
+            tw = min(w - 8, max(36, len(tag) * 6 + 6))
+            ly = max(2, y0 - 16)
+            d.rectangle([x0, ly, min(w - 2, x0 + tw), ly + 14], fill=col)
+            d.text((x0 + 3, ly + 2), tag, fill=(10, 12, 16))
+        return out
+
+    def _record_tool_markers(self, name: str, args: dict[str, Any], payload: Any) -> None:
+        if not hasattr(self, "_overlay_markers"):
+            self._overlay_markers: dict[str, dict[str, Any]] = {}
+        data = payload
+        if isinstance(payload, str):
+            try:
+                data = json.loads(payload)
+            except Exception:
+                data = None
+        if not isinstance(data, dict):
+            data = {}
+
+        palette = [(0, 225, 255), (255, 195, 0), (80, 240, 120), (255, 95, 175)]
+        ttl = time.monotonic() + 25.0
+
+        if name in ("localize_3d", "robo_jev_check", "robo_jev_guard") and data.get("found"):
+            label = str(data.get("query") or data.get("label") or args.get("query") or "target")
+            cam = str(data.get("camera") or args.get("camera") or "top")
+            world = data.get("world") or data.get("pose_6d")
+            xyz = (float(world["x"]), float(world["y"]), float(world["z"])) if isinstance(world, dict) and "x" in world else None
+            existing = self._overlay_markers.get(label, {})
+            col = existing.get("color") or palette[len(self._overlay_markers) % len(palette)]
+            views = dict(existing.get("views") or {})
+            if isinstance(data.get("views"), dict):
+                for v_cam, v_det in data["views"].items():
+                    if isinstance(v_det, dict):
+                        views[v_cam] = v_det
+                cam = "both"
+            else:
+                views[cam] = {
+                    "found": True,
+                    "box_2d": data.get("box_2d"),
+                    "pixel": data.get("pixel"),
+                    "image_size": data.get("image_size", [640, 480]),
+                }
+                if len(views) > 1:
+                    cam = "both"
+            self._overlay_markers[label] = {
+                "label": label,
+                "camera": cam,
+                "box_2d": data.get("box_2d"),
+                "pixel": data.get("pixel"),
+                "image_size": data.get("image_size", [640, 480]),
+                "views": views,
+                "fusion_mode": data.get("fusion_mode") or existing.get("fusion_mode"),
+                "xyz": xyz,
+                "color": col,
+                "expires_at": ttl,
+            }
             return
-        if not hasattr(self, "_last_cam_bytes"):
-            self._last_cam_bytes: dict[str, bytes] = {}
+
+        if name == "mock_scene_state" and isinstance(data.get("objects"), dict):
+            ee = data.get("ee_pos")
+            if isinstance(ee, dict) and "x" in ee:
+                self._last_ee_pos = (float(ee["x"]), float(ee["y"]), float(ee["z"]))
+            cmd_low = getattr(self, "_active_cmd", "").lower()
+            aliases = {
+                "green_block": ("green_block", "green block", "green box"),
+                "red_cube": ("red_cube", "red cube", "red box"),
+                "mobile_phone": ("mobile_phone", "mobile phone", "phone"),
+                "wired_earphones": ("wired_earphones", "wired earphones", "earphones"),
+            }
+            for obj_name, obj in data["objects"].items():
+                keys = aliases.get(obj_name, (obj_name, obj_name.replace("_", " ")))
+                if any(k in cmd_low for k in keys):
+                    col = self._overlay_markers.get(obj_name, {}).get("color") or palette[len(self._overlay_markers) % len(palette)]
+                    self._overlay_markers[obj_name] = {
+                        "label": obj_name,
+                        "camera": "both",
+                        "xyz": (float(obj["x"]), float(obj["y"]), float(obj.get("z", 0.0))),
+                        "color": col,
+                        "expires_at": ttl,
+                    }
+            return
+
+        if name in ("pick_at", "place_at") and "x" in args and "y" in args:
+            tag = "PICK" if name == "pick_at" else "PLACE"
+            col = (255, 85, 65) if name == "pick_at" else (60, 235, 115)
+            self._overlay_markers[tag] = {
+                "label": tag,
+                "camera": "both",
+                "xyz": (float(args["x"]), float(args["y"]), float(args.get("z", 0.0))),
+                "color": col,
+                "expires_at": ttl,
+            }
+        elif name == "pick_pixel" and "x" in args and "y" in args:
+            self._overlay_markers["PICK"] = {
+                "label": "PICK",
+                "camera": str(args.get("camera", "top")),
+                "pixel": [float(args["x"]), float(args["y"])],
+                "image_size": [640, 480],
+                "color": (255, 85, 65),
+                "expires_at": ttl,
+            }
+
+    async def _refresh_camera_views(self) -> None:
+        if self.session is None or not self.is_mounted:
+            return
+        try:
+            if not self.query_one("#show-cams", Checkbox).value:
+                return
+        except Exception:
+            return
+        if getattr(self, "_cam_busy", False):
+            return
+        self._cam_busy = True
+        if not hasattr(self, "_last_cam_sig"):
+            self._last_cam_sig: dict[str, tuple[bytes, str]] = {}
         try:
             r_top, r_wrist = await asyncio.gather(
-                self.session.call_tool("get_frame", {"camera": "top", "denoise": False}),
-                self.session.call_tool("get_frame", {"camera": "wrist", "denoise": False}),
+                self.session.call_tool("get_frame", {"camera": "top", "denoise": False, "save_npy": False}),
+                self.session.call_tool("get_frame", {"camera": "wrist", "denoise": False, "save_npy": False}),
+            )
+            markers = getattr(self, "_overlay_markers", {})
+            marker_sig = json.dumps(
+                {k: (v.get("camera"), v.get("box_2d"), v.get("pixel"), v.get("xyz")) for k, v in sorted(markers.items())},
+                default=str,
             )
             for cam, wid, res in [("top", "#cam-top-view", r_top), ("wrist", "#cam-wrist-view", r_wrist)]:
                 for block in res.content:
                     if getattr(block, "type", None) == "image":
                         jpg = base64.b64decode(block.data)
-                        if self._last_cam_bytes.get(cam) != jpg:
-                            self._last_cam_bytes[cam] = jpg
-                            self.query_one(wid, TerminalImage).image = Image.open(io.BytesIO(jpg))
+                        sig = (jpg, marker_sig)
+                        if self._last_cam_sig.get(cam) != sig:
+                            self._last_cam_sig[cam] = sig
+                            img = Image.open(io.BytesIO(jpg))
+                            img = self._draw_overlay_markers(cam, img)
+                            self.query_one(wid, TerminalImage).image = img
                         break
         except Exception:
             pass
+        finally:
+            self._cam_busy = False
 
     @on(Button.Pressed, "#btn-placement")
     async def _on_placement_btn(self) -> None:
@@ -836,6 +1041,8 @@ class RobotAgentTUI(App):
         if self.session is None:
             return
         await self.session.call_tool("mock_reset_scene", {})
+        if hasattr(self, "_overlay_markers"):
+            self._overlay_markers.clear()
         log.write("[cyan]Reset synthetic 3D scene to defaults.[/cyan]")
         await self._refresh_camera_views()
 
@@ -881,8 +1088,19 @@ class RobotAgentTUI(App):
     async def _on_estop_btn(self) -> None:
         await self.action_trigger_estop()
 
+    @on(Button.Pressed, "#btn-home")
+    async def _on_home_btn(self) -> None:
+        log = self.query_one("#chat-log", RichLog)
+        res = await self._call_mcp_tool("go_home", {"look_at_table": True})
+        if isinstance(res, dict) and res.get("ok") is False:
+            return
+        log.write(f"[green]Rig reset to table-view home:[/green] {res}")
+
     async def action_trigger_estop(self) -> None:
         log = self.query_one("#chat-log", RichLog)
+        cancelled = self.workers.cancel_group(self, "agent")
+        if cancelled:
+            log.write("[bold red]Agent stopped.[/bold red]")
         if self.session is None:
             log.write("[red]Not connected.[/red]")
             return
@@ -905,18 +1123,23 @@ class RobotAgentTUI(App):
         if self.session is None:
             return {"error": "MCP not connected"}
         armed = self.query_one("#arm-motion", Checkbox).value
-        if name in MOTION_TOOLS and not armed:
+        needs_arm = name in MOTION_TOOLS or (name in EXECUTE_GATED_TOOLS and bool(args.get("execute")))
+        if needs_arm and not armed:
             msg = f"Blocked `{name}`: check Arm Motion first."
             log.write(f"[yellow]{msg}[/yellow]")
             return {"ok": False, "error": msg}
 
         log.write(f"[cyan]→ {name}[/cyan]({json.dumps(args)})")
         res = await self.session.call_tool(name, args)
-        await self._refresh_camera_views()
+        payload: Any
         if getattr(res, "structuredContent", None) is not None:
-            return res.structuredContent
-        texts = [b.text for b in res.content if getattr(b, "type", None) == "text"]
-        return "\n".join(texts)
+            payload = res.structuredContent
+        else:
+            texts = [b.text for b in res.content if getattr(b, "type", None) == "text"]
+            payload = "\n".join(texts)
+        self._record_tool_markers(name, args, payload)
+        await self._refresh_camera_views()
+        return payload
 
     @on(Input.Submitted, "#cmd-input")
     @on(Button.Pressed, "#btn-send")
@@ -926,7 +1149,7 @@ class RobotAgentTUI(App):
         if not cmd:
             return
         inp.value = ""
-        await self._execute_command(cmd)
+        self._start_agent(cmd)
 
     @on(Button.Pressed, "#btn-voice")
     async def _on_voice_btn(self) -> None:
@@ -943,13 +1166,75 @@ class RobotAgentTUI(App):
                 log.write("[yellow]No speech detected.[/yellow]")
                 return
             log.write(f"[b]Voice:[/b] {transcript}")
-            await self._execute_command(transcript)
+            self._start_agent(transcript)
         except Exception as exc:
             log.write(f"[red]Voice error:[/red] {exc}")
+
+    def _agent_running(self) -> bool:
+        return any(w.group == "agent" and w.is_running for w in self.workers)
+
+    def _start_agent(self, cmd: str) -> None:
+        if self._agent_running():
+            self.query_one("#chat-log", RichLog).write("[yellow]Agent busy; press Ctrl+E to stop it first.[/yellow]")
+            return
+        self.run_worker(self._execute_command(cmd), group="agent", exclusive=False, name="agent")
+
+    async def _run_plan(self, plan: dict[str, Any]) -> None:
+        log = self.query_one("#chat-log", RichLog)
+        log.write(f"[cyan]Jev plan: {plan['template']} {json.dumps(plan['slots'])}[/cyan]")
+        if not self.query_one("#arm-motion", Checkbox).value:
+            msg = "Blocked `execute_sequence`: check Arm Motion first."
+            log.write(f"[yellow]{msg}[/yellow]")
+            self._chat_history.append(("assistant", msg))
+            return
+        obs = await self._call_mcp_tool("observe", {})
+        preflight_err: str | None = None
+        if isinstance(obs, dict):
+            if obs.get("ok") is False or obs.get("error"):
+                preflight_err = str(obs.get("error") or "Preflight observe failed.")
+        elif isinstance(obs, str):
+            if "[camera " in obs and "unavailable:" in obs:
+                preflight_err = f"Preflight observe failed: camera unavailable ({obs.splitlines()[-1]})"
+            else:
+                try:
+                    summary = json.loads(obs)
+                except Exception:
+                    preflight_err = f"Preflight observe failed: {obs[:180]}"
+                else:
+                    link = summary.get("link") if isinstance(summary, dict) else None
+                    if isinstance(link, dict):
+                        if link.get("socket_up") is False or link.get("resyncing") is True:
+                            preflight_err = f"Preflight observe failed: station link not ready ({link})"
+                        elif link.get("rx_age_ms") is not None and float(link["rx_age_ms"]) > 5000.0:
+                            preflight_err = f"Preflight observe failed: stale telemetry ({link['rx_age_ms']} ms)"
+        if preflight_err:
+            log.write(f"[red]Agent:[/red] {preflight_err}")
+            self._chat_history.append(("assistant", preflight_err))
+            return
+        res = await self._call_mcp_tool("execute_sequence", {"steps": plan["steps"]})
+        if isinstance(res, dict) and res.get("ok") is True:
+            log.write("[bold green]Done.[/bold green]")
+            reply = "Done."
+        else:
+            log.write(f"[bold red]Plan failed:[/bold red] {res}")
+            reply = "The plan failed."
+        mode = str(self.query_one("#output-mode", Select).value or "audio_text")
+        if mode in ("audio_text", "audio_only"):
+            voice = str(self.query_one("#voice-select", Select).value or "female")
+            await asyncio.to_thread(speak_text_sync, reply, voice)
 
     async def _execute_command(self, cmd: str) -> None:
         log = self.query_one("#chat-log", RichLog)
         log.write(f"\n[b]You:[/b] {cmd}")
+        self._active_cmd = cmd
+        if hasattr(self, "_overlay_markers"):
+            self._overlay_markers.clear()
+        plan = await self._call_mcp_tool("plan_command", {"command": cmd})
+        if isinstance(plan, dict) and plan.get("route") == "motion":
+            await self._run_plan(plan)
+            return
+        if isinstance(plan, dict) and plan.get("route") in ("unsupported", "not_found", "unavailable"):
+            log.write(f"[dim]Jev: {plan.get('reason')}. Using the LLM agent.[/dim]")
         val = str(self.query_one("#model-select", Select).value or "gemini:gemini-4-hydrogen")
         provider, _, model_id = val.partition(":")
         try:
