@@ -1,10 +1,40 @@
 """Races between live motor startup and the reflex stop, with fake Station telemetry and writes."""
 import asyncio
+import logging
 import time
 
 import pytest
 
 from desk_core.station_bridge import EStopLatched, LiveStationBridge, MotorState, RAM_GOAL_POSITION
+from station_py import Client, new_station_client
+
+
+def test_station_client_setup_timeout_stops_connection_task(monkeypatch):
+    async def check():
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def manage_connection(_client):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                stopped.set()
+
+        async def wait_ready(_client, timeout):
+            await started.wait()
+            raise TimeoutError("offline")
+
+        monkeypatch.setattr(Client, "manage_connection", manage_connection)
+        monkeypatch.setattr(Client, "wait_ready", wait_ready)
+        for _ in range(2):
+            started.clear()
+            stopped.clear()
+            with pytest.raises(TimeoutError, match="offline"):
+                await new_station_client("localhost", logging.getLogger(__name__))
+            assert stopped.is_set()
+
+    asyncio.run(check())
 
 
 @pytest.mark.parametrize("stop_at_read", [1, 2])

@@ -63,7 +63,12 @@ class Client:
         self.ping_sequence = 0
 
         # Start connection management as a task in the provided loop
-        asyncio.create_task(self.manage_connection())
+        self._connection_task = asyncio.create_task(self.manage_connection())
+
+    async def close(self):
+        self._connection_task.cancel()
+        await asyncio.gather(self._connection_task, return_exceptions=True)
+        self.close_connection()
 
     async def wait_ready(self, timeout: Optional[float] = None):
         """
@@ -472,7 +477,11 @@ async def new_station_client(server: str, logger) -> StationClient:
         addr = f"{server}:8888"
 
     client = Client(addr, logger)
-    await client.wait_ready(timeout=10.0)
+    try:
+        await client.wait_ready(timeout=10.0)
+    except (Exception, asyncio.CancelledError):
+        await client.close()
+        raise
     return client
 
 

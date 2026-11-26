@@ -250,14 +250,14 @@ async def main() -> int:
                 "confidence": 0.96,
             })
 
-        with patch("desk_core.vision_3d._call_gemini_interactions_sync", return_value={
+        with patch("desk_core.vision_3d._call_gemini_interactions_sync", return_value=[{
             "found": True,
             "label": "silicone key fob",
             "point": [500, 765],
             "box_2d": [416, 687, 583, 843],
             "yaw_deg": 15.0,
             "confidence": 0.96,
-        }):
+        }]):
             res_gem = await localize_object_3d(scene_jpeg, "keys", cs_vis, use_gemini=True)
             check(
                 "gemini-4-hydrogen path maps [y,x] 0-1000 to metric 6D pose",

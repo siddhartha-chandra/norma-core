@@ -48,7 +48,7 @@ from .station_bridge import (DEFAULT_MAX_STEP, MAX_ANGLE_STEP, REPO_ROOT, LiveSt
                              PreflightWriteUncertain, RobotState, StationBridge, create_bridge)
 from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
-from .vision_3d import localize_object_3d
+from .vision_3d import localize_frame_3d, localize_object_3d
 from .wrist_ibvs import MAX_ROLL_STEP_RAD, MAX_START_ERROR_M, PERIOD_S, TIMEOUT_S, YAW_TOL_RAD, alignment_step
 
 if TYPE_CHECKING:
@@ -692,7 +692,7 @@ async def pixel_to_world(
 @mcp.tool()
 @_traced
 async def localize_3d(
-    query: str,
+    query: str | None = None,
     camera: str = "top",
     z_m: float | None = None,
     use_gemini: bool = True,
@@ -700,19 +700,51 @@ async def localize_3d(
     timeout_s: float = 6.0,
     provider: str = "auto",
     model: str | None = None,
+    after_frame_ref: str | None = None,
 ) -> dict:
-    """Zero-shot 2D object localization (Gemini/Anthropic/OpenAI/Qwen/DeepSeek with OpenCV fallback) on one camera. The 3D point uses a placeholder depth: the table plane (z_table) unless z_m is given; epipolar 2D->3D is not wired yet."""
+    """Localize a named object, or omit the query to scan all visible objects from the overhead camera.
+
+    A scene scan uses the newest frame without denoising, returns detections and its reference,
+    and skips an already scanned frame
+    when after_frame_ref is supplied. Depth uses the table plane unless z_m is given.
+    """
     if camera in ("both", "dual"):
         raise ValueError("camera='both' is disabled: dual-camera 3D localization is pending the epipolar step; use 'top' or 'wrist'.")
+    if query is None and camera != "top":
+        raise ValueError("Scene scans require camera='top'.")
     bridge = await _get_bridge()
-    jpeg = await bridge.get_frame(camera, denoise=denoise)
+    if query is None and isinstance(bridge, LiveStationBridge):
+        jpeg = await bridge.get_frame(camera, strict_camera=True)
+        if after_frame_ref is None:
+            baseline = bridge.last_frame_ref(camera)
+            try:
+                async with asyncio.timeout(3.0):
+                    while True:
+                        await asyncio.sleep(0.1)
+                        jpeg = await bridge.get_frame(camera, strict_camera=True)
+                        if (current := bridge.last_frame_ref(camera)) and current != baseline:
+                            break
+            except TimeoutError:
+                return {"detections": [], "frame_ref": baseline, "stale_frame": True}
+    else:
+        jpeg = await bridge.get_frame(camera, denoise=denoise and query is not None)
     seen_at = time.time()
     frame_ref = (
         bridge.last_frame_ref(camera)
         if hasattr(bridge, "last_frame_ref")
         else None
     ) or f"{camera}@{int(seen_at * 1000)}"
+    if query is None and frame_ref == after_frame_ref and not frame_ref.startswith("camera://"):
+        return {"detections": [], "frame_ref": frame_ref, "stale_frame": True}
     q = await _live_arm_q(None, camera)
+    if query is None:
+        detections = await localize_frame_3d(
+            jpeg, None, _calib, camera=camera, q_rad=q, z_m=z_m,
+            use_gemini=use_gemini, timeout_s=float(timeout_s), model=model, provider=provider,
+        )
+        for detection in detections:
+            await _record_localization(detection, bridge, camera, frame_ref, seen_at)
+        return {"detections": detections, "frame_ref": frame_ref, "stale_frame": False}
     res = await localize_object_3d(
         jpeg_bytes=jpeg,
         query=query,
@@ -725,6 +757,13 @@ async def localize_3d(
         model=model,
         provider=provider,
     )
+    await _record_localization(res, bridge, camera, frame_ref, seen_at)
+    return res
+
+
+async def _record_localization(
+    res: dict, bridge: StationBridge, camera: str, frame_ref: str, seen_at: float,
+) -> None:
     if res.get("found") and camera == "top" and isinstance(bridge, MockStationBridge) and res.get("pixel"):
         world = res.get("world") or {}
         xy = bridge.synthetic_top_unproject(*res["pixel"][:2], float(world.get("z", 0.0)))
@@ -742,8 +781,7 @@ async def localize_3d(
             if write_res is not None:
                 res["sighting"] = write_res.to_dict()
         except Exception as exc:
-            _log.warning("Failed to record sighting for %r: %s", res.get("label") or query, exc)
-    return res
+            _log.warning("Failed to record sighting for %r: %s", res.get("label") or res.get("query"), exc)
 
 
 @mcp.tool()

@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -24,11 +25,12 @@ from typing import Any
 
 import cv2
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .calib_store import CalibrationStore
 
 GEMINI_VISION_MODEL = os.environ.get("DESK_VISION_MODEL", "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
+_scene_provider_lock = threading.Lock()
 
 DEFAULT_PROVIDER_MODELS: dict[str, str] = {
     "gemini": GEMINI_VISION_MODEL,
@@ -148,6 +150,10 @@ class GeminiPoint2DResult(BaseModel):
     )
 
 
+class Scene2DResult(BaseModel):
+    detections: list[GeminiPoint2DResult]
+
+
 def _clamp_norm(val: float, lo: int = 0, hi: int = 1000) -> int:
     return max(lo, min(hi, int(round(val))))
 
@@ -169,13 +175,15 @@ def build_orange_horn_mask(hsv: np.ndarray) -> np.ndarray:
     return cv2.dilate(mask, kernel, iterations=1)
 
 
-def localize_opencv(bgr: np.ndarray, query: str) -> dict[str, Any]:
-    """Fast local HSV + contour fallback, explicitly masking orange ElRobot servo horns."""
+def _opencv_candidates(bgr: np.ndarray, query: str | None) -> tuple[list[tuple[float, np.ndarray]], int]:
     h, w = bgr.shape[:2]
     img_area = float(h * w)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     orange_mask = build_orange_horn_mask(hsv)
-    q_low = query.lower()
+    q_low = (query or "").lower()
+    if query is None:
+        brown_mask = cv2.inRange(hsv, *COLOR_HINTS["brown"])
+        orange_mask = cv2.bitwise_and(orange_mask, cv2.bitwise_not(brown_mask))
 
     # Optional explicit color hint (or semantic prop alias) if query specifies a target
     hint_mask: np.ndarray | None = None
@@ -202,9 +210,10 @@ def localize_opencv(bgr: np.ndarray, query: str) -> dict[str, Any]:
         bg_lab = np.median(lab.reshape(-1, 3), axis=0)
         dist = np.linalg.norm(lab - bg_lab, axis=2)
         fg_mask = (dist > 22.0).astype(np.uint8) * 255
-        # Also include high-saturation non-orange regions
-        sat_mask = (hsv[:, :, 1] > 70).astype(np.uint8) * 255
-        fg_mask = cv2.bitwise_or(fg_mask, sat_mask)
+        saturated = hsv[:, :, 1] > 70
+        if query is not None or np.count_nonzero(saturated) <= img_area / 2:
+            sat_mask = saturated.astype(np.uint8) * 255
+            fg_mask = cv2.bitwise_or(fg_mask, sat_mask)
         fg_mask = cv2.bitwise_and(fg_mask, cv2.bitwise_not(orange_mask))
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -221,6 +230,12 @@ def localize_opencv(bgr: np.ndarray, query: str) -> dict[str, Any]:
         if min_area <= area <= max_area:
             candidates.append((area, cnt))
 
+    return candidates, int(np.count_nonzero(orange_mask))
+
+
+def localize_opencv(bgr: np.ndarray, query: str) -> dict[str, Any]:
+    """Fast local HSV + contour fallback, explicitly masking orange ElRobot servo horns."""
+    candidates, orange_masked_px = _opencv_candidates(bgr, query)
     if not candidates:
         return {
             "found": False,
@@ -229,21 +244,28 @@ def localize_opencv(bgr: np.ndarray, query: str) -> dict[str, Any]:
             "box_2d": [0, 0, 0, 0],
             "yaw_deg": 0.0,
             "confidence": 0.0,
-            "orange_masked_px": int(np.count_nonzero(orange_mask)),
+            "orange_masked_px": orange_masked_px,
         }
 
     # Prefer largest clean foreground contour
     best_area, best_cnt = max(candidates, key=lambda item: item[0])
-    M = cv2.moments(best_cnt)
+    return _opencv_detection(best_cnt, best_area, bgr.shape[:2], f"{query} (opencv)", orange_masked_px)
+
+
+def _opencv_detection(
+    contour: np.ndarray, area: float, shape: tuple[int, int], label: str, orange_masked_px: int,
+) -> dict[str, Any]:
+    h, w = shape
+    M = cv2.moments(contour)
     if M["m00"] > 1e-6:
         cx = M["m10"] / M["m00"]
         cy = M["m01"] / M["m00"]
     else:
-        bx, by, bw, bh = cv2.boundingRect(best_cnt)
+        bx, by, bw, bh = cv2.boundingRect(contour)
         cx, cy = bx + 0.5 * bw, by + 0.5 * bh
 
-    bx, by, bw, bh = cv2.boundingRect(best_cnt)
-    rect = cv2.minAreaRect(best_cnt)
+    bx, by, bw, bh = cv2.boundingRect(contour)
+    rect = cv2.minAreaRect(contour)
     (_, _), (rw, rh), angle = rect
     yaw_deg = float(angle + 90.0) if rw < rh else float(angle)
     while yaw_deg > 90.0:
@@ -258,19 +280,36 @@ def localize_opencv(bgr: np.ndarray, query: str) -> dict[str, Any]:
     ymax = _clamp_norm(((by + bh) / h) * 1000.0)
     xmax = _clamp_norm(((bx + bw) / w) * 1000.0)
 
-    conf = min(0.85, max(0.35, 0.35 + 2.5 * (best_area / img_area)))
+    conf = min(0.85, max(0.35, 0.35 + 2.5 * (area / (h * w))))
     return {
         "found": True,
-        "label": f"{query} (opencv)",
+        "label": label,
         "point": [y_norm, x_norm],
         "box_2d": [ymin, xmin, ymax, xmax],
         "yaw_deg": round(yaw_deg, 2),
         "confidence": round(conf, 3),
-        "orange_masked_px": int(np.count_nonzero(orange_mask)),
+        "orange_masked_px": orange_masked_px,
     }
 
 
-def _vision_prompt(query: str) -> str:
+def _localize_scene_opencv(bgr: np.ndarray) -> list[dict[str, Any]]:
+    candidates, orange_masked_px = _opencv_candidates(bgr, None)
+    return [
+        _opencv_detection(contour, area, bgr.shape[:2], "unidentified object (opencv)", orange_masked_px)
+        for area, contour in candidates
+    ]
+
+
+def _vision_prompt(query: str | None) -> str:
+    if query is None:
+        return (
+            "Locate each distinct visible desk item in this overhead robot workspace image. "
+            "Ignore the table, arm, servo horns, and gripper. Do not guess at hidden items. "
+            'Return ONLY a JSON object with a "detections" array, empty if no items are visible. '
+            "For each detection provide found=true, a short identifying label including visible distinguishing details, "
+            "point ([y, x] center normalized 0-1000), box_2d ([ymin, xmin, ymax, xmax] normalized 0-1000), "
+            "yaw_deg (principal axis angle -90..90), and confidence (0.0..1.0)."
+        )
     return (
         f"Locate the desk item matching '{query}' in this robot workspace image. "
         "Ignore orange/coral robot arm links, servo horns, and gripper fingers unless explicitly queried. "
@@ -280,7 +319,7 @@ def _vision_prompt(query: str) -> str:
     )
 
 
-def _parse_vlm_json(raw_text: str, query: str) -> dict[str, Any]:
+def _parse_vlm_json(raw_text: str, query: str | None) -> list[dict[str, Any]]:
     txt = raw_text.strip()
     if txt.startswith("```"):
         txt = re.sub(r"^```(?:json)?\s*", "", txt)
@@ -288,12 +327,41 @@ def _parse_vlm_json(raw_text: str, query: str) -> dict[str, Any]:
     m = re.search(r"\{.*\}", txt, re.DOTALL)
     if m:
         txt = m.group(0)
+    if query is None:
+        items = json.loads(txt).get("detections")
+        if not isinstance(items, list):
+            raise ValueError("Scene vision response must contain a detections array.")
+        detections = []
+        has_valid_item = False
+        for item in items:
+            try:
+                det = GeminiPoint2DResult.model_validate(item)
+            except ValidationError:
+                continue
+            if not det.found:
+                has_valid_item = True
+                continue
+            if (
+                det.label.strip()
+                and len(det.point) == 2 and len(det.box_2d) == 4
+                and {"point", "box_2d"} <= det.model_fields_set
+                and math.isfinite(det.yaw_deg) and math.isfinite(det.confidence)
+            ):
+                detections.append(_normalize_detection(det, det.label.strip()))
+                has_valid_item = True
+        if items and not has_valid_item:
+            raise ValueError("Scene vision response had no valid detections.")
+        return detections
     parsed = GeminiPoint2DResult.model_validate_json(txt)
+    return [_normalize_detection(parsed, parsed.label or query)]
+
+
+def _normalize_detection(parsed: GeminiPoint2DResult, label: str) -> dict[str, Any]:
     pt = parsed.point if len(parsed.point) == 2 else [500, 500]
     box = parsed.box_2d if len(parsed.box_2d) == 4 else [0, 0, 0, 0]
     return {
         "found": bool(parsed.found),
-        "label": parsed.label or query,
+        "label": label,
         "point": [_clamp_norm(pt[0]), _clamp_norm(pt[1])],
         "box_2d": [_clamp_norm(v) for v in box],
         "yaw_deg": float(parsed.yaw_deg),
@@ -336,7 +404,7 @@ def _get_api_key(provider: str) -> str:
     return _load_keystore().get(p, "")
 
 
-def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str, Any]:
+def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str | None, model: str) -> list[dict[str, Any]]:
     from google import genai
 
     api_key = _get_api_key("gemini")
@@ -354,14 +422,14 @@ def _call_gemini_interactions_sync(jpeg_bytes: bytes, query: str, model: str) ->
         response_format={
             "type": "text",
             "mime_type": "application/json",
-            "schema": GeminiPoint2DResult.model_json_schema(),
+            "schema": (Scene2DResult if query is None else GeminiPoint2DResult).model_json_schema(),
         },
         store=False,
     )
     return _parse_vlm_json(interaction.output_text, query)
 
 
-def _call_anthropic_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str, Any]:
+def _call_anthropic_sync(jpeg_bytes: bytes, query: str | None, model: str) -> list[dict[str, Any]]:
     api_key = _get_api_key("anthropic")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY not set")
@@ -404,12 +472,12 @@ def _call_anthropic_sync(jpeg_bytes: bytes, query: str, model: str) -> dict[str,
 
 def _call_openai_compat_sync(
     jpeg_bytes: bytes,
-    query: str,
+    query: str | None,
     model: str,
     api_key: str,
     base_url: str,
     provider_label: str,
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     if not api_key:
         raise RuntimeError(f"{provider_label} API key not set")
     b64_jpeg = base64.b64encode(jpeg_bytes).decode("ascii")
@@ -460,7 +528,7 @@ def _resolve_provider(provider: str) -> str:
     return "gemini"
 
 
-def _call_vlm_sync(jpeg_bytes: bytes, query: str, provider: str, model: str) -> dict[str, Any]:
+def _call_vlm_sync(jpeg_bytes: bytes, query: str | None, provider: str, model: str) -> list[dict[str, Any]]:
     if provider == "gemini":
         return _call_gemini_interactions_sync(jpeg_bytes, query, model)
     if provider == "anthropic":
@@ -485,6 +553,15 @@ def _call_vlm_sync(jpeg_bytes: bytes, query: str, provider: str, model: str) -> 
     raise ValueError(f"Unsupported vision provider: {provider!r}")
 
 
+def _call_scene_vlm_sync(jpeg_bytes: bytes, query: str | None, provider: str, model: str) -> list[dict[str, Any]]:
+    if not _scene_provider_lock.acquire(blocking=False):
+        raise RuntimeError("Previous scene vision request is still running.")
+    try:
+        return _call_vlm_sync(jpeg_bytes, query, provider, model)
+    finally:
+        _scene_provider_lock.release()
+
+
 async def localize_object_3d(
     jpeg_bytes: bytes,
     query: str,
@@ -498,12 +575,30 @@ async def localize_object_3d(
     provider: str = "auto",
 ) -> dict[str, Any]:
     """Localize `query` in `jpeg_bytes` via Gemini/Anthropic/OpenAI/Qwen/DeepSeek (with OpenCV fallback) and project to 3D."""
+    return (await localize_frame_3d(
+        jpeg_bytes, query, calib, camera=camera, q_rad=q_rad, z_m=z_m,
+        use_gemini=use_gemini, timeout_s=timeout_s, model=model, provider=provider,
+    ))[0]
+
+
+async def localize_frame_3d(
+    jpeg_bytes: bytes,
+    query: str | None,
+    calib: CalibrationStore,
+    camera: str = "top",
+    q_rad: list[float] | None = None,
+    z_m: float | None = None,
+    use_gemini: bool = True,
+    timeout_s: float = 12.0,
+    model: str | None = None,
+    provider: str = "auto",
+) -> list[dict[str, Any]]:
+    """Localize a requested item or, without a query, all detected items in one frame."""
     bgr = _decode_bgr(jpeg_bytes)
-    h, w = bgr.shape[:2]
 
     backend = "opencv-fallback"
     fallback_reason: str | None = None
-    det: dict[str, Any] | None = None
+    detections: list[dict[str, Any]] | None = None
 
     resolved_provider = _resolve_provider(provider)
     if use_gemini and resolved_provider != "opencv":
@@ -511,22 +606,35 @@ async def localize_object_3d(
         allowed = VISION_MODELS_BY_PROVIDER.get(resolved_provider)
         if allowed and model and model not in allowed:
             raise ValueError(f"Model {model!r} is not in vision-capable list for {resolved_provider}: {allowed}")
+        call_provider = _call_scene_vlm_sync if query is None else _call_vlm_sync
         try:
-            det = await asyncio.wait_for(
-                asyncio.to_thread(_call_vlm_sync, jpeg_bytes, query, resolved_provider, chosen_model),
+            detections = await asyncio.wait_for(
+                asyncio.to_thread(call_provider, jpeg_bytes, query, resolved_provider, chosen_model),
                 timeout=timeout_s,
             )
             backend = chosen_model if resolved_provider == "gemini" else f"{resolved_provider}:{chosen_model}"
         except Exception as exc:
             fallback_reason = str(exc) or exc.__class__.__name__
-            det = None
     else:
         fallback_reason = "opencv_only" if resolved_provider == "opencv" else "use_gemini=False"
 
-    if det is None:
-        det = await asyncio.to_thread(localize_opencv, bgr, query)
-        backend = "opencv-fallback"
+    if detections is None:
+        if query is None:
+            detections = await asyncio.to_thread(_localize_scene_opencv, bgr)
+        else:
+            detections = [await asyncio.to_thread(localize_opencv, bgr, query)]
 
+    return [
+        _project_detection(det, query, bgr.shape[:2], calib, camera, q_rad, z_m, backend, fallback_reason)
+        for det in detections
+    ]
+
+
+def _project_detection(
+    det: dict[str, Any], query: str | None, shape: tuple[int, int], calib: CalibrationStore,
+    camera: str, q_rad: list[float] | None, z_m: float | None, backend: str, fallback_reason: str | None,
+) -> dict[str, Any]:
+    h, w = shape
     y_norm, x_norm = det["point"]
     ymin, xmin, ymax, xmax = det["box_2d"]
     px = (x_norm / 1000.0) * w
