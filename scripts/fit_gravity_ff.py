@@ -83,7 +83,7 @@ async def main(args):
     calib = CalibrationStore()
     hw = calib.hardware_config()
     bridge = LiveStationBridge(host=args.host, port=args.port, target_bus=hw["bus_serial"],
-                               cam_top=hw["camera_top"], cam_wrist=hw["camera_wrist"])
+                               cam_top=hw["camera_top"], cam_wrist=hw["camera_wrist"], follow_motor_rx=True)
     await bridge.connect()
     await asyncio.sleep(2.0)
     motors = (await bridge.get_state()).motors
