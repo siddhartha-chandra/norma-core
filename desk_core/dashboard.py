@@ -514,7 +514,7 @@ async def api_tts(req: TTSReq) -> dict[str, Any]:
 @app.post("/api/first_light")
 async def api_first_light() -> dict[str, Any]:
     """Run the Act 1 07:30 First-Light check-in routine (non-destructive if uncalibrated)."""
-    global _first_light_running, _last_detection
+    global _first_light_running, _last_detection, _armed_camera
     if _first_light_running:
         return {"ok": False, "error": "First-Light routine already running"}
     _first_light_running = True
@@ -535,6 +535,7 @@ async def api_first_light() -> dict[str, Any]:
 
         if det["found"]:
             await srv.robo_jev_arm_watch(*det["pixel"], query="keys", depth_m=det["depth_m"])
+            _armed_camera = "top"
             reflex = await check_reflex_and_abort(srv._robo_jev, bridge, calib=srv._calib, obstacles=list(srv._obstacles.values()))
             steps.append({"step": "robo_jev", "ok": reflex["ok"], "latency_ms": reflex["latency_ms"]})
             srv._tts.speak(f"Keys spotted. Reflex check nominal in {int(round(reflex['latency_ms']))} milliseconds.")
