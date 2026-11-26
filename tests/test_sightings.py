@@ -284,6 +284,20 @@ def test_live_bridge_denoised_frame_ref_tracks_selected_frame():
         f"normfs://{qid}#0003",
     }
 
+    # Simulate probe + cached-buffer fallback when on-demand tail fetch returns empty.
+    async def empty_tail(_qid, count=1, timeout_s=3.0):
+        return []
+
+    live._fetch_tail_frames = empty_tail  # type: ignore[method-assign]
+    live._last_selected_ref["cam_top_uid"] = "normfs://stale#dead"
+    fallback_chosen = asyncio.run(live.get_frame("top", denoise=True))
+    assert fallback_chosen != noisy_latest
+    assert live.last_frame_ref("top") in {
+        f"normfs://{qid}#0001",
+        f"normfs://{qid}#0002",
+        f"normfs://{qid}#0003",
+    }
+
 
 def test_mcp_localize_3d_logs_to_sqlite_in_mock_simulation(tmp_path, monkeypatch, mock_bridge):
     monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
