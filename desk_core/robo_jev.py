@@ -158,7 +158,7 @@ class RoboJevGatekeeper:
         offset_x, offset_y = round(ex - ref_x), round(ey - ref_y)
         x1, x2, y1, y2 = x1 + offset_x, x2 + offset_x, y1 + offset_y, y2 + offset_y
         if not (0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h):
-            return {"shifted": False, "shift_px": 0.0, "shift_mm": 0.0, "armed": True}
+            return {"shifted": False, "shift_px": 0.0, "shift_mm": 0.0, "armed": True, "out_of_view": True}
 
         # Original ROI absolute delta
         roi_curr = gray[y1:y2, x1:x2]
@@ -188,8 +188,8 @@ class RoboJevGatekeeper:
 
         shift_mm = (shift_px / max(1.0, fx)) * watch.depth_m * 1000.0
 
-        # Trigger if object slid noticeably OR vanished from the ROI (low correlation + high pixel change)
-        vanished = expected_pixel is None and mad_roi > 24.0 and match_score < 0.45
+        # A projected wrist crop is already translated for camera motion; low correlation can mean loss.
+        vanished = match_score < 0.45 and (expected_pixel is not None or mad_roi > 24.0)
         shifted = vanished or (new_px is not None and match_score >= 0.45 and
                                (shift_px >= self.shift_px_threshold or shift_mm >= self.shift_mm_threshold))
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
@@ -290,6 +290,7 @@ class RoboJevGatekeeper:
             "ok": ok,
             "reason": reason,
             "camera": camera,
+            "out_of_view": shift_info.get("out_of_view", False),
             "target_shifted": bool(shift_info["shifted"]),
             "shift_px": shift_info["shift_px"],
             "shift_mm": shift_info["shift_mm"],
@@ -340,18 +341,23 @@ class ReflexMonitor:
                 q_rad = self.calib.ticks_to_rad(state.motors)
                 expected = self.calib.project_world_to_pixel(watch.world, camera, q_rad)
                 if expected is None:
-                    return None
+                    return None if self.gatekeeper.watch is not None else {
+                        "ok": False, "reason": "target_shifted", "target_shifted": True, "camera": camera,
+                    }
             jpeg = await self.bridge.get_reflex_frame(camera)
             obstacles = self.obstacles_fn()
             start_xy = (0.15, 0.0)
             if state and self.target_xy is not None and obstacles:
                 q_rad = self.calib.ticks_to_rad(state.motors)
                 start_xy = tuple(self.calib.fk_ee_pose(q_rad)[:2, 3])
-            return self.gatekeeper.evaluate(
+            report = self.gatekeeper.evaluate(
                 curr_jpeg=jpeg, calib=self.calib, obstacles=obstacles, target_xy=self.target_xy, start_xy=start_xy,
                 gripper_current_ma=state.motors[-1].current_ma if state and state.motors else 0,
                 camera=camera, expected_pixel=expected,
             )
+            if report["ok"] and camera == "wrist" and self.gatekeeper.watch is None and report["out_of_view"]:
+                report.update(ok=False, reason="target_shifted", target_shifted=True)
+            return report
 
         while True:
             started = time.perf_counter()

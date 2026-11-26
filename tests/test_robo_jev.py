@@ -2,12 +2,24 @@
 import asyncio
 import time
 
+import cv2
+import numpy as np
 import pytest
 
 from desk_core import mcp_server as srv
 from desk_core.calib_store import CalibrationStore
 from desk_core.interfaces import SceneObstacle
-from desk_core.robo_jev import RoboJevGatekeeper, guarded_recover
+from desk_core.robo_jev import ReflexMonitor, RoboJevGatekeeper, guarded_recover
+
+
+def _scene(x=None):
+    image = np.full((240, 320, 3), 225, dtype=np.uint8)
+    if x is not None:
+        cv2.rectangle(image, (x - 14, 104), (x + 14, 132), (200, 70, 20), -1)
+        cv2.circle(image, (x, 115), 5, (255, 255, 255), -1)
+    ok, encoded = cv2.imencode(".jpg", image)
+    assert ok
+    return encoded.tobytes()
 
 
 def test_recovery_rechecks_interrupted_path_without_caller_coordinates(calib, mock_bridge):
@@ -35,6 +47,23 @@ def test_recovery_rechecks_interrupted_path_without_caller_coordinates(calib, mo
         recovered = await recover()
         assert recovered["ok"] and recovered["target_xy"] == list(goal), recovered
         assert mock_bridge.abort_source is None
+
+    asyncio.run(simulate())
+
+
+def test_projected_wrist_watch_stops_if_the_target_disappears(calib, mock_bridge, monkeypatch):
+    monkeypatch.setattr(calib, "project_world_to_pixel", lambda *args: (170.0, 120.0))
+    gatekeeper = RoboJevGatekeeper()
+    gatekeeper.arm_watch(_scene(150), (150, 120), camera="wrist", world=(0.25, 0.0, 0.0))
+    mock_bridge.set_frame_override("wrist", _scene())
+
+    async def simulate():
+        monitor = ReflexMonitor(gatekeeper, mock_bridge, calib, lambda: [])
+        monitor.state = await mock_bridge.get_state()
+        async with monitor:
+            await asyncio.sleep(0.15)
+        assert monitor.report and monitor.report["reason"] == "target_shifted"
+        assert mock_bridge.abort_source == "reflex"
 
     asyncio.run(simulate())
 
