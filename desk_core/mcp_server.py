@@ -362,7 +362,7 @@ async def go_home(look_at_table: bool = True) -> dict:
     settled = False
     for _ in range(10):
         applied = await bridge.send_joint_targets(targets, max_step=300)
-        settled = await bridge.wait_settle(applied, tol_ticks=40, timeout_s=2.0)
+        await bridge.wait_settle(applied, tol_ticks=40, timeout_s=2.0)
         cur = {m.id: m.position for m in (await bridge.get_state()).motors[:n_arm]}
         if all(abs(cur.get(mid, tgt) - tgt) <= 40 for mid, tgt in targets.items()):
             settled = True
