@@ -181,6 +181,7 @@ Tool names are the public contract. Agents should call them by name.
 | **Kinematics and 3D** | `solve_ik(x, y, z, qx, qy, qz, qw)`, `get_metric_depth(x, y, camera, q_rad)`, `pixel_to_world(...)`, `localize_3d(...)` |
 | **Composite motion** | `plan_and_move` and `sweep_aside` (MuJoCo preflight; dry run unless `execute=True`), `move_to_pose`, `move_flange` (dry run unless `execute=True`), `pick_at`, `place_at`, `pick_pixel(x, y, yaw)`, `execute_sequence(steps, stop_on_false)` |
 | **Wrist-stereo pipeline** | `detect_requested_object`, `aim_wrist`, `capture_wrist_stereo`, `estimate_wrist_depth`, `measure_graspability`, `estimate_grasp_pose` (legacy), `plan_tolerant_grasp`, `retract_to_hover`, `move_to_drop`, `master_pick_place` |
+| **Wrist final approach** | `servo_align_wrist(tol_mm=1.5)` |
 | **Safety and scene** | `update_scene_obstacle`, `robo_jev_arm_watch`, `robo_jev_check`, `robo_jev_guard`, `speak_status` |
 | **Mock helpers** | `mock_add_object`, `mock_scene_state`, `mock_reset_scene` |
 
@@ -210,6 +211,18 @@ On a stall or an unconfirmed target write, Station attempts to hold the measured
 The model does not account for payload or dynamic torque. A simulation budget is not a hardware rating.
 To request just the MuJoCo IK solution, pass the same limit to `solve_ik`; without it the existing IK
 backend is unchanged.
+
+`servo_align_wrist` moves at the current hover height without closing the jaws. Start with the open
+gripper pointing down and an isolated, elongated, saturated-color marker near the center of the wrist
+view. It projects the marker to the calibrated table plane, centers the camera's optical ray there, and
+turns the jaws perpendicular to the marker's long axis. It uses local CPU vision at a target rate of
+10 Hz, caps the centering tolerance at 0.99 mm, and requires yaw within 2° before returning success.
+Large initial yaw errors trigger a pre-rotation. If wrist roll alone would put the marker out of range,
+the plan also translates the flange to keep it in range. MuJoCo checks the entire path before Station
+moves; the 1.5 s fine-alignment deadline starts after that pre-rotation. The result reports
+`prerotation_s`, `ibvs_s`, and total `elapsed_s`. Live Station feedback and settling can reduce the
+update rate. For live use, configure the measured wrist calibration and camera ID, enable arm
+torque, and set an appropriate `shoulder_torque_limit_nm` model budget in the active rig JSON.
 
 Use `sweep_aside(start_xy, end_xy, z_mm)` to push a rolling marker instead of grasping it.
 XY points are jaw-tip midpoint coordinates in `base_link` meters. `z_mm` is the clearance from the
