@@ -39,6 +39,22 @@ def test_fk_and_analytical_torque_match_reference_models(calib, scene):
         assert holding_torque == pytest.approx(planner.data.qfrc_bias[shoulder_dof], abs=1e-9)
 
 
+def test_payload_shoulder_torque_matches_mujoco_flange_jacobian(scene):
+    make_planner, _, start = scene
+    planner = make_planner()
+    mass_kg = 0.03
+    unloaded = planner.shoulder_torque(start)
+    loaded = planner.shoulder_torque(start, payload_mass_kg=mass_kg)
+
+    linear_jacobian = np.zeros((3, planner.model.nv))
+    mujoco.mj_jacBody(planner.model, planner.data, linear_jacobian, None, planner.flange)
+    shoulder_dof = planner.model.jnt_dofadr[planner.shoulder]
+    effective_lever_m = linear_jacobian[2, shoulder_dof]
+    assert effective_lever_m == pytest.approx(-0.2164, abs=0.001)
+    assert loaded - unloaded == pytest.approx(-mass_kg * planner.model.opt.gravity[2] * effective_lever_m)
+    assert unloaded < 0 and abs(unloaded) < planner.torque_limit < abs(loaded)
+
+
 @pytest.mark.parametrize("shape", ["cylinder", "box"])
 def test_rejects_swept_collision_with_clear_endpoints(scene, shape):
     make_planner, _, q = scene
