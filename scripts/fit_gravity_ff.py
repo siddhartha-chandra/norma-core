@@ -110,6 +110,9 @@ async def main(args):
             return
         await asyncio.sleep(HOLD_S)
         state = await bridge.get_state()
+        if state.link_age_ms is None or state.link_age_ms > 500:
+            print(f"aborted: stale motor telemetry ({state.link_age_ms} ms old)")
+            return
         reached = np.array(calib.ticks_to_rad(state.motors))
         shortfall = q - reached
         samples.append({"goal": q.tolist(), "reached": reached.tolist(), "torque": gravity_torque(reached).tolist(),
