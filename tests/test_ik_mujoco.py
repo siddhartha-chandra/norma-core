@@ -1,0 +1,126 @@
+import asyncio
+
+import mujoco
+import numpy as np
+import pytest
+
+from desk_core import mcp_server
+from desk_core.ik_mujoco import MAX_WAYPOINT_STEP_RAD, MuJoCoPlanner, PlanningError
+from desk_core.ik_tracik import TOOL_FRAME
+from desk_core.interfaces import SceneObstacle
+from desk_core.station_bridge import MockStationBridge
+
+
+@pytest.fixture
+def scene(calib):
+    bridge = MockStationBridge(num_joints=8)
+    state = asyncio.run(bridge.get_state())
+
+    def planner(obstacles=(), limit=0.6, table_z=None):
+        return MuJoCoPlanner(calib.urdf_path(), calib.z_table() if table_z is None else table_z,
+                             list(obstacles), limit, calib.bounds_rad(state.motors))
+
+    return planner, bridge, np.asarray(calib.ticks_to_rad(state.motors))
+
+
+def test_fk_and_analytical_torque_match_reference_models(calib, scene):
+    make_planner, _, start = scene
+    planner = make_planner()
+    for q in (start, start + [0.2, -0.2, 0.12, -0.12, 0.15, -0.2, 0.3]):
+        position, rotation = planner.flange_pose(q)
+        expected = calib.fk_ee_pose(q, TOOL_FRAME)
+        np.testing.assert_allclose(position, expected[:3, 3], atol=1e-9)
+        np.testing.assert_allclose(rotation.as_matrix(), expected[:3, :3], atol=1e-9)
+        holding_torque = planner.shoulder_torque(q)
+        mujoco.mj_forward(planner.model, planner.data)
+        shoulder_dof = planner.model.jnt_dofadr[planner.shoulder]
+        assert holding_torque == pytest.approx(planner.data.qfrc_bias[shoulder_dof], abs=1e-9)
+
+
+@pytest.mark.parametrize("shape", ["cylinder", "box"])
+def test_rejects_swept_collision_with_clear_endpoints(scene, shape):
+    make_planner, _, q = scene
+    midpoint, _ = make_planner().flange_pose(q)
+    obstacle = SceneObstacle("sweep", shape, *midpoint, radius_m=0.03, height_m=0.04,
+                             size_xyz=(0.06, 0.06, 0.06))
+    planner = make_planner([obstacle])
+    start, goal = q.copy(), q.copy()
+    start[0], goal[0] = -0.4, 0.4
+    assert planner.plan_trajectory(start, start).peak_shoulder_torque_nm < 0.6
+    assert planner.plan_trajectory(goal, goal).peak_shoulder_torque_nm < 0.6
+    with pytest.raises(PlanningError, match=r"Waypoint \d+: Collision clearance violated: .*sweep"):
+        planner.plan_trajectory(start, goal)
+
+
+def test_table_collision_and_torque_limit_are_hard_constraints(scene):
+    make_planner, _, q = scene
+    with pytest.raises(PlanningError, match=r"Collision clearance violated: .*table"):
+        make_planner(table_z=0.22).plan_trajectory(q, q)
+    with pytest.raises(PlanningError, match="Shoulder torque"):
+        make_planner(limit=0.5).plan_trajectory(q, q)
+
+
+def test_ik_lift_tucks_elbow_and_wrist_before_shoulder(scene):
+    make_planner, _, start = scene
+    planner = make_planner()
+    target = start.copy()
+    target[1] -= 0.2
+    position, rotation = planner.flange_pose(target)
+    goal = planner.solve_ik(position, rotation.as_quat(), start)
+    actual_position, actual_rotation = planner.flange_pose(goal)
+    np.testing.assert_allclose(actual_position, position, atol=0.0005)
+    assert (actual_rotation * rotation.inv()).magnitude() < np.deg2rad(0.3)
+    plan = planner.plan_trajectory(start, goal)
+    assert 0 < plan.tuck_end < len(plan.waypoints) - 1
+    tuck = plan.waypoints[plan.tuck_end]
+    np.testing.assert_array_equal(plan.waypoints[:plan.tuck_end + 1, 1], start[1])
+    assert np.all(np.abs(tuck[2:4] - start[2:4]) > 0)
+    assert abs(planner.shoulder_torque(tuck)) < abs(planner.shoulder_torque(start))
+    assert np.max(np.abs(np.diff(plan.waypoints, axis=0))) <= MAX_WAYPOINT_STEP_RAD
+    assert plan.peak_shoulder_torque_nm <= 0.6
+
+
+def test_plan_and_move_preflights_before_sending_any_mock_targets(scene, monkeypatch):
+    make_planner, bridge, start = scene
+    monkeypatch.setattr(mcp_server, "_bridge", bridge)
+    monkeypatch.setattr(mcp_server, "_obstacles", {})
+    send = bridge.send_joint_targets
+    sent = []
+
+    async def track_targets(targets, max_step):
+        sent.append(targets)
+        return await send(targets, max_step)
+
+    monkeypatch.setattr(bridge, "send_joint_targets", track_targets)
+    target = start.copy()
+    target[1] -= 0.2
+    xyz, rotation = make_planner().flange_pose(target)
+    args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
+
+    async def run():
+        initial_ticks = (await bridge.get_state()).positions()
+        preview = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6)
+        assert preview["ok"] and not preview["executed"]
+        assert not sent
+        solution = await mcp_server.solve_ik(**args, shoulder_torque_limit_nm=0.6)
+        assert len(solution) == 7
+        await mcp_server.update_scene_obstacle("blocker", *xyz, radius_m=0.03, height_m=0.04)
+        blocked = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True)
+        assert not blocked["ok"] and not blocked["executed"]
+        assert "Collision" in blocked["problems"][0]
+        await mcp_server.update_scene_obstacle("blocker", *xyz, remove=True)
+        overloaded = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.5, execute=True)
+        assert not overloaded["ok"] and not overloaded["executed"]
+        assert "Shoulder torque" in overloaded["problems"][0]
+        assert not sent
+        assert (await bridge.get_state()).positions() == initial_ticks
+        moved = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True)
+        assert moved["ok"] and moved["executed"]
+        assert len(sent) == moved["waypoints"] - 1
+        tuck = moved["tuck_end_waypoint"]
+        assert tuck and all(command[2] == initial_ticks[2] for command in sent[:tuck])
+        assert sent[tuck - 1][3] != initial_ticks[3] and sent[tuck - 1][4] != initial_ticks[4]
+        assert sent[tuck][2] != initial_ticks[2]
+        assert (await bridge.get_state()).positions() == {**initial_ticks, **sent[-1]}
+
+    asyncio.run(run())

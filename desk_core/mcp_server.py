@@ -23,6 +23,7 @@ import io
 import json
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -38,7 +39,7 @@ from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
 from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
-from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, StationBridge, create_bridge
+from .station_bridge import DEFAULT_MAX_STEP, REPO_ROOT, MockStationBridge, RobotState, StationBridge, create_bridge
 from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
 from .vision_3d import localize_object_3d
@@ -538,6 +539,20 @@ async def get_frame(
     return [json.dumps(meta), Image(data=jpeg, format="jpeg")]
 
 
+def _mujoco_planner(st: RobotState, obstacles: list[SceneObstacle], shoulder_torque_limit_nm: float):
+    from .ik_mujoco import MuJoCoPlanner, PlanningError
+    from .urdf_fk import DEFAULT_ARM_JOINTS
+
+    if (_calib.world_frame() != "base_link" or tuple(_calib.joint_names()) != DEFAULT_ARM_JOINTS
+            or _calib.num_arm_joints(len(st.motors)) != len(DEFAULT_ARM_JOINTS)
+            or len(st.motors) != 8 or [m.id for m in st.motors] != list(range(1, 9))):
+        raise PlanningError("MuJoCo requires the calibrated seven-joint ElRobot model")
+    if any(not m.range_min <= m.position <= m.range_max or m.range_max <= m.range_min for m in st.motors):
+        raise PlanningError("Invalid calibrated motor ranges or current ticks")
+    return MuJoCoPlanner(_calib.urdf_path(), _calib.z_table(), obstacles, shoulder_torque_limit_nm,
+                         _calib.bounds_rad(st.motors))
+
+
 ### 6. Solve the flange pose with the configured IK backend
 # Existing MCP tool
 @mcp.tool()
@@ -551,13 +566,22 @@ async def solve_ik(
     qz: float = 0.0,
     qw: float = 1.0,
     seed_joints_rad: list[float] | None = None,
+    shoulder_torque_limit_nm: float | None = None,
 ) -> list[float]:
-    """Solve IK for a metric target pose with an xyzw quaternion."""
+    """Solve a metric flange pose (xyzw). Supply a shoulder torque limit to use MuJoCo IK."""
     bridge = await _get_bridge()
     st = await bridge.get_state()
     ## added by Abhi
     if seed_joints_rad is None:
         seed_joints_rad = _calib.ticks_to_rad(st.motors)
+    if shoulder_torque_limit_nm is not None:
+        obstacles = list(_obstacles.values())
+
+        def solve_in_sim() -> list[float]:
+            planner = _mujoco_planner(st, obstacles, shoulder_torque_limit_nm)
+            return planner.solve_ik([x, y, z], [qx, qy, qz, qw], seed_joints_rad).tolist()
+
+        return await asyncio.to_thread(solve_in_sim)
     n_arm = _calib.num_arm_joints(len(st.motors))
     valid_bounds = all(m.range_max > m.range_min and m.range_min <= m.position <= m.range_max for m in st.motors[:n_arm])
     return await asyncio.to_thread(
@@ -760,6 +784,7 @@ async def update_scene_obstacle(
     radius_m: float = 0.045,
     height_m: float = 0.10,
     remove: bool = False,
+    size_xyz: tuple[float, float, float] | None = None,
 ) -> dict:
     """Register or remove a 3D obstacle (e.g. mug, departure_tray) for IK/planner collision checks."""
     if remove:
@@ -767,7 +792,7 @@ async def update_scene_obstacle(
     else:
         _obstacles[name] = SceneObstacle(
             name=name, shape=shape, x=float(x), y=float(y), z=float(z),
-            radius_m=float(radius_m), height_m=float(height_m),
+            radius_m=float(radius_m), height_m=float(height_m), size_xyz=size_xyz,
         )
     return {"obstacles": sorted(_obstacles.keys())}
 
@@ -808,6 +833,70 @@ async def reload_config() -> dict:
 # =============================================================================
 # 4. Composite Execution Tools & Declarative Pipeline Runner
 # =============================================================================
+
+
+@mcp.tool()
+@_traced
+@_motion_tool
+async def plan_and_move(
+    x: float,
+    y: float,
+    z: float,
+    shoulder_torque_limit_nm: float,
+    qx: float = 0.0,
+    qy: float = 0.0,
+    qz: float = 0.0,
+    qw: float = 1.0,
+    execute: bool = False,
+) -> dict:
+    """Preflight a flange pose in MuJoCo. Execution is opt-in and mock-only pending #5."""
+    from .ik_mujoco import PlanningError
+
+    bridge = await _get_bridge()
+    if execute and not isinstance(bridge, MockStationBridge):
+        return {"ok": False, "executed": False, "problems": ["Live execution requires servo alignment (#5)"]}
+    if isinstance(bridge, MockStationBridge) and bridge.get_mock_scene_state()["held_object"]:
+        return {"ok": False, "executed": False, "problems": ["Payloads are not modeled by the shoulder torque guard"]}
+    st = await bridge.get_state()
+    initial_ticks = st.positions()
+    motors = [replace(m) for m in st.motors]
+    obstacles = list(_obstacles.values())
+
+    def preflight():
+        planner = _mujoco_planner(replace(st, motors=motors), obstacles, shoulder_torque_limit_nm)
+        start = np.asarray(_calib.ticks_to_rad(motors))
+        goal = planner.solve_ik([x, y, z], [qx, qy, qz, qw], start)
+
+        def quantize(q):
+            ticks = _calib.rad_to_ticks(q.tolist(), motors)
+            return np.asarray(_calib.ticks_to_rad([replace(m, position=ticks.get(m.id, m.position)) for m in motors]))
+
+        plan = planner.plan_trajectory(start, goal, quantize)
+        targets = [_calib.rad_to_ticks(q.tolist(), motors) for q in plan.waypoints]
+        if any(abs(second[mid] - tick) > DEFAULT_MAX_STEP for first, second in zip(targets, targets[1:])
+               for mid, tick in first.items()):
+            raise PlanningError("Preflight path exceeds Station's per-command step limit")
+        return plan, targets, planner.flange_pose(plan.waypoints[-1])[0]
+
+    try:
+        plan, targets, position = await asyncio.to_thread(preflight)
+    except PlanningError as exc:
+        return {"ok": False, "executed": False, "problems": [str(exc)]}
+    result = {"ok": True, "executed": False, "waypoints": len(targets),
+              "tuck_end_waypoint": plan.tuck_end, "peak_shoulder_torque_nm": plan.peak_shoulder_torque_nm,
+              "joints_rad": plan.waypoints[-1].tolist()}
+    if not execute:
+        return result
+    current = await bridge.get_state()
+    if current.positions() != initial_ticks or list(_obstacles.values()) != obstacles:
+        return {"ok": False, "executed": False, "problems": ["Start pose or obstacles changed during preflight"]}
+    for target in targets[1:]:
+        result["executed"] = True
+        if await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP) != target:
+            result.update(ok=False, problems=["Station did not apply the preflighted waypoint"])
+            return result
+    bridge.set_mock_ee_pose(*position)
+    return result
 
 
 ### 7 and 8. Move to a flange pose through the configured IK backend
@@ -1355,6 +1444,7 @@ _SEQ_TOOLS = {
     "move_to_home": move_to_home,
     "estop": estop,
     "move_to_pose": move_to_pose,
+    "plan_and_move": plan_and_move,
     "move_flange": move_flange,
     "pick_at": pick_at,
     "place_at": place_at,

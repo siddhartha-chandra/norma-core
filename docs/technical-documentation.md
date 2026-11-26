@@ -178,13 +178,26 @@ Tool names are the public contract. Agents should call them by name.
 |---|---|
 | **Observation** | `observe(views, denoise)`, `get_state`, `get_frame(camera)`, `get_joint_angles(include_gripper)`, `get_calib_status`, `reload_config` |
 | **Bare-metal control** | `set_torque`, `move_joints(targets, max_step, wait)`, `move_joint(...)`, `grasp(close_ticks)`, `release`, `go_home`, `move_to_home(max_step, timeout_s)`, `estop` |
-| **Kinematics and 3D** | `solve_ik(x, y, z, alpha, beta, gamma)`, `get_metric_depth(x, y, camera, q_rad)`, `pixel_to_world(...)`, `localize_3d(...)` |
-| **Composite motion** | `move_to_pose`, `move_flange` (dry run unless `execute=True`), `pick_at`, `place_at`, `pick_pixel(x, y, yaw)`, `execute_sequence(steps, stop_on_false)` |
+| **Kinematics and 3D** | `solve_ik(x, y, z, qx, qy, qz, qw)`, `get_metric_depth(x, y, camera, q_rad)`, `pixel_to_world(...)`, `localize_3d(...)` |
+| **Composite motion** | `plan_and_move` (MuJoCo preflight; mock-only execution), `move_to_pose`, `move_flange` (dry run unless `execute=True`), `pick_at`, `place_at`, `pick_pixel(x, y, yaw)`, `execute_sequence(steps, stop_on_false)` |
 | **Wrist-stereo pipeline** | `detect_requested_object`, `aim_wrist`, `capture_wrist_stereo`, `estimate_wrist_depth`, `measure_graspability`, `estimate_grasp_pose` (legacy), `plan_tolerant_grasp`, `retract_to_hover`, `move_to_drop`, `master_pick_place` |
 | **Safety and scene** | `update_scene_obstacle`, `robo_jev_arm_watch`, `robo_jev_check`, `robo_jev_guard`, `speak_status` |
 | **Mock helpers** | `mock_add_object`, `mock_scene_state`, `mock_reset_scene` |
 
 Prompt skills: `desk_operator_skill`, `pick_and_place_skill`.
+
+`plan_and_move` takes a flange pose in `base_link` (meters, xyzw quaternion) and an explicit
+`shoulder_torque_limit_nm` simulation budget. It checks the ElRobot URDF collision geometry against the
+tabletop and obstacles registered with `update_scene_obstacle` (center coordinates; boxes require
+`size_xyz` full dimensions). It also checks the modeled gravity moment about j2 at each sampled waypoint,
+including the quantized tick targets. Lifts involving j2 first move j3 and j4 to reduce the shoulder load.
+It rejects paths that do not clear these checks without issuing a joint target.
+
+`execute=True` sends the checked targets only to `MockStationBridge`; live execution is disabled pending
+verified servo alignment (#5). The fixed-gripper model has no payload or dynamic torque model, and a
+simulation budget is not a safe hardware rating. To request just the MuJoCo IK solution, pass the same
+limit to `solve_ik`; without it the existing IK backend is unchanged. The other motion tools do not run
+this preflight.
 
 ### 4.2 Motion lock and run log
 
