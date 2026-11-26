@@ -176,12 +176,15 @@ class StationBridge(Protocol):
     async def connect(self) -> None: ...
     async def get_state(self) -> RobotState: ...
     async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes: ...
+    async def get_reflex_frame(self, camera: str) -> bytes: ...
     async def list_cameras(self) -> list[str]: ...
     async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP) -> dict[int, int]: ...
     async def set_torque(self, enable: bool, motor_ids: list[int] | None = None) -> bool: ...
     async def wait_settle(self, targets: dict[int, int], tol_ticks: int = 25, timeout_s: float = 3.0) -> bool: ...
     async def grasp_with_verify(self, close_ticks: int | None = None, open_ticks: int | None = None) -> dict: ...
     async def abort(self, source: str = "manual") -> dict: ...
+    @property
+    def abort_source(self) -> str | None: ...
     def rearm(self) -> None: ...
 
 
@@ -340,6 +343,9 @@ class MockStationBridge:
             self._frame_overrides.pop(camera, None)
         else:
             self._frame_overrides[camera] = jpeg_bytes
+
+    async def get_reflex_frame(self, camera: str) -> bytes:
+        return await self.get_frame(camera, denoise=False)
 
     async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
         if camera in self._frame_overrides:
@@ -529,6 +535,10 @@ class MockStationBridge:
             self._abort_source = source
         self._aborted = True
         return {"aborted": True, "source": self._abort_source, "positions": {k: v.position for k, v in self._motors.items()}}
+
+    @property
+    def abort_source(self) -> str | None:
+        return self._abort_source
 
     def rearm(self) -> None:
         self._aborted = False
@@ -1098,6 +1108,20 @@ class LiveStationBridge:
         idx = 1 if (camera == "wrist" and len(self._frame_order) > 1) else 0
         return self._frame_order[idx]
 
+    async def get_reflex_frame(self, camera: str) -> bytes:
+        opposite = "top" if camera == "wrist" else "wrist"
+        if not self._frame_order or (camera == "wrist" and len(self._frame_order) < 2):
+            raise RuntimeError(f"No {camera} reflex camera")
+        key = self._resolve_cam_key(camera)
+        if self._cam_map.get(camera) and self._cam_map[camera] not in key:
+            raise RuntimeError(f"No calibrated {camera} reflex camera")
+        if len(self._frame_order) > 1 and key == self._resolve_cam_key(opposite):
+            raise RuntimeError(f"Cannot resolve distinct {camera} reflex camera")
+        jpeg = await self.get_frame(camera, denoise=False)
+        if time.monotonic() - self.frame_received_at.get(key, -math.inf) > 0.1:
+            raise RuntimeError(f"Stale {camera} reflex camera")
+        return jpeg
+
     async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
         for _ in range(50):
             if self._frames:
@@ -1151,6 +1175,8 @@ class LiveStationBridge:
         mids = motor_ids or [m.id for m in st.motors]
         pack = []
         if enable:
+            if self._aborted:
+                raise EStopLatched("E-STOP latched: call observe() before moving")
             self._require_fresh_motor_rx(st, mids)
             present = {m.id: m.position.to_bytes(2, "little") for m in st.motors if m.id in mids}
             pack.append(self._sync_write(st.bus_serial, RAM_GOAL_POSITION, present))
@@ -1230,6 +1256,8 @@ class LiveStationBridge:
             need_start = [mid for mid in applied if mid not in self._torque_started]
             if need_start:
                 await self.set_torque(True, need_start)
+            if self._aborted:
+                raise EStopLatched("E-STOP latched: call observe() before moving")
             cmd = self._sync_write(
                 st.bus_serial,
                 RAM_GOAL_POSITION,
@@ -1361,11 +1389,18 @@ class LiveStationBridge:
         # Hold Position uses live PresentPosition when fresh (prevents jumping
         # by unseen drift); if telemetry is stale, drop torque safely instead
         # of refusing an emergency stop.
-        if hasattr(self.client, "read_from_tail"):
+        if (source != "reflex" or not self._follow_motor_rx) and hasattr(self.client, "read_from_tail"):
             await self._poll_inference_tail(timeout_s=1.0)
         try:
             self._require_fresh()
-            st = await self.get_state()
+            if source == "reflex" and self._follow_motor_rx:
+                serial = self._select_bus()
+                motors = sorted(self._motor_state.get(serial, {}).values(), key=lambda m: m.id)
+                if not motors:
+                    raise RuntimeError("No follower telemetry for reflex hold")
+                st = RobotState(serial, motors, bool(self._torque_started))
+            else:
+                st = await self.get_state()
             self._require_fresh_motor_rx(st, st.positions())
         except RuntimeError as exc:
             await self.set_torque(False)
@@ -1376,6 +1411,10 @@ class LiveStationBridge:
         cmd = self._sync_write(st.bus_serial, RAM_GOAL_POSITION, hold)
         await self._send_commands(self.client, [cmd])
         return {"aborted": True, "mode": "hold", "source": self._abort_source, "positions": st.positions()}
+
+    @property
+    def abort_source(self) -> str | None:
+        return self._abort_source
 
     def rearm(self) -> None:
         self._aborted = False

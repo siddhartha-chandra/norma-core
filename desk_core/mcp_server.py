@@ -39,7 +39,7 @@ from .calib_store import CalibrationStore, TICKS_PER_RAD
 from .hive import HIVE_SHAPE, POSITION_TOL_M, Layout, Obstacle, Tile, plan_hive
 from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
-from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
+from .robo_jev import ReflexMonitor, RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
 from .station_bridge import (DEFAULT_MAX_STEP, MAX_ANGLE_STEP, REPO_ROOT, LiveStationBridge, MockStationBridge,
                              PreflightWriteUncertain, RobotState, StationBridge, create_bridge)
@@ -172,7 +172,8 @@ mcp = FastMCP("desk-core")
 async def observe(views: list[str] | None = None, denoise: bool = True) -> list:
     """Inspect camera feed(s) ('top', or 'wrist' = gripper eye-in-hand; there is no separate wrist camera) and live ST3215 joint telemetry in one round-trip."""
     bridge = await _get_bridge()
-    bridge.rearm()
+    if bridge.abort_source != "reflex":
+        bridge.rearm()
     want_views = views or ["top", "wrist"]
     st = await bridge.get_state()
     summary = {
@@ -497,7 +498,7 @@ async def move_joint(
     if limits.out_of_bounds():
         return False
     try:
-        run = await move_joints_smooth(bridge, _calib, target_rad, limits)
+        run = await move_joints_smooth(bridge, _calib, target_rad, limits, reflex=_reach_reflex(bridge))
         return bool(run["ok"])
     except Exception:
         return False
@@ -699,6 +700,7 @@ async def plan_command(command: str) -> dict:
 
 @mcp.tool()
 @_traced
+@_motion_tool
 async def robo_jev_arm_watch(
     x: float,
     y: float,
@@ -706,11 +708,38 @@ async def robo_jev_arm_watch(
     camera: str = "top",
     depth_m: float | None = None,
 ) -> dict:
-    """Arm Robo-Jev's <150 ms visual reflex watch on pixel (x, y) before a reach."""
+    """Arm a camera crop around the localized target before a reach. Use the same query for both cameras."""
     bridge = await _get_bridge()
+    if camera not in ("top", "wrist"):
+        raise ValueError("Robo-Jev camera must be 'top' or 'wrist'.")
+    if bridge.abort_source == "reflex":
+        raise ValueError("Recover the interrupted reach with robo_jev_guard before arming another watch.")
+    if any(watch.query != query for watch in _robo_jev.watches.values()):
+        _robo_jev.clear_watch()
+    q_rad = await _live_arm_q(None, camera)
     jpeg = await bridge.get_frame(camera, denoise=False)
-    d_m = float(depth_m) if depth_m is not None else _calib.get_metric_depth(float(x), float(y), camera=camera)
-    return _robo_jev.arm_watch(jpeg_bytes=jpeg, pixel=(float(x), float(y)), query=query, depth_m=d_m)
+    pixel = float(x), float(y)
+    d_m = float(depth_m) if depth_m is not None else _calib.get_metric_depth(*pixel, camera=camera, q_rad=q_rad)
+    world = None
+    if camera == "wrist" and bridge.link_status().get("bridge") == "live":
+        if _calib.T_world_cam(camera, q_rad=q_rad) is None:
+            raise ValueError("Wrist reflex tracking requires wrist camera extrinsics.")
+        world = _calib.pixel_to_world(*pixel, camera=camera, q_rad=q_rad)
+    return _robo_jev.arm_watch(jpeg, pixel, query=query, depth_m=d_m, camera=camera, world=world)
+
+
+def _reach_reflex(bridge, target_xy=None) -> ReflexMonitor | None:
+    if not _robo_jev.watches:
+        return None
+    if target_xy is None and _robo_jev.watch is not None:
+        target_xy = _calib.pixel_to_world(*_robo_jev.watch.ref_pixel, camera="top")[:2]
+    return ReflexMonitor(_robo_jev, bridge, _calib, lambda: list(_obstacles.values()), target_xy)
+
+
+def _reflex_failure(bridge) -> dict:
+    if bridge.abort_source == "reflex":
+        return {"reflex": _robo_jev.interruption, "recovery_tool": "robo_jev_guard"}
+    return {}
 
 
 @mcp.tool()
@@ -1039,7 +1068,8 @@ async def move_to_pose(
     ok = await move_joint(joints=angles, wait=True)
     if ok and hasattr(bridge, "set_mock_ee_pose"):
         bridge.set_mock_ee_pose(x, y, z)
-    return {"ok": ok, "pose": [x, y, z, qx, qy, qz, qw], "joints_rad": angles}
+    return {"ok": ok, "pose": [x, y, z, qx, qy, qz, qw], "joints_rad": angles,
+            **(_reflex_failure(bridge) if not ok else {})}
 
 
 ### 3 and 4. Plan or execute a calibrated Cartesian flange move
@@ -1076,7 +1106,7 @@ async def move_flange(
     """
     from scipy.spatial.transform import Rotation
 
-    from .motion import MotionLimits, correct_final_pose, flange_error, plan_flange_move, stream_joint_path
+    from .motion import MotionLimits, flange_error, plan_flange_move, stream_joint_path
 
     if rot_frame not in ("flange", "base"):
         return {"ok": False, "problems": [f"rot_frame must be 'flange' or 'base', got {rot_frame!r}"]}
@@ -1093,11 +1123,12 @@ async def move_flange(
     result = {"ok": plan["ok"], "executed": False, "problems": plan["problems"], "plan": plan["summary"]}
     if not plan["ok"] or not execute:
         return result
-    run = await stream_joint_path(bridge, _calib, plan["path"], plan["duration_s"], limits)
+    run = await stream_joint_path(bridge, _calib, plan["path"], plan["duration_s"], limits,
+                                  reflex=_reach_reflex(bridge), correct=correct)
     result.update({"ok": run["ok"], "executed": True, "run": run})
     if run["ok"]:
         if correct:
-            result["correction"] = await correct_final_pose(bridge, _calib, plan["path"], limits)
+            result["correction"] = run.pop("correction")
         final_rad = _calib.ticks_to_rad((await bridge.get_state()).motors)
         result["result"] = flange_error(_calib, plan["path"], final_rad)
     return result
@@ -1312,19 +1343,20 @@ async def pick_at(
     approach_dz: float = 0.06,
 ) -> dict:
     """Composite pick: open jaws -> hover above -> descend -> grasp_with_verify -> retract cleanly."""
+    bridge = await _get_bridge()
     rx, ry, rz, q_hover, q_grasp = await _resolve_grasp_pose(x, y, z, qx, qy, qz, qw, dz=approach_dz)
     ## added by Abhi
     if not (opened := await release()).get("released"):
         return {"ok": False, "stage": "open", "release": opened}
     if q_hover is not None and q_grasp is not None:
-        bridge = await _get_bridge()
         if not await move_joint(joints=q_hover, wait=True):
-            return {"ok": False, "stage": "hover", "error": "move_joint(hover) failed"}
+            return {"ok": False, "stage": "hover", "error": "move_joint(hover) failed", **_reflex_failure(bridge)}
         if not await move_joint(joints=q_grasp, wait=True):
-            return {"ok": False, "stage": "descend", "error": "move_joint(descend) failed"}
+            return {"ok": False, "stage": "descend", "error": "move_joint(descend) failed", **_reflex_failure(bridge)}
         if hasattr(bridge, "set_mock_ee_pose"):
             bridge.set_mock_ee_pose(rx, ry, rz)
         grip = await grasp()
+        _robo_jev.clear_watch()
         if not grip.get("ok"):
             return {"ok": False, "stage": "close", "grasp": grip, "retract_ok": False}
         retract_ok = await move_joint(joints=q_hover, wait=True)
@@ -1339,6 +1371,7 @@ async def pick_at(
     if not descend["ok"]:
         return {"ok": False, "stage": "descend", **descend}
     grip = await grasp()
+    _robo_jev.clear_watch()
     ## added by Abhi
     if not grip.get("ok"):
         return {"ok": False, "stage": "close", "grasp": grip, "retract_ok": False}
@@ -1415,6 +1448,7 @@ async def pick_pixel(
     """Composite vision-to-grasp: pixel (x, y) -> get_metric_depth -> pixel_to_world -> pick_at."""
     depth_z = await get_metric_depth(x=x, y=y, camera=camera)
     world = await pixel_to_world(x=x, y=y, camera=camera)
+    await robo_jev_arm_watch(x=x, y=y, camera=camera, depth_m=depth_z)
     res = await pick_at(
         x=world["x"], y=world["y"], z=world["z"], qx=qx, qy=qy, qz=qz, qw=qw
     )
@@ -1449,7 +1483,8 @@ async def _get_main_control() -> MainControl:
             "grasp": grasp,
             "release": release,
             "estop": estop,
-        }, _obstacles)
+            "robo_jev_arm_watch": robo_jev_arm_watch,
+        }, _obstacles, _robo_jev)
     return _main_control
 
 
@@ -1697,7 +1732,14 @@ def desk_operator_skill() -> str:
         "3. Register obstacles (e.g. mug, departure_tray) via `update_scene_obstacle(...)` before moving.\n"
         "4. Prefer composite tools (`move_to_pose`, `pick_at`, `place_at`, `execute_sequence`) or "
         "`solve_ik -> move_joint -> grasp` over raw `move_joints` tick guesses.\n"
-        "5. On any unexpected slip, obstruction, or shift, call `estop()` immediately and re-`observe()`."
+        "5. Before a localized reach, call `robo_jev_arm_watch` on the top target pixel and the wrist target pixel "
+        "when visible in both views, using the same query.\n"
+        "6. If anything shifts or stalls, call `estop()` immediately and re-`observe()`. "
+        "If Robo-Jev has already latched the emergency stop, re-`observe()` without replacing the reflex latch "
+        "with a manual stop. Call `robo_jev_guard` and stop if it fails. "
+        "Use its `world` result if it re-localized the target; otherwise obtain fresh world coordinates via "
+        "`localize_3d` before planning. Use its coordinates only if it reports `found: true`; otherwise stay stopped. "
+        "Plan from the stopped pose; never resume the interrupted trajectory."
     )
 
 
@@ -1713,6 +1755,7 @@ def pick_and_place_skill(target_name: str, destination_name: str = "drop_x") -> 
         "2. Register visible tabletop obstacles with `update_scene_obstacle` before moving.\n"
         f"3. Call `master_pick_place(query={target_name!r})` for a dry run. The master's destination is the saved X (`drop_x`).\n"
         "4. For an authorized live pick to X with verified tool calibration, call the same tool with `execute=True`. "
+        "If Robo-Jev stops the reach, call `robo_jev_guard` and run a fresh localization and plan only if it succeeds. "
         "Use the returned status to report absence, uncertainty, an aborted stage, or successful placement."
     )
 
