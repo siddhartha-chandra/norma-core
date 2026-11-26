@@ -108,6 +108,12 @@ def test_hive_sorts_a_randomized_station_mock_scene(seed):
                     return response.structured_content
 
                 before = await call("mock_scene_state")
+                measured = [{"name": "measured", "color": "cream", "insect": "ant", "x": 0.28, "y": 0.0}]
+                direct = await call("hive_sort", tiles=measured)
+                dry_run = await call("execute_sequence", steps=[{"tool": "hive_sort", "args": {"tiles": measured}}])
+                assert dry_run["ok"], dry_run
+                assert dry_run["trace"][0]["result"] == direct
+                assert direct["ok"] and not direct["executed"] and len(direct["moves"]) == 1
                 preview = await call("hive_sort")
                 assert preview["ok"] and not preview["executed"] and preview["moves"]
                 assert await call("mock_scene_state") == before

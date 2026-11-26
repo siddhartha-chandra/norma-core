@@ -33,6 +33,7 @@ from dotenv import dotenv_values
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from PIL import Image as PILImage
+from pydantic import TypeAdapter
 
 from .calib_store import CalibrationStore, TICKS_PER_RAD
 from .hive import HIVE_SHAPE, POSITION_TOL_M, Layout, Obstacle, Tile, plan_hive
@@ -66,6 +67,7 @@ _connect_cooldown_until = 0.0
 _calib = CalibrationStore()
 _ik = IKAdapter()
 _obstacles: dict[str, SceneObstacle] = {}
+_hive_tiles = TypeAdapter(list[Tile])
 _robo_jev = RoboJevGatekeeper()
 _tts = SpeakerTTS()
 
@@ -975,7 +977,7 @@ async def hive_sort(execute: bool = False, tiles: list[Tile] | None = None) -> d
             else:
                 obstacles.append(Obstacle(obj["x"], obj["y"], obj["radius_m"]))
     try:
-        plan = plan_hive(tiles, Layout.load(), tuple(obstacles))
+        plan = plan_hive(_hive_tiles.validate_python(tiles), Layout.load(), tuple(obstacles))
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
     if mock is not None:
