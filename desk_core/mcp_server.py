@@ -970,12 +970,16 @@ async def sweep_aside(
                     failure = exc
         raise PlanningError(f"Sweep preflight rejected: {failure}") from failure
 
-    return await _run_mujoco_motion(shoulder_torque_limit_nm, execute, build)
+    def push_mock(bridge):
+        bridge.push_mock_pens(tuple(xy[0]), tuple(xy[1]), z_mm / 1000)
+
+    return await _run_mujoco_motion(shoulder_torque_limit_nm, execute, build, on_mock_success=push_mock)
 
 
 async def _run_mujoco_motion(
     shoulder_torque_limit_nm: float, execute: bool,
     build: Callable[[MuJoCoPlanner, np.ndarray, Callable[[np.ndarray], np.ndarray], bool], JointPlan],
+    *, on_mock_success: Callable[[MockStationBridge], None] | None = None,
 ) -> dict:
     from .ik_mujoco import PlanningError
     from .motion import FLANGE_SETTLE_TOL_TICKS
@@ -1091,6 +1095,8 @@ async def _run_mujoco_motion(
             return await stop_motion("Station did not finish within the planned joint tolerance")
     if isinstance(bridge, MockStationBridge):
         bridge.set_mock_ee_pose(*planner.flange_pose(plan.waypoints[-1])[0])
+        if on_mock_success is not None and result["executed"]:
+            on_mock_success(bridge)
     return result
 
 
