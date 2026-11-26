@@ -201,14 +201,16 @@ def test_sequence_rejects_non_boolean_sweep_execution_flag(execute, monkeypatch)
     assert "execute must be a JSON boolean" in str(result)
 
 
-def test_mock_sweep_moves_only_pens_in_the_swept_corridor(monkeypatch):
+def test_mock_sweep_moves_only_pens_in_the_swept_corridor(calib, monkeypatch):
     bridge = MockStationBridge(num_joints=8)
     monkeypatch.setattr(mcp_server, "_bridge", bridge)
     monkeypatch.setattr(mcp_server, "_obstacles", {})
-    bridge.add_mock_object("in-path", 0, 0.210, shape="pen")
-    bridge.add_mock_object("off-path", 0, 0.265, shape="pen")
-    bridge.add_mock_object("under-jaws", 0, 0.205, shape="pen", z=-0.010)
-    bridge.add_mock_object("fixed-object", 0, 0.205, shape="cube")
+    monkeypatch.setattr(mcp_server, "_calib", calib)
+    monkeypatch.setitem(calib.data, "z_table", 0.010)
+    bridge.add_mock_object("in-path", 0, 0.210, shape="pen", z=0.010)
+    bridge.add_mock_object("off-path", 0, 0.265, shape="pen", z=0.010)
+    bridge.add_mock_object("under-jaws", 0, 0.205, shape="pen", z=0.003)
+    bridge.add_mock_object("fixed-object", 0, 0.205, shape="cube", z=0.010)
 
     async def run():
         args = ((-0.064, 0.205), (0.063, 0.205), 6)

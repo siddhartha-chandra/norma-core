@@ -966,8 +966,9 @@ async def sweep_aside(
         return {"ok": False, "executed": False,
                 "problems": ["Provide distinct finite XY points and a clearance above the collision margin"]}
 
+    low_z = _calib.z_table() + z_mm / 1000
+
     def build(planner, start, quantize, live):
-        low_z = _calib.z_table() + z_mm / 1000
         low_start, low_end = np.column_stack((xy, [low_z, low_z]))
         lift = np.array([0, 0, SWEEP_HOVER_M])
         hover_start, hover_end = low_start + lift, low_end + lift
@@ -1000,7 +1001,7 @@ async def sweep_aside(
         raise PlanningError(f"Sweep preflight rejected: {failure}") from failure
 
     def push_mock(bridge):
-        bridge.push_mock_pens(tuple(xy[0]), tuple(xy[1]), z_mm / 1000)
+        bridge.push_mock_pens(tuple(xy[0]), tuple(xy[1]), low_z)
 
     return await _run_mujoco_motion(shoulder_torque_limit_nm, execute, build, on_mock_success=push_mock)
 
