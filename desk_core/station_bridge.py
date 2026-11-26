@@ -109,16 +109,16 @@ def _norm_pos(raw: int) -> int:
     return raw & MAX_ANGLE_STEP
 
 
-def _cleanest_frame(frames: list[bytes]) -> bytes:
-    """Burst consensus denoising against occasional corrupt USB/usbip JPEGs."""
+def _cleanest_frame_index(frames: list[bytes]) -> int:
+    """Return index of the burst-consensus cleanest JPEG against occasional corrupt frames."""
     pairs = []
-    for jb in frames:
+    for idx, jb in enumerate(frames):
         try:
-            pairs.append((jb, Image.open(io.BytesIO(jb)).convert("RGB")))
+            pairs.append((idx, Image.open(io.BytesIO(jb)).convert("RGB")))
         except Exception:
             pass
     if len(pairs) < 3:
-        return frames[-1]
+        return len(frames) - 1
     w, h = pairs[0][1].size
     imgs = [im if im.size == (w, h) else im.resize((w, h)) for _, im in pairs]
     best_i, best_score = 0, None
@@ -131,6 +131,11 @@ def _cleanest_frame(frames: list[bytes]) -> bytes:
         if best_score is None or score < best_score:
             best_score, best_i = score, i
     return pairs[best_i][0]
+
+
+def _cleanest_frame(frames: list[bytes]) -> bytes:
+    """Burst consensus denoising against occasional corrupt USB/usbip JPEGs."""
+    return frames[_cleanest_frame_index(frames)]
 
 
 @dataclass
@@ -654,8 +659,10 @@ class LiveStationBridge:
         self.frame_received_at: dict[str, float] = {}
         self.frame_station_ns: dict[str, int] = {}
         self._video_entry_ids: dict[str, bytes] = {}
+        self._last_selected_ref: dict[str, str] = {}
         self._frames: dict[str, bytes] = {}
         self._frame_buf: dict[str, deque[bytes]] = {}
+        self._frame_ref_buf: dict[str, deque[str]] = {}
         self._frame_order: list[str] = []
         self._followed_video_qids: set[str] = set()
         self._key_to_qid: dict[str, str] = {}
@@ -1078,6 +1085,10 @@ class LiveStationBridge:
                 log.debug("tail video parse skip: %s", exc)
         return out
 
+    def _append_frame_buf(self, key: str, jpeg: bytes, frame_ref: str) -> None:
+        self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
+        self._frame_ref_buf.setdefault(key, deque(maxlen=7)).append(frame_ref)
+
     async def _probe_video_queue(self, qid: str) -> None:
         try:
             items = await self._fetch_tail_frames(qid, count=1, timeout_s=3.0)
@@ -1087,7 +1098,7 @@ class LiveStationBridge:
             self._key_to_qid[key] = qid
             self._record_frame_receipt(key, jpeg, capture_ns, entry_id)
             self._frames[key] = jpeg
-            self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
+            self._append_frame_buf(key, jpeg, self._format_frame_ref(key, qid, entry_id, capture_ns))
             if key not in self._frame_order:
                 self._frame_order.append(key)
                 log.info("Camera discovered: %s (%s)", key, qid)
@@ -1106,9 +1117,12 @@ class LiveStationBridge:
                 if parsed is None:
                     continue
                 key, jpeg, capture_ns = parsed
-                self._record_frame_receipt(key, jpeg, capture_ns, getattr(getattr(entry, "ID", None), "ID", None))
+                entry_id = getattr(getattr(entry, "ID", None), "ID", None)
+                self._record_frame_receipt(key, jpeg, capture_ns, entry_id)
                 self._frames[key] = jpeg
-                self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
+                self._append_frame_buf(
+                    key, jpeg, self._format_frame_ref(key, self._key_to_qid.get(key), entry_id, capture_ns)
+                )
                 if key not in self._frame_order:
                     self._frame_order.append(key)
                     log.info("Camera discovered: %s", key)
@@ -1174,6 +1188,15 @@ class LiveStationBridge:
         idx = 1 if (camera == "wrist" and len(self._frame_order) > 1) else 0
         return self._frame_order[idx]
 
+    def _format_frame_ref(
+        self, key: str, qid: str | None, entry_id: bytes | bytearray | memoryview | None, capture_ns: int | None
+    ) -> str:
+        if qid and entry_id is not None:
+            return f"normfs://{qid}#{bytes(entry_id).hex()}"
+        if qid and capture_ns:
+            return f"normfs://{qid}@{capture_ns}"
+        return f"camera://{key}"
+
     def last_frame_ref(self, camera: str = "top") -> str | None:
         if not self._frames and not self._frame_order:
             return None
@@ -1181,14 +1204,12 @@ class LiveStationBridge:
             key = self._resolve_cam_key(camera)
         except (IndexError, KeyError, RuntimeError):
             return None
+        if key in self._last_selected_ref:
+            return self._last_selected_ref[key]
         qid = self._key_to_qid.get(key)
         entry_id = self._video_entry_ids.get(key)
         capture_ns = self.frame_station_ns.get(key)
-        if qid and entry_id:
-            return f"normfs://{qid}#{entry_id.hex()}"
-        if qid and capture_ns:
-            return f"normfs://{qid}@{capture_ns}"
-        return f"camera://{key}" if key else None
+        return self._format_frame_ref(key, qid, entry_id, capture_ns) if key else None
 
     async def get_reflex_frame(self, camera: str) -> bytes:
         opposite = "top" if camera == "wrist" else "wrist"
@@ -1221,17 +1242,33 @@ class LiveStationBridge:
                     _, jpeg, capture_ns, entry_id = items[-1]
                     self._record_frame_receipt(key, jpeg, capture_ns, entry_id)
                     self._frames[key] = jpegs[-1]
-                    buf = self._frame_buf.setdefault(key, deque(maxlen=7))
-                    buf.extend(jpegs)
+                    for _k, jb, c_ns, eid in items:
+                        self._append_frame_buf(key, jb, self._format_frame_ref(key, qid, eid, c_ns))
                     if denoise and len(jpegs) >= 3:
-                        return await asyncio.to_thread(_cleanest_frame, jpegs[-4:])
+                        window = items[-4:]
+                        idx = await asyncio.to_thread(_cleanest_frame_index, [it[1] for it in window])
+                        _, chosen_jpeg, chosen_ns, chosen_eid = window[idx]
+                        self._last_selected_ref[key] = self._format_frame_ref(key, qid, chosen_eid, chosen_ns)
+                        return chosen_jpeg
+                    self._last_selected_ref[key] = self._format_frame_ref(key, qid, entry_id, capture_ns)
                     return jpegs[-1]
             except Exception as exc:
                 log.debug("on-demand camera fetch failed for %s: %s", key, exc)
         if denoise:
             buf = list(self._frame_buf.get(key, ()))
+            ref_buf = list(self._frame_ref_buf.get(key, ()))
             if len(buf) >= 3:
-                return await asyncio.to_thread(_cleanest_frame, buf)
+                idx = await asyncio.to_thread(_cleanest_frame_index, buf)
+                if len(ref_buf) == len(buf):
+                    self._last_selected_ref[key] = ref_buf[idx]
+                else:
+                    self._last_selected_ref[key] = self._format_frame_ref(
+                        key, qid, self._video_entry_ids.get(key), self.frame_station_ns.get(key)
+                    )
+                return buf[idx]
+        self._last_selected_ref[key] = self._format_frame_ref(
+            key, qid, self._video_entry_ids.get(key), self.frame_station_ns.get(key)
+        )
         return self._frames[key]
 
     def _sync_write(self, bus_serial: str, address: int, values: dict[int, bytes]):

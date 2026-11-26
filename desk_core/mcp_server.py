@@ -21,6 +21,7 @@ import atexit
 import functools
 import io
 import json
+import logging
 import math
 import os
 import time
@@ -75,6 +76,7 @@ _tts = SpeakerTTS()
 
 RUNS_DIR = Path(os.environ.get("DESK_RUNS_DIR") or (REPO_ROOT / "runs"))
 FIXED_POSITIONS_PATH = REPO_ROOT / "calib" / "fixed_positions.json"
+_log = logging.getLogger(__name__)
 _logger: RunLogger | None = None
 _sightings: SightingsStore | None = None
 _frame_seq = 0
@@ -739,8 +741,8 @@ async def localize_3d(
             )
             if write_res is not None:
                 res["sighting"] = write_res.to_dict()
-        except Exception:
-            pass
+        except Exception as exc:
+            _log.warning("Failed to record sighting for %r: %s", res.get("label") or query, exc)
     return res
 
 
