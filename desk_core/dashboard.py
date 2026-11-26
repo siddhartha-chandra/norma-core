@@ -45,6 +45,7 @@ _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 _armed_camera = "top"
 _armed_positions: dict[int, int] | None = None
 _detection_positions: dict[int, int] | None = None
+_wrist_watch_stale = False
 WRIST_WATCH_MOVE_TICKS = 15
 
 
@@ -245,13 +246,14 @@ async def api_arm_watch() -> dict[str, Any]:
         q = "center-roi"
         d = 0.62
         cam = "top"
-    global _armed_camera, _armed_positions
+    global _armed_camera, _armed_positions, _wrist_watch_stale
     ref = _detection_positions if cam == "wrist" else None
     if ref is not None and _arm_moved_since(ref, await _arm_joint_positions(await srv._get_bridge())):
         raise HTTPException(status_code=409, detail="The arm moved since the wrist detection; run Localize again before arming.")
     res = await srv.robo_jev_arm_watch(*px, query=q, camera=cam, depth_m=d)
     _armed_camera = cam
     _armed_positions = ref
+    _wrist_watch_stale = False
     _log_event("ROBO-JEV", f"Armed watch on {q} @ {res['ref_pixel']}")
     return res
 
@@ -259,8 +261,10 @@ async def api_arm_watch() -> dict[str, Any]:
 @app.post("/api/robo_jev/check")
 async def api_check_reflex() -> dict[str, Any]:
     bridge = await srv._get_bridge()
+    global _wrist_watch_stale
     if _armed_camera == "wrist" and _armed_positions is not None:
-        if _arm_moved_since(_armed_positions, await _arm_joint_positions(bridge)):
+        if _wrist_watch_stale or _arm_moved_since(_armed_positions, await _arm_joint_positions(bridge)):
+            _wrist_watch_stale = True
             # The wrist camera moved with the arm, so the armed reference pixel no longer applies.
             srv._robo_jev.watches.pop("wrist", None)
             res = {**srv._robo_jev.last_report, "ok": False, "aborted": False, "target_shifted": False,
