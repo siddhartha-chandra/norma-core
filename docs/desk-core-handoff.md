@@ -18,6 +18,30 @@ NormaCore Station is running the arm and both camera streams. DESK-CORE adds the
 
 The branch reviewed was `feat/metric_depth_estimation` at `758c52f`. Commit `fa6db35` added reconnect, replay and smoke coverage. Commit `8d786fb` added the arm primitives and composite skills. Commit `33adc44` connected wrist FK, lens undistortion and the calibration verifier. Subsequent commits added session 1 camera calibration and loading of its nested scene/wrist format. At this snapshot, the five scripts for coin measurement, camera pose recovery, scene-to-base recovery, wrist mount solving and wrist capture were untracked working-tree files. The bridge receipt-time changes were also local. A clean checkout at the cited commit needs those working-tree changes to reproduce the capture workflow.
 
+## Periodic overhead desk scan
+
+Start one scanner alongside Station with the usual DESK-CORE camera and vision
+configuration:
+
+```sh
+uv run --managed-python python -m desk_core.desk_scan
+```
+
+It scans immediately, then every 120 seconds until stopped with Ctrl+C.
+`--interval SECONDS` overrides the cadence. The scanner calls `localize_3d`
+with no query to detect visible items in one overhead frame and record each
+projected position in the usual sightings history (NormFS, with SQLite fallback).
+It does not move the arm or uncover hidden items. A configured vision model can
+name items; OpenCV fallback records unidentified foreground objects.
+
+To try it in the internal simulation without the Station or a vision API:
+
+```sh
+DESK_MOCK=1 DESK_MOCK_SYNTHETIC=1 DESK_NO_DOTENV=1 \
+  DESK_SIGHTINGS_DB="$HOME/desk-scan-demo.db" \
+  uv run --managed-python python -m desk_core.desk_scan --interval 2 --provider opencv
+```
+
 ## Frames, units and measured inputs
 
 Transform names follow `T_A_B`: multiply coordinates in frame B by this matrix to obtain coordinates in frame A. Translations use meters, joint angles use radians, and encoder readings use 12-bit ticks. Both optical frames use OpenCV axes (+X right, +Y down, +Z forward).
