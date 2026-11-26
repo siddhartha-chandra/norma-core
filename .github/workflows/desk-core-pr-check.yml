@@ -7,6 +7,8 @@ on:
       - "desk_core/**"
       - "scripts/**"
       - "tests/**"
+      - "calib/**"
+      - "software/station/shared/station_py/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/desk-core-pr-check.yml"
