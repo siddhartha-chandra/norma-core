@@ -122,7 +122,7 @@ async def api_telemetry() -> dict[str, Any]:
 
 
 @app.get("/api/frame/{camera}.jpg")
-async def api_frame(camera: str) -> Response:
+async def api_frame(camera: str, show_overlay: bool = False) -> Response:
     if camera not in ("top", "wrist"):
         return Response(status_code=404)
     bridge = await srv._get_bridge()
@@ -163,6 +163,8 @@ async def api_frame(camera: str) -> Response:
             if ok_enc:
                 jpeg = buf.tobytes()
 
+    if camera == "top" and show_overlay:
+        jpeg = srv._with_xray(bridge, jpeg)
     return Response(content=jpeg, media_type="image/jpeg")
 
 
@@ -598,6 +600,7 @@ DASHBOARD_HTML = """<!doctype html>
         <div class="cam-box">
           <div class="cam-label">TOP WORKSPACE (X-Ray / Robo-Jev ROI)</div>
           <img id="cam-top" src="/api/frame/top.jpg" alt="top" />
+          <label><input id="show-xray" type="checkbox" onchange="refreshFrames()" /> X-Ray (obstacles and safe path)</label>
         </div>
         <div class="cam-box">
           <div class="cam-label">GRIPPER EYE-IN-HAND (camera id: wrist)</div>
@@ -810,7 +813,8 @@ DASHBOARD_HTML = """<!doctype html>
 
     function refreshFrames() {
       const t = Date.now();
-      document.getElementById('cam-top').src = '/api/frame/top.jpg?t=' + t;
+      const xray = document.getElementById('show-xray').checked;
+      document.getElementById('cam-top').src = '/api/frame/top.jpg?show_overlay=' + xray + '&t=' + t;
       document.getElementById('cam-wrist').src = '/api/frame/wrist.jpg?t=' + t;
     }
 

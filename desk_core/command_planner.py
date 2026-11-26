@@ -33,6 +33,7 @@ _PICK_AND_PLACE = re.compile(
     re.IGNORECASE,
 )
 _SORT_HIVE = re.compile(r"(?:please\s+)?sort\s+(?:the\s+)?hive\s+tiles[.!]?", re.IGNORECASE)
+_HEADING_OUT = re.compile(r"i(?:['’]m| am)\s+heading\s+out[.!]?", re.IGNORECASE)
 
 Localize = Callable[[str], Awaitable[dict[str, Any]]]
 
@@ -91,6 +92,9 @@ async def plan_command(command: str, localize: Localize, timeout_s: float = 8.0)
     if _SORT_HIVE.fullmatch(command.strip()):
         return {"route": "motion", "template": "sort_hive", "slots": {}, "grounding": {},
                 "steps": _steps("sort_hive", {})}
+    if _HEADING_OUT.fullmatch(command.strip()):
+        return {"route": "motion", "template": "heading_out", "slots": {}, "grounding": {},
+                "steps": [{"tool": "heading_out", "args": {"execute": True}}]}
 
     questions = {
         "needs_motion": noul_question("The command asks the robot arm to physically move, pick up, or place an object."),

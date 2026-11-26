@@ -166,6 +166,22 @@ Implemented in `LiveStationBridge` (`station_bridge.py`):
 
 `MockStationBridge` simulates the arm and a desk scene (mug and tray, registered via `mock_add_object`), renders `mock_frames/`, and supports `mock_displace_object` for Robo-Jev tests. Tests run against it by default (`DESK_MOCK=1` forces it).
 
+To try **Sim-Before-Steel X-Ray**, run
+`DESK_MOCK=1 DESK_MOCK_HEADING_OUT=1 uv run python scripts/agent_tui.py --mock`,
+enable **Show Camera Views** and **Arm Motion**, and type **I'm heading out**. The mock starts with a mug
+between the keys and the Departure Tray. The routine registers the mug cylinder and tray box,
+preflights the approach and transfer in MuJoCo (including a 30 g mock payload), and carries the keys around or over the mug
+only if it finds a clear path. No model API key is needed for this mock scene.
+
+Via MCP, call `heading_out()` for a dry run or `heading_out(execute=True)` to run the
+mock transfer. Set `show_overlay=True` on `get_frame(camera="top")` to draw the red collision
+volumes and the last certified green flange path on the JPEG. The Mission Control dashboard has
+the same X-Ray toggle. The raw feed, vision input, and wrist camera are unchanged.
+
+On a calibrated physical rig, the overhead wireframes use camera detections and the green
+path comes from a successful unloaded `plan_and_move` preflight. Heading Out does not
+execute on hardware: its simulated grasp offset and payload are not a calibrated live grasp.
+
 ---
 
 ## 4. MCP Server

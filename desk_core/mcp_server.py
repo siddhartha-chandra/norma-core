@@ -72,6 +72,8 @@ _connect_cooldown_until = 0.0
 _calib = CalibrationStore()
 _ik = IKAdapter()
 _obstacles: dict[str, SceneObstacle] = {}
+_unlocalized_obstacles: set[str] = set()
+_overlay_path: tuple = ()
 _hive_tiles = TypeAdapter(list[Tile])
 _robo_jev = RoboJevGatekeeper()
 _tts = SpeakerTTS()
@@ -152,6 +154,13 @@ async def _get_bridge() -> StationBridge:
 
 def _decode_rgb_matrix(jpeg: bytes) -> np.ndarray:
     return np.asarray(PILImage.open(io.BytesIO(jpeg)).convert("RGB"), dtype=np.uint8)
+
+
+def _with_xray(bridge: StationBridge, jpeg: bytes) -> bytes:
+    from .xray import overlay_jpeg
+
+    project = bridge.synthetic_top_projector() if isinstance(bridge, MockStationBridge) else None
+    return overlay_jpeg(jpeg, project or _calib.project_world_to_pixel, tuple(_obstacles.values()), _overlay_path)
 
 
 async def get_frame_matrix(camera: str = "top", denoise: bool = True) -> np.ndarray:
@@ -429,6 +438,8 @@ async def move_to_home(max_step: int = DEFAULT_MAX_STEP, timeout_s: float = 30.0
 @_traced
 async def estop() -> dict:
     """Emergency stop: freeze every motor immediately at its current encoder reading (or cut torque if stale)."""
+    global _overlay_path
+    _overlay_path = ()
     ## added by Abhi
     async with _estop_lock:
         owner = _motion_owner
@@ -519,12 +530,15 @@ async def get_frame(
     as_matrix: bool = False,
     max_dim: int = 0,
     save_npy: bool = True,
+    show_overlay: bool = False,
 ) -> list:
-    """Fetch camera frame as (H, W, 3) uint8 RGB matrix reference (.npy path + optional inline matrix) and Image."""
+    """Fetch a camera JPEG and RGB matrix reference; show_overlay draws X-Ray on the top view."""
     global _frame_seq
     _frame_seq += 1
     bridge = await _get_bridge()
     jpeg = await bridge.get_frame(camera, denoise=denoise)
+    if show_overlay and camera == "top":
+        jpeg = _with_xray(bridge, jpeg)
     arr = _decode_rgb_matrix(jpeg)
 
     frame_dir = (_logger.run_dir / "frames") if _logger is not None else (RUNS_DIR / "latest_frames")
@@ -565,6 +579,11 @@ def _mujoco_planner(st: RobotState, obstacles: list[SceneObstacle], shoulder_tor
         raise PlanningError("Invalid calibrated motor ranges or current ticks")
     return MuJoCoPlanner(_calib.urdf_path(), _calib.z_table(), obstacles, shoulder_torque_limit_nm,
                          _calib.bounds_rad(st.motors), gripper_open_fraction)
+
+
+def _quantize_joints(q: np.ndarray, motors) -> np.ndarray:
+    ticks = _calib.rad_to_ticks(q.tolist(), motors)
+    return np.asarray(_calib.ticks_to_rad([replace(m, position=ticks.get(m.id, m.position)) for m in motors]))
 
 
 ### 6. Solve the flange pose with the configured IK backend
@@ -829,6 +848,8 @@ async def update_scene_obstacle(
     size_xyz: tuple[float, float, float] | None = None,
 ) -> dict:
     """Register or remove a 3D obstacle (e.g. mug, departure_tray) for IK/planner collision checks."""
+    global _overlay_path
+    _overlay_path = ()
     if remove:
         _obstacles.pop(name, None)
     else:
@@ -836,6 +857,7 @@ async def update_scene_obstacle(
             name=name, shape=shape, x=float(x), y=float(y), z=float(z),
             radius_m=float(radius_m), height_m=float(height_m), size_xyz=size_xyz,
         )
+    _unlocalized_obstacles.discard(name)
     return {"obstacles": sorted(_obstacles.keys())}
 
 
@@ -849,6 +871,7 @@ async def get_calib_status() -> dict:
         "calibration": _calib.status(),
         "ik_backend": _ik.backend_name(),
         "obstacles": [vars(o) for o in _obstacles.values()],
+        "unlocalized_obstacles": sorted(_unlocalized_obstacles),
     }
 
 
@@ -858,7 +881,8 @@ async def get_calib_status() -> dict:
 async def reload_config() -> dict:
     """Hot-reload calib/rig_calib.json and the Pink IK module without restarting the MCP server."""
     ## added by Abhi
-    global _main_control
+    global _main_control, _overlay_path
+    _overlay_path = ()
     cal_status = _calib.reload()
     _main_control = None  # Captured poses use the calibration active when their images were taken.
     _ik.reload()
@@ -1125,8 +1149,13 @@ async def _run_mujoco_motion(
     from .ik_mujoco import PlanningError
     from .motion import FLANGE_SETTLE_TOL_TICKS
 
+    global _overlay_path
+    _overlay_path = ()
     bridge = await _get_bridge()
     live = isinstance(bridge, LiveStationBridge)
+    if live and _unlocalized_obstacles:
+        names = ", ".join(sorted(_unlocalized_obstacles))
+        return {"ok": False, "executed": False, "problems": [f"Obstacle positions unknown: {names}"]}
     if execute and not (live or isinstance(bridge, MockStationBridge)):
         return {"ok": False, "executed": False, "problems": ["Unsupported Station bridge"]}
     if isinstance(bridge, MockStationBridge) and bridge.get_mock_scene_state()["held_object"]:
@@ -1150,21 +1179,21 @@ async def _run_mujoco_motion(
                    if wrist_planner is None else wrist_planner(state, obstacles, fraction))
         start = np.asarray(_calib.ticks_to_rad(motors))
 
-        def quantize(q):
-            ticks = _calib.rad_to_ticks(q.tolist(), motors)
-            return np.asarray(_calib.ticks_to_rad([replace(m, position=ticks.get(m.id, m.position)) for m in motors]))
-
-        plan = build(planner, start, quantize, live)
+        plan = build(planner, start, lambda q: _quantize_joints(q, motors), live)
         targets = [_calib.rad_to_ticks(q.tolist(), motors) for q in plan.waypoints]
         if any(abs(second[mid] - tick) > DEFAULT_MAX_STEP for first, second in zip(targets, targets[1:])
                for mid, tick in first.items()):
             raise PlanningError("Preflight path exceeds Station's per-command step limit")
-        return planner, plan, targets
+        path = tuple(planner.flange_pose(q)[0] for q in plan.waypoints)
+        return planner, plan, targets, path
 
     try:
-        planner, plan, targets = await asyncio.to_thread(preflight)
+        planner, plan, targets, path = await asyncio.to_thread(preflight)
     except PlanningError as exc:
         return {"ok": False, "executed": False, "problems": [str(exc)]}
+    if list(_obstacles.values()) != obstacles:
+        return {"ok": False, "executed": False, "problems": ["Obstacles changed during preflight"]}
+    _overlay_path = path
     result = {"ok": True, "executed": False, "waypoints": len(targets),
               "tuck_end_waypoint": plan.tuck_end, "peak_shoulder_torque_nm": plan.peak_shoulder_torque_nm,
               "joints_rad": plan.waypoints[-1].tolist()}
@@ -1172,9 +1201,12 @@ async def _run_mujoco_motion(
         return result
     current = await bridge.get_state()
     if current.bus_serial != st.bus_serial or current.positions() != initial_ticks or list(_obstacles.values()) != obstacles:
+        _overlay_path = ()
         return {"ok": False, "executed": False, "problems": ["Start pose or obstacles changed during preflight"]}
 
     async def stop_motion(problem: str, *, write_uncertain: bool = False) -> dict:
+        global _overlay_path
+        _overlay_path = ()
         result.update(ok=False, problems=[problem])
         if result["executed"] or write_uncertain:
             try:
@@ -1366,6 +1398,7 @@ async def move_flange(
 
 @mcp.tool()
 @_traced
+@_motion_tool
 async def mock_add_object(
     name: str,
     x: float,
@@ -1377,9 +1410,11 @@ async def mock_add_object(
     insect: str | None = None,
 ) -> dict:
     """Add a synthetic 3D object in meters. Use shape='hive_tile' and set insect for a Hive tile."""
+    global _overlay_path
     bridge = await _get_bridge()
     if not hasattr(bridge, "add_mock_object"):
         return {"ok": False, "error": "mock_add_object is only available in --mock mode"}
+    _overlay_path = ()
     return {"ok": True, **bridge.add_mock_object(
         name=name, x=x, y=y, z=z, color=color, shape=shape, radius_m=radius_m, insect=insect,
     )}
@@ -1397,12 +1432,149 @@ async def mock_scene_state() -> dict:
 
 @mcp.tool()
 @_traced
+@_motion_tool
 async def mock_reset_scene() -> dict:
     """Reset the synthetic 3D tabletop scene in --mock mode."""
     bridge = await _get_bridge()
     if not hasattr(bridge, "reset_mock_scene"):
         return {"ok": False, "error": "mock_reset_scene is only available in --mock mode"}
+    for name in ("mug", "departure_tray"):
+        await update_scene_obstacle(name, 0, 0, remove=True)
     return {"ok": True, **bridge.reset_mock_scene()}
+
+
+async def _observe_heading_out_obstacles(bridge: StationBridge) -> None:
+    targets = (("coffee mug", "mug", 0.10), ("Departure Tray", "departure_tray", 0.02))
+    for _, name, _ in targets:
+        _obstacles.pop(name, None)
+        _unlocalized_obstacles.add(name)
+
+    table = _calib.z_table()
+    if _calib.T_world_cam("top") is None:
+        return
+    jpeg = await bridge.get_frame("top", denoise=True)
+    for query, name, height in targets:
+        detection = await localize_object_3d(jpeg, query, _calib, z_m=table + height, camera="top")
+        if not detection["found"] or detection["backend"] == "opencv-fallback":
+            continue
+        x, y = (detection["world"][axis] for axis in ("x", "y"))
+        width, length = detection["size_m"]
+        if not np.isfinite([x, y, width, length]).all() or min(width, length) <= 0:
+            continue
+        if name == "mug":
+            await update_scene_obstacle(name, x, y, table + height / 2,
+                                        radius_m=max(0.045, np.hypot(width, length) / 2), height_m=height)
+        else:
+            side = np.hypot(width, length)
+            await update_scene_obstacle(name, x, y, table + height / 2,
+                                        shape="box", size_xyz=(side, side, height))
+
+
+@mcp.tool()
+@_traced
+@_motion_tool
+async def heading_out(execute: bool = False) -> dict:
+    """Detect mug and tray; preview or execute a collision-checked keys transfer in Station mock mode."""
+    from .heading_out import MOCK_TCP_DROP_M, STACK_CLEARANCE_M, plan_transfer
+    from .ik_mujoco import PlanningError
+
+    global _overlay_path
+    _overlay_path = ()
+    bridge = await _get_bridge()
+    if not isinstance(bridge, MockStationBridge):
+        await _observe_heading_out_obstacles(bridge)
+        return {"ok": False, "executed": False,
+                "unlocalized_obstacles": sorted(_unlocalized_obstacles),
+                "problems": ["Heading Out transfer requires mock mode; live grasp and payload are not calibrated"]}
+
+    scene = bridge.get_mock_scene_state()
+    objects = scene["objects"]
+    if scene["held_object"] is not None or "keys" not in objects or "departure_tray" not in objects:
+        return {"ok": False, "executed": False, "problems": ["Need loose keys and a departure_tray in the mock scene"]}
+    table = _calib.z_table()
+    keys, tray = objects["keys"], objects["departure_tray"]
+    for name, obj in objects.items():
+        if name == "departure_tray":
+            continue
+        dx = max(0.0, abs(obj["x"] - tray["x"]) - tray["radius_m"])
+        dy = max(0.0, abs(obj["y"] - tray["y"]) - tray["radius_m"])
+        if np.hypot(dx, dy) < obj["radius_m"]:
+            return {"ok": False, "executed": False, "problems": [f"Departure tray is occupied by {name}"]}
+    if bridge.get_mock_riders("keys"):
+        return {"ok": False, "executed": False, "problems": ["Keys are blocked by another object"]}
+    tray_height = bridge._obj_height("departure_tray", tray)
+    await update_scene_obstacle("departure_tray", tray["x"], tray["y"], table + tray["z"] + tray_height / 2,
+                                shape="box", size_xyz=(2 * tray["radius_m"], 2 * tray["radius_m"], tray_height))
+    if mug := objects.get("mug"):
+        height = bridge._obj_height("mug", mug)
+        await update_scene_obstacle("mug", mug["x"], mug["y"], table + mug["z"] + height / 2,
+                                    radius_m=mug["radius_m"], height_m=height)
+    else:
+        await update_scene_obstacle("mug", 0, 0, remove=True)
+
+    initial = await bridge.get_state()
+    ticks = initial.positions()
+    motors = [replace(motor) for motor in initial.motors]
+    obstacles = list(_obstacles.values())
+    source = [keys["x"], keys["y"], table + keys["z"]]
+    destination = [tray["x"], tray["y"], table + tray["z"] + tray_height + STACK_CLEARANCE_M]
+
+    def preflight():
+        planner = _mujoco_planner(replace(initial, motors=motors), obstacles, 0.6)
+        start = _calib.ticks_to_rad(motors)
+        transfer = plan_transfer(planner, start, source, destination, keys["radius_m"],
+                                 bridge._obj_height("keys", keys), obstacles,
+                                 lambda q: _quantize_joints(q, motors), table)
+        plans = []
+        for path in (transfer.approach, transfer.carry):
+            commands = [_calib.rad_to_ticks(q.tolist(), motors) for q in path]
+            if any(abs(b[mid] - tick) > DEFAULT_MAX_STEP for a, b in zip(commands, commands[1:])
+                   for mid, tick in a.items()):
+                raise PlanningError("Preflight path exceeds Station's per-command step limit")
+            plans.append(list(zip(commands[1:], [planner.flange_pose(q)[0] for q in path[1:]])))
+        return transfer, plans
+
+    try:
+        transfer, (approach, carry) = await asyncio.to_thread(preflight)
+    except PlanningError as exc:
+        return {"ok": False, "executed": False, "problems": [str(exc)]}
+
+    def unchanged():
+        return list(_obstacles.values()) == obstacles
+
+    current_ticks = (await bridge.get_state()).positions()
+    if not unchanged() or bridge.get_mock_scene_state() != scene or current_ticks != ticks:
+        return {"ok": False, "executed": False, "problems": ["Mock pose or scene changed during preflight"]}
+    _overlay_path = tuple(transfer.flange_path)
+    result = {"ok": True, "executed": False, "detour": transfer.detour,
+              "waypoints": len(transfer.carry), "transfer_flange_m": transfer.flange_path.tolist()}
+    if not execute:
+        return result
+
+    async def move(path):
+        for command, (x, y, z) in path:
+            if not unchanged() or await bridge.send_joint_targets(command, max_step=DEFAULT_MAX_STEP) != command:
+                raise PlanningError("Station or the registered obstacles changed during transfer")
+            bridge.set_mock_ee_pose(x, y, z - MOCK_TCP_DROP_M - table)
+            await asyncio.sleep(0)
+
+    try:
+        if not (await release()).get("released"):
+            raise PlanningError("Could not open the mock gripper")
+        await move(approach)
+        if (await grasp()).get("held_object") != "keys":
+            raise PlanningError("Mock gripper did not grasp the keys")
+        await move(carry)
+        if (await release()).get("released_object") != "keys":
+            raise PlanningError("Mock gripper did not release the keys")
+        placed = bridge.get_mock_scene_state()["objects"]["keys"]
+        if np.linalg.norm(np.array([placed[axis] for axis in ("x", "y", "z")])
+                          - (np.asarray(destination) - [0, 0, table])) > 0.002:
+            raise PlanningError("Keys did not land at the departure tray")
+    except (PlanningError, RuntimeError) as exc:
+        _overlay_path = ()
+        return {**result, "ok": False, "problems": [str(exc)], "hold": await bridge.abort()}
+    return {**result, "executed": True}
 
 
 @mcp.tool()
@@ -1714,7 +1886,7 @@ async def _get_main_control() -> MainControl:
             "release": release,
             "estop": estop,
             "robo_jev_arm_watch": robo_jev_arm_watch,
-        }, _obstacles, _robo_jev)
+        }, _obstacles, _robo_jev, unlocalized_obstacles=_unlocalized_obstacles)
     return _main_control
 
 
@@ -2041,6 +2213,7 @@ _SEQ_TOOLS = {
     "pick_at": pick_at,
     "place_at": place_at,
     "pick_pixel": pick_pixel,
+    "heading_out": heading_out,
     "sweep_aside": sweep_aside,
     "hive_sort": hive_sort,
     ## added by Abhi

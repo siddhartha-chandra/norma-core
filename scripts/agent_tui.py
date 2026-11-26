@@ -84,6 +84,7 @@ EXECUTE_GATED_TOOLS = {
     "capture_wrist_stereo",
     "master_pick_place",
     "hive_sort",
+    "heading_out",
     "sweep_aside",
 }
 
@@ -935,7 +936,9 @@ class RobotAgentTUI(App):
             self._last_cam_sig: dict[str, tuple[bytes, str]] = {}
         try:
             r_top, r_wrist = await asyncio.gather(
-                self.session.call_tool("get_frame", {"camera": "top", "denoise": False, "save_npy": False}),
+                self.session.call_tool("get_frame", {
+                    "camera": "top", "denoise": False, "save_npy": False, "show_overlay": True,
+                }),
                 self.session.call_tool("get_frame", {"camera": "wrist", "denoise": False, "save_npy": False}),
             )
             markers = getattr(self, "_overlay_markers", {})
@@ -1265,7 +1268,7 @@ class RobotAgentTUI(App):
 
 async def _run_headless_test() -> int:
     import tempfile
-    from unittest.mock import patch
+    from unittest.mock import AsyncMock, patch
     from desk_core.llm_plugins import AgentStepResponse, AgentToolCall, validate_vision_plugin
 
     # 1. Verify strict vision-only provider/model enforcement
@@ -1300,6 +1303,15 @@ async def _run_headless_test() -> int:
                     break
                 await pilot.pause(0.1)
             assert app.session is not None, "MCP session failed to initialize"
+
+            arm = app.query_one("#arm-motion", Checkbox)
+            was_armed = arm.value
+            arm.value = False
+            with patch.object(app.session, "call_tool", new_callable=AsyncMock) as call:
+                denied = await app._call_mcp_tool("heading_out", {"execute": True})
+                assert denied["ok"] is False and "check Arm Motion" in denied["error"]
+                assert not any(args.args[:1] == ("heading_out",) for args in call.call_args_list)
+            arm.value = was_armed
 
             fake_step = AgentStepResponse(
                 thought="Locate keys first.",

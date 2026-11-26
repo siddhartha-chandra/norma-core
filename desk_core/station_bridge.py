@@ -215,6 +215,7 @@ class MockStationBridge:
         self._scene_objects: dict[str, dict[str, Any]] = {}
         seed = os.environ.get("DESK_MOCK_HIVE_SEED")
         self._hive_seed = int(seed) if seed else None
+        self._heading_out_scene = os.environ.get("DESK_MOCK_HEADING_OUT") == "1"
         self.reset_mock_scene()
 
     def seed_mock_hive(self, seed: int) -> None:
@@ -237,6 +238,12 @@ class MockStationBridge:
         self._held_riders = []
         if self._hive_seed is not None:
             self.seed_mock_hive(self._hive_seed)
+            return self.get_mock_scene_state()
+        if self._heading_out_scene:
+            self._scene_objects.clear()
+            self.add_mock_object("keys", -0.09, 0.18, color="blue", radius_m=0.018)
+            self.add_mock_object("mug", 0.0, 0.18, color="brown", shape="cylinder", radius_m=0.035)
+            self.add_mock_object("departure_tray", 0.09, 0.18, color="green", shape="tray", radius_m=0.035)
             return self.get_mock_scene_state()
         self._scene_objects = {
             "keys": {"x": 0.27, "y": -0.06, "z": 0.0, "color": "blue", "shape": "cube", "radius_m": 0.025},
@@ -275,7 +282,7 @@ class MockStationBridge:
         heights = {
             "cylinder": 0.09, "mug": 0.09, "pen": 0.012, "wallet": 0.025,
             "airpods": 0.025, "wired_earphones": 0.015, "mobile_phone": 0.010,
-            "sphere": 0.048, "cube": 0.045, HIVE_SHAPE: TILE_THICKNESS_M,
+            "sphere": 0.048, "cube": 0.045, "tray": 0.018, HIVE_SHAPE: TILE_THICKNESS_M,
         }
         return heights.get("mug" if name == "mug" else obj.get("shape", "cube"), 0.04)
 
@@ -362,11 +369,9 @@ class MockStationBridge:
     async def get_reflex_frame(self, camera: str) -> bytes:
         return await self.get_frame(camera, denoise=False)
 
-    async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
-        if camera in self._frame_overrides:
-            return self._frame_overrides[camera]
+    def _mock_frame_path(self, camera: str) -> Path | None:
         hive_active = any(obj["shape"] == HIVE_SHAPE for obj in self._scene_objects.values())
-        if not hive_active and os.environ.get("DESK_MOCK_SYNTHETIC") != "1":
+        if not (hive_active or self._heading_out_scene) and os.environ.get("DESK_MOCK_SYNTHETIC") != "1":
             env_key = "DESK_MOCK_TOP_IMAGE" if camera == "top" else "DESK_MOCK_WRIST_IMAGE"
             candidates = []
             if os.environ.get(env_key, "").strip():
@@ -376,7 +381,33 @@ class MockStationBridge:
                 candidates.append(REPO_ROOT / ("cam_1.jpg" if camera == "top" else "cam_0.jpg"))
             for cand in candidates:
                 if cand.exists() and cand.is_file():
-                    return cand.read_bytes()
+                    return cand
+        return None
+
+    @staticmethod
+    def _project_mock_point(point, cx, cy, cz, focal):
+        x, y, z = point
+        dz = max(0.06, cz - z)
+        return 320.0 - (y - cy) * focal / dz, 240.0 - (x - cx) * focal / dz, dz
+
+    def synthetic_top_projector(self):
+        if "top" not in self._frame_overrides and self._mock_frame_path("top") is None:
+            return self._project_mock_top
+        return None
+
+    def _mock_top_camera(self):
+        return (0.0, 0.21, 0.65) if self._heading_out_scene else (0.28, 0.0, 0.65)
+
+    def _project_mock_top(self, point):
+        if point[2] >= 0.65:
+            return None
+        return self._project_mock_point(point, *self._mock_top_camera(), 680.0)[:2]
+
+    async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
+        if camera in self._frame_overrides:
+            return self._frame_overrides[camera]
+        if path := self._mock_frame_path(camera):
+            return path.read_bytes()
 
         # 2. Clean 640x480 synthetic 3D tabletop scene projected into top & gripper ('wrist') views
         color_rgb = {
@@ -395,7 +426,7 @@ class MockStationBridge:
         d = ImageDraw.Draw(img)
 
         if camera == "top":
-            cx_cam, cy_cam, cz_cam = 0.28, 0.0, 0.65
+            cx_cam, cy_cam, cz_cam = self._mock_top_camera()
             f_px = 680.0
             d.rectangle([28, 28, 612, 452], fill=(242, 240, 235), outline=(190, 188, 180), width=2)
         else:
@@ -405,11 +436,7 @@ class MockStationBridge:
             d.rectangle([0, 0, 640, 480], fill=(224, 222, 216))
 
         def _proj(wx: float, wy: float, wz: float) -> tuple[float, float, float]:
-            dz = max(0.06, cz_cam - wz)
-            # World +X = forward (up on screen -> -v), World +Y = left (-u)
-            u = 320.0 - ((wy - cy_cam) / dz) * f_px
-            v = 240.0 - ((wx - cx_cam) / dz) * f_px
-            return u, v, dz
+            return self._project_mock_point((wx, wy, wz), cx_cam, cy_cam, cz_cam, f_px)
 
         hive_layers: dict[tuple[float, float], int] = {}
         for name, obj in sorted(self._scene_objects.items(), key=lambda kv: kv[1].get("z", 0.0)):

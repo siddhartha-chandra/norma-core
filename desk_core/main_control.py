@@ -111,11 +111,13 @@ def _jaw_bounds(urdf: Path) -> np.ndarray:
 class MainControl:
     """Runs each stage with the same bridge, calibration and registered obstacles."""
 
-    def __init__(self, bridge, calib, tools, obstacles, gatekeeper: RoboJevGatekeeper | None = None):
+    def __init__(self, bridge, calib, tools, obstacles, gatekeeper: RoboJevGatekeeper | None = None, *,
+                 unlocalized_obstacles: set[str] | None = None):
         self.bridge = bridge
         self.calib = calib
         self.tools = tools
         self.obstacles = obstacles
+        self.unlocalized_obstacles = unlocalized_obstacles if unlocalized_obstacles is not None else set()
         self.gatekeeper = gatekeeper
         self.captures: dict[str, WristMeasurement] = {}
         self.pick_plan: dict | None = None
@@ -210,15 +212,21 @@ class MainControl:
             raise ValueError("Wrist detection returned an empty box.")
         return x0, y0, x1 - x0, y1 - y0
 
+    def _collision_obstacles(self):
+        unknown = sorted(self.unlocalized_obstacles)
+        if unknown:
+            raise ValueError(f"Obstacle positions unknown: {', '.join(unknown)}")
+        return tuple(self.obstacles.values())
+
     ### 3. Aim the wrist with the measured coarse scene target.
     async def aim_wrist(self, target_base_m, execute=False) -> dict:
         return await plan_wrist_aim(self.bridge, self.calib, target_base_m, execute=execute,
-                                    obstacles=tuple(self.obstacles.values()), reflex=self._reach_reflex())
+                                    obstacles=self._collision_obstacles(), reflex=self._reach_reflex())
 
     ### 4. Capture an identified pair and estimate sparse wrist depth.
     async def capture_wrist_stereo(self, target_base_m, execute=False) -> dict:
         capture = await run_wrist_sweep(self.bridge, self.calib, target_base_m, execute=execute,
-                                       obstacles=tuple(self.obstacles.values()), reflex=self._reach_reflex())
+                                       obstacles=self._collision_obstacles(), reflex=self._reach_reflex())
         if not capture.get("ok") or not execute:
             return capture
         pair = capture.pop("pair")
@@ -400,6 +408,7 @@ class MainControl:
                 "jaw_lowest_above_table_m": best["jaw_lowest_above_table_m"], **summary}
 
     def _checked_path(self, q0, q1, carried=None, lift_from_table=False):
+        obstacles = self._collision_obstacles()
         a, b = np.asarray(q0, dtype=float), np.asarray(q1, dtype=float)
         if a.shape != (7,) or b.shape != (7,) or not np.isfinite([a, b]).all():
             raise ValueError("A motion waypoint must contain seven finite joint angles.")
@@ -423,7 +432,7 @@ class MainControl:
             raise ValueError("The lift did not clear the table by 5 mm.")
         obstacle_points = jaw if carried is None else np.vstack((jaw, carried))
         if problem := registered_obstacle_path_problem(
-            self.calib, path, tuple(self.obstacles.values()), points_in_flange=obstacle_points,
+            self.calib, path, obstacles, points_in_flange=obstacle_points,
         ):
             raise ValueError(problem)
         return path
@@ -583,6 +592,7 @@ class MainControl:
                 await self._motor_state()
             for obstacle in obstacles or ():
                 await self.tools["update_scene_obstacle"](**obstacle)
+            self._collision_obstacles()
             if execute and self.gatekeeper is not None:
                 found = detection["detection"]
                 await self.tools["robo_jev_arm_watch"](*found["pixel"], query=query, depth_m=found["depth_m"])

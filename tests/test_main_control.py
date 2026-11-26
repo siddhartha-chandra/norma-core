@@ -65,6 +65,17 @@ def test_dry_run_passes_scene_target_to_aim_only(workflow):
     workflow.capture_wrist_stereo.assert_not_awaited()
 
 
+def test_unknown_obstacle_stops_pick_place_before_aiming(workflow):
+    workflow.unlocalized_obstacles.add("mug")
+
+    result = asyncio.run(workflow.master_pick_place("keys", execute=True, tool=TOOL))
+
+    assert not result["ok"] and not result["executed"]
+    assert result["error"] == "Obstacle positions unknown: mug"
+    workflow.aim_wrist.assert_not_awaited()
+    workflow.tools["release"].assert_not_awaited()
+
+
 def test_full_workflow_passes_capture_and_ik_results_to_motion(workflow):
     result = asyncio.run(workflow.master_pick_place("keys", execute=True, tool=TOOL))
     assert result["ok"], result
