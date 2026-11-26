@@ -5,6 +5,18 @@ import pytest
 
 from desk_core import desk_scan, mcp_server, vision_3d
 from desk_core.sightings import SightingsStore
+from desk_core.station_bridge import LiveStationBridge
+
+
+def test_scene_scan_never_uses_wrist_as_overhead(monkeypatch):
+    bridge = LiveStationBridge("localhost", 8888, cam_top="overhead-id", cam_wrist="wrist-id")
+    bridge._frames["wrist-id"] = b"wrist-frame"
+    bridge._frame_order.append("wrist-id")
+    monkeypatch.setattr(mcp_server, "_bridge", bridge)
+    monkeypatch.setattr(mcp_server, "_logger", None)
+
+    with pytest.raises(RuntimeError, match="No uniquely configured top camera"):
+        asyncio.run(mcp_server.localize_3d(provider="opencv"))
 
 
 def test_default_ten_minute_scan_in_mock_simulation(tmp_path, monkeypatch, mock_bridge):

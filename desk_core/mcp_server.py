@@ -711,7 +711,10 @@ async def localize_3d(
     if query is None and camera != "top":
         raise ValueError("Scene scans require camera='top'.")
     bridge = await _get_bridge()
-    jpeg = await bridge.get_frame(camera, denoise=denoise)
+    if query is None and isinstance(bridge, LiveStationBridge):
+        jpeg = await bridge.get_frame(camera, denoise=denoise, strict_camera=True)
+    else:
+        jpeg = await bridge.get_frame(camera, denoise=denoise)
     seen_at = time.time()
     frame_ref = (
         bridge.last_frame_ref(camera)
