@@ -488,3 +488,10 @@ def test_mcp_reanchor_plane_blocked_during_active_motion():
                 await srv.reanchor_plane(clear=True)
 
     asyncio.run(_run())
+
+
+def test_fit_homography_from_checkerboard_requires_origin_hint():
+    """fit_homography_from_checkerboard must reject missing origin_hint_px to prevent 180-deg flips."""
+    dummy = np.zeros((120, 160, 3), dtype=np.uint8)
+    with pytest.raises(ValueError, match="origin_hint_px is required"):
+        fit_homography_from_checkerboard(dummy, (6, 4), 0.025)

@@ -303,6 +303,11 @@ def fit_homography_from_checkerboard(
     sq = float(square_size_m)
     if sq <= 0.0:
         raise ValueError("square_size_m must be positive.")
+    if origin_hint_px is None:
+        raise ValueError(
+            "origin_hint_px is required for fit_homography_from_checkerboard to "
+            "disambiguate corner (0, 0) and prevent 180-degree-rotated tabletop mappings."
+        )
 
     x_vec = np.asarray(board_x_dir, dtype=np.float64).reshape(2)
     y_vec = np.asarray(board_y_dir, dtype=np.float64).reshape(2)

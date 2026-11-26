@@ -269,6 +269,12 @@ def main(argv: list[str] | None = None) -> int:
         if image is None:
             print("Error: --checkerboard requires --image, --live, or --mock.", file=sys.stderr)
             return 1
+        if args.origin_hint is None:
+            print(
+                "Error: --checkerboard requires --origin-hint U V near corner (0, 0) to avoid 180-degree flips.",
+                file=sys.stderr,
+            )
+            return 1
         fit_cb, px_cb, w_cb, det_method = fit_homography_from_checkerboard(
             image,
             (args.checkerboard[0], args.checkerboard[1]),
