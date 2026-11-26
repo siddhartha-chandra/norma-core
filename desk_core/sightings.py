@@ -353,8 +353,9 @@ class SightingsStore:
 
     async def _drain_queue_read(
         self, qr: Any, deadline: float
-    ) -> tuple[list[Sighting], bytes | None, int]:
+    ) -> tuple[list[Sighting], bytes | None, bytes | None, int]:
         entries: list[Sighting] = []
+        first_id: bytes | None = None
         last_id: bytes | None = None
         raw_count = 0
         while time.monotonic() < deadline:
@@ -368,12 +369,15 @@ class SightingsStore:
             raw_count += 1
             raw_id = getattr(getattr(entry, "ID", None), "ID", None)
             if isinstance(raw_id, (bytes, bytearray, memoryview)):
-                last_id = bytes(raw_id)
+                b_id = bytes(raw_id)
+                if first_id is None:
+                    first_id = b_id
+                last_id = b_id
             try:
                 entries.append(Sighting.from_bytes(entry.Data))
             except Exception as exc:
                 log.debug("Skipping malformed NormFS sighting entry: %s", exc)
-        return entries, last_id, raw_count
+        return entries, first_id, last_id, raw_count
 
     async def read_normfs(
         self,
@@ -392,28 +396,39 @@ class SightingsStore:
         deadline = time.monotonic() + self.timeout_s
         filtered = label is not None or before_time is not None
 
-        # When filtering by label/time, paginate from offset 0 so sightings older than
-        # a fixed tail window are never silently missed.
-        if filtered and hasattr(client, "read_from_offset"):
+        # When filtering by label/time, walk backwards from the tail in 1,000-entry pages
+        # so newest matches are collected first and sightings older than 1,000 entries are found.
+        if filtered and hasattr(client, "read_from_tail") and hasattr(client, "read_from_offset"):
             page_size = 1000
             buf_size = 256
-            next_idx = 0
             matched: list[Sighting] = []
             want_label = label.strip().casefold() if label is not None else None
             cutoff = float(before_time) if before_time is not None else None
-            while time.monotonic() < deadline:
-                offset = next_idx.to_bytes(8, "little") if next_idx > 0 else b"\x00"
-                qr = client.read_from_offset(self.queue_id, offset=offset, limit=page_size, step=1, buf_size=buf_size)
-                page, last_id, raw_count = await self._drain_queue_read(qr, deadline)
+
+            def _collect(page: list[Sighting]) -> None:
                 for s in page:
                     if want_label is not None and s.label.casefold() != want_label:
                         continue
                     if cutoff is not None and s.time > cutoff:
                         continue
                     matched.append(s)
-                if raw_count < page_size or last_id is None:
+
+            tail_offset = (page_size - 1).to_bytes(8, "little")
+            qr = client.read_from_tail(self.queue_id, offset=tail_offset, limit=page_size, step=1, buf_size=buf_size)
+            page, first_id, _last_id, _raw_count = await self._drain_queue_read(qr, deadline)
+            _collect(page)
+
+            end_idx = int.from_bytes(first_id, "little") if first_id is not None else 0
+            while end_idx > 0 and time.monotonic() < deadline:
+                start_idx = max(0, end_idx - page_size)
+                chunk = end_idx - start_idx
+                offset = start_idx.to_bytes(8, "little") if start_idx > 0 else b"\x00"
+                qr = client.read_from_offset(self.queue_id, offset=offset, limit=chunk, step=1, buf_size=buf_size)
+                page, _fid, _lid, raw_count = await self._drain_queue_read(qr, deadline)
+                _collect(page)
+                if raw_count == 0:
                     break
-                next_idx = int.from_bytes(last_id, "little") + 1
+                end_idx = start_idx
             return _filter_and_sort(matched, limit=limit, label=label, before_time=before_time)
 
         buf_size = min(max(limit, 16), 256)
@@ -425,7 +440,7 @@ class SightingsStore:
         else:
             return []
 
-        entries, _, _ = await self._drain_queue_read(qr, deadline)
+        entries, _, _, _ = await self._drain_queue_read(qr, deadline)
         return _filter_and_sort(entries, limit=limit, label=label, before_time=before_time)
 
     def read_sqlite(
