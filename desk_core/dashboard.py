@@ -840,8 +840,9 @@ DASHBOARD_HTML = """<!doctype html>
           `<tr><td>M${m.id}</td><td>${m.position}</td><td>${m.norm}</td><td>${m.current_ma}</td><td>${m.err}</td></tr>`
         ).join('');
 
-        const evs = (logs.dashboard_events || []).map(e => `<div>[${e.ts}] <b>${e.kind}</b>: ${e.detail}</div>`).join('');
-        const calls = (logs.mcp_calls || []).map(c => `<div style="color:var(--muted)">[${c.ts}] MCP ${c.tool} (${c.duration_ms}ms)</div>`).join('');
+        const esc = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'})[ch]);
+        const evs = (logs.dashboard_events || []).map(e => `<div>[${esc(e.ts)}] <b>${esc(e.kind)}</b>: ${esc(e.detail)}</div>`).join('');
+        const calls = (logs.mcp_calls || []).map(c => `<div style="color:var(--muted)">[${esc(c.ts)}] MCP ${esc(c.tool)} (${esc(c.duration_ms)}ms)</div>`).join('');
         document.getElementById('log-box').innerHTML = evs + calls;
       } catch (e) {}
     }
