@@ -6,9 +6,11 @@ import cv2
 import numpy as np
 import pytest
 
+from conftest import FRONT_POSE_TICKS, SaggingBridge, rad
 from desk_core import mcp_server as srv
 from desk_core.calib_store import CalibrationStore
 from desk_core.interfaces import SceneObstacle
+from desk_core.motion import MotionLimits, move_joints_smooth
 from desk_core.robo_jev import ReflexMonitor, RoboJevGatekeeper, guarded_recover
 from desk_core.vision_3d import localize_object_3d
 
@@ -95,6 +97,40 @@ def test_recovery_does_not_rearm_on_a_larger_same_color_contour(mock_bridge):
         assert mock_bridge.abort_source == "reflex"
 
     asyncio.run(simulate())
+
+
+def test_target_shift_during_final_correction_stops_remaining_writes(calib, monkeypatch):
+    bridge = SaggingBridge()
+    gatekeeper = RoboJevGatekeeper()
+    gatekeeper.arm_watch(_scene(100), (100, 120), half_crop=24)
+    bridge.set_frame_override("top", _scene(100))
+    send = bridge.send_joint_targets
+    correcting = False
+    corrections_sent = 0
+
+    async def settled(*args, **kwargs):
+        nonlocal correcting
+        correcting = True
+        return True
+
+    async def send_and_slide(*args, **kwargs):
+        nonlocal corrections_sent
+        result = await send(*args, **kwargs)
+        if correcting:
+            corrections_sent += 1
+            bridge.set_frame_override("top", _scene(150))
+        return result
+
+    monkeypatch.setattr(bridge, "wait_settle", settled)
+    monkeypatch.setattr(bridge, "send_joint_targets", send_and_slide)
+    monkeypatch.setattr("desk_core.motion.gravity_gains", lambda: (np.zeros(7), np.zeros(7)))
+    goal = rad(calib, FRONT_POSE_TICKS) + [0, 0.05, -0.05, 0.05, 0, 0, 0]
+    limits = MotionLimits(rate_hz=50.0, min_duration_s=0.2)
+    monitor = ReflexMonitor(gatekeeper, bridge, calib, lambda: [])
+    run = asyncio.run(move_joints_smooth(bridge, calib, goal, limits, reflex=monitor))
+    assert not run["ok"] and run.get("aborted") == "target_shifted", run
+    assert bridge.abort_source == "reflex"
+    assert corrections_sent == 1
 
 
 @pytest.mark.parametrize("trigger_camera", ["top", "wrist"])

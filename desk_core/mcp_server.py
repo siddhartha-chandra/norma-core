@@ -907,7 +907,7 @@ async def move_flange(
     """
     from scipy.spatial.transform import Rotation
 
-    from .motion import MotionLimits, correct_final_pose, flange_error, plan_flange_move, stream_joint_path
+    from .motion import MotionLimits, flange_error, plan_flange_move, stream_joint_path
 
     if rot_frame not in ("flange", "base"):
         return {"ok": False, "problems": [f"rot_frame must be 'flange' or 'base', got {rot_frame!r}"]}
@@ -925,11 +925,11 @@ async def move_flange(
     if not plan["ok"] or not execute:
         return result
     run = await stream_joint_path(bridge, _calib, plan["path"], plan["duration_s"], limits,
-                                  reflex=_reach_reflex(bridge))
+                                  reflex=_reach_reflex(bridge), correct=correct)
     result.update({"ok": run["ok"], "executed": True, "run": run})
     if run["ok"]:
         if correct:
-            result["correction"] = await correct_final_pose(bridge, _calib, plan["path"], limits)
+            result["correction"] = run.pop("correction")
         final_rad = _calib.ticks_to_rad((await bridge.get_state()).motors)
         result["result"] = flange_error(_calib, plan["path"], final_rad)
     return result

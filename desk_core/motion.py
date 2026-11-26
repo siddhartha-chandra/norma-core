@@ -215,7 +215,8 @@ def plan_flange_move(calib: CalibrationStore, motors: list[MotorState], shift_m,
 
 async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path: np.ndarray, duration: float,
                             limits: MotionLimits | None = None, gravity_ff: bool = True,
-                            trace: list | None = None, reflex: ReflexMonitor | None = None) -> dict:
+                            trace: list | None = None, reflex: ReflexMonitor | None = None, *,
+                            correct: bool = False) -> dict:
     """Stream a joint path along a minimum-jerk profile; hold position on excessive tracking lag or error.
 
     Parameters
@@ -237,6 +238,8 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
         If given, receives ``(t_s, measured_rad, expected_rad)`` for every streamed cycle.
     reflex : ReflexMonitor, optional
         Watch the target and hold on hazards while streaming.
+    correct : bool
+        Correct the final pose with the same watch active.
 
     Returns
     -------
@@ -258,6 +261,7 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
         return calib.rad_to_ticks(list(_sample(along, s)), motors)
 
     start, cycles, worst_lag = time.monotonic(), 0, 0
+    result = {}
     try:
         if reflex is not None:
             reflex.state = initial_state
@@ -286,6 +290,13 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
             if reflex is None or reflex.report is None:
                 await bridge.send_joint_targets(ticks_at(1.0, commanded), max_step=limits.max_step_ticks)
                 await bridge.wait_settle(ticks_at(1.0), tol_ticks=15, timeout_s=1.0)
+            if reflex is None or reflex.report is None:
+                state = await bridge.get_state()
+                final = state.positions()
+                result = {"ok": True, "cycles": cycles, "elapsed_s": round(time.monotonic() - start, 2),
+                          "worst_lag_ticks": worst_lag, "final_ticks": [final[mid] for mid in arm_ids]}
+                if correct:
+                    result["correction"] = await correct_final_pose(bridge, calib, path, limits, reflex=reflex)
     except EStopLatched:
         if reflex is None or reflex.report is None:
             raise
@@ -295,9 +306,7 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
         raise
     if reflex is not None and reflex.report is not None:
         return {"ok": False, "aborted": reflex.report["reason"], "reflex": reflex.report, "cycles": cycles}
-    final = (await bridge.get_state()).positions()
-    return {"ok": True, "cycles": cycles, "elapsed_s": round(time.monotonic() - start, 2), "worst_lag_ticks": worst_lag,
-            "final_ticks": [final[mid] for mid in arm_ids]}
+    return result
 
 
 async def move_joints_smooth(bridge: StationBridge, calib: CalibrationStore, q_goal, limits: MotionLimits | None = None,
@@ -314,10 +323,9 @@ async def move_joints_smooth(bridge: StationBridge, calib: CalibrationStore, q_g
     path = np.vstack([q0, goal])
     travel = float(np.max(np.abs(goal - q0)))
     duration = max(limits.min_duration_s, 1.875 * travel / math.radians(limits.joint_speed_deg_s))
-    run = await stream_joint_path(bridge, calib, path, duration, limits, reflex=reflex)
+    run = await stream_joint_path(bridge, calib, path, duration, limits, reflex=reflex, correct=True)
     if run["ok"]:
-        corr = await correct_final_pose(bridge, calib, path, limits)
-        run["correction"] = corr
+        corr = run["correction"]
         if corr["off_target_mm"] and corr["off_target_mm"][-1] > limits.correct_tol_mm:
             run["ok"] = False
             run["reason"] = f"final flange error {corr['off_target_mm'][-1]} mm exceeds {limits.correct_tol_mm} mm"
@@ -325,7 +333,7 @@ async def move_joints_smooth(bridge: StationBridge, calib: CalibrationStore, q_g
 
 
 async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, path: np.ndarray,
-                             limits: MotionLimits | None = None) -> dict:
+                             limits: MotionLimits | None = None, *, reflex: ReflexMonitor | None = None) -> dict:
     """Close the loop on the path's end pose: offset joint targets by their remaining error until the flange arrives.
 
     The servos are proportional position loops, so joints carrying gravity load settle short of their targets.
@@ -344,6 +352,8 @@ async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, pat
         Joint path in radians; its last row is the goal.
     limits : MotionLimits, optional
         Iteration count, tolerance and offset bound.
+    reflex : ReflexMonitor, optional
+        The watch already running for this move.
 
     Returns
     -------
@@ -363,6 +373,10 @@ async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, pat
     released = False
     for iteration in range(limits.correct_iterations + 1):
         state = await bridge.get_state()
+        if reflex is not None:
+            reflex.state = state
+            if reflex.report is not None:
+                break
         err = flange_error(calib, path, calib.ticks_to_rad(state.motors))
         history.append(err["off_target_mm"])
         if err["off_target_mm"] <= limits.correct_tol_mm or iteration == limits.correct_iterations:
@@ -379,7 +393,7 @@ async def correct_final_pose(bridge: StationBridge, calib: CalibrationStore, pat
             command[m.id] = int(np.clip(goal[m.id] + offset, m.range_min, m.range_max))
         await bridge.send_joint_targets(command, max_step=limits.max_step_ticks)
         await asyncio.sleep(0.5)
-    return {"iterations": len(history) - 1, "off_target_mm": history,
+    return {"iterations": max(0, len(history) - 1), "off_target_mm": history,
             "offset_ticks": [command[m.id] - goal[m.id] for m in arm], "released": released}
 
 
