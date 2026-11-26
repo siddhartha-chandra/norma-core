@@ -19,6 +19,7 @@ TEMPLATES: dict[str, str] = {
     "pick_and_place": "Pick up one object and put it on or in another object.",
     "place_next_to": "Put one object next to, beside, or near another object.",
     "go_home": "Return the robot arm to its resting home pose.",
+    "sort_hive": "Sort the Hive board game tiles by color, then stack each insect type.",
     "none": "Not a physical action the arm can do with these templates, e.g. a question about the scene or small talk.",
 }
 
@@ -31,13 +32,14 @@ _PICK_AND_PLACE = re.compile(
     r"|(?:place|put)\s+(?:the\s+)?(?P<target2>.+?)\s+(?:on|in|into|onto)\s+)\s*(?:the\s+)?(?P<destination>.+?)\s*[.!?]*\s*$",
     re.IGNORECASE,
 )
+_SORT_HIVE = re.compile(r"(?:please\s+)?sort\s+(?:the\s+)?hive\s+tiles[.!]?", re.IGNORECASE)
 
 Localize = Callable[[str], Awaitable[dict[str, Any]]]
 
 
 def extract_slots(template: str, command: str) -> dict[str, str] | None:
     """Pull object names out of the command with fixed patterns. None when the command does not fit."""
-    if template == "go_home":
+    if template in {"go_home", "sort_hive"}:
         return {}
     if template == "place_next_to":
         m = _PLACE_NEXT_TO.match(command)
@@ -59,6 +61,8 @@ def _point(found: dict[str, Any]) -> dict[str, float]:
 def _steps(template: str, grounded: dict[str, dict[str, float]]) -> list[dict[str, Any]]:
     if template == "go_home":
         return [{"tool": "go_home", "args": {"look_at_table": True}}]
+    if template == "sort_hive":
+        return [{"tool": "hive_sort", "args": {"execute": True}}]
     if template == "pick_and_place":
         t, d = grounded["target"], grounded["destination"]
         return [
@@ -84,6 +88,10 @@ def _unpack(answers: dict[str, Any]) -> tuple[bool, str, float]:
 async def plan_command(command: str, localize: Localize, timeout_s: float = 8.0) -> dict[str, Any]:
     """Return {route, ...}. route is 'motion' (with template, slots, grounding, steps), or
     'no_motion', 'unsupported', 'not_found', or 'unavailable' (caller should use its LLM path)."""
+    if _SORT_HIVE.fullmatch(command.strip()):
+        return {"route": "motion", "template": "sort_hive", "slots": {}, "grounding": {},
+                "steps": _steps("sort_hive", {})}
+
     questions = {
         "needs_motion": noul_question("The command asks the robot arm to physically move, pick up, or place an object."),
         "template": choice_question("Which robot action template matches the command?", TEMPLATES),

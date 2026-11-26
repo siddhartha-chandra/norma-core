@@ -83,6 +83,7 @@ EXECUTE_GATED_TOOLS = {
     "aim_wrist",
     "capture_wrist_stereo",
     "master_pick_place",
+    "hive_sort",
 }
 
 
@@ -1003,6 +1004,7 @@ class RobotAgentTUI(App):
                         "color": spec.get("color", "blue"),
                         "shape": spec.get("shape", "cube"),
                         "radius_m": float(spec.get("radius_m", 0.025)),
+                        "insect": spec.get("insect"),
                     },
                 )
                 log.write(f"[green]Placed '{name}' at ({x:.3f}, {y:.3f}, {z:.3f})[/green]")
@@ -1132,8 +1134,9 @@ class RobotAgentTUI(App):
         log.write(f"[cyan]→ {name}[/cyan]({json.dumps(args)})")
         res = await self.session.call_tool(name, args)
         payload: Any
-        if getattr(res, "structuredContent", None) is not None:
-            payload = res.structuredContent
+        structured = getattr(res, "structured_content", getattr(res, "structuredContent", None))
+        if structured is not None:
+            payload = structured
         else:
             texts = [b.text for b in res.content if getattr(b, "type", None) == "text"]
             payload = "\n".join(texts)
@@ -1181,7 +1184,7 @@ class RobotAgentTUI(App):
 
     async def _run_plan(self, plan: dict[str, Any]) -> None:
         log = self.query_one("#chat-log", RichLog)
-        log.write(f"[cyan]Jev plan: {plan['template']} {json.dumps(plan['slots'])}[/cyan]")
+        log.write(f"[cyan]Motion plan: {plan['template']} {json.dumps(plan['slots'])}[/cyan]")
         if not self.query_one("#arm-motion", Checkbox).value:
             msg = "Blocked `execute_sequence`: check Arm Motion first."
             log.write(f"[yellow]{msg}[/yellow]")

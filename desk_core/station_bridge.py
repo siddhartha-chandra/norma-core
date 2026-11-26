@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import struct
 import sys
@@ -27,9 +28,11 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from PIL import Image, ImageChops, ImageDraw, ImageStat
+
+from .hive import HIVE_SHAPE, TILE_RADIUS_M, TILE_THICKNESS_M
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -57,6 +60,7 @@ FULL_STATE_LEN = 0x47
 GRIPPER_SLACK_STEPS = 120
 GRIPPER_CONTACT_CURRENT_MA = 20
 RAW_RX_MAX_AGE_S = 0.5
+PREFLIGHT_DEADBAND_TICKS = 1
 DEFAULT_MAX_STEP = int(os.environ.get("ROBOT_MAX_STEP_TICKS", "400"))
 DEFAULT_SPEED = int(os.environ.get("ROBOT_GOAL_SPEED", "600"))
 DEFAULT_ACCEL = int(os.environ.get("ROBOT_GOAL_ACCEL", "20"))
@@ -163,6 +167,10 @@ class EStopLatched(RuntimeError):
     """A motion command was issued while E-STOP is latched; call `rearm()` (via `observe()`) first."""
 
 
+class PreflightWriteUncertain(RuntimeError):
+    """Station did not confirm whether a preflighted target was sent."""
+
+
 @runtime_checkable
 class StationBridge(Protocol):
     async def connect(self) -> None: ...
@@ -205,12 +213,31 @@ class MockStationBridge:
         self._held_object: str | None = None
         self._held_riders: list[str] = []
         self._scene_objects: dict[str, dict[str, Any]] = {}
+        seed = os.environ.get("DESK_MOCK_HIVE_SEED")
+        self._hive_seed = int(seed) if seed else None
         self.reset_mock_scene()
+
+    def seed_mock_hive(self, seed: int) -> None:
+        self._hive_seed = seed
+        spots = [(x, y) for x in (0.17, 0.225, 0.28, 0.335, 0.39) for y in (-0.05, 0.0, 0.05)]
+        rng = random.Random(seed)
+        rng.shuffle(spots)
+        self._scene_objects.clear()
+        for color in ("cream", "black"):
+            for insect in ("ant", "bee", "beetle"):
+                for number in (1, 2):
+                    x, y = spots.pop()
+                    self.add_mock_object(
+                        f"{color}-{insect}-{number}", x, y, color=color, shape=HIVE_SHAPE, insect=insect,
+                    )
 
     def reset_mock_scene(self) -> dict[str, Any]:
         self._ee_pos = [0.28, 0.0, 0.25]
         self._held_object = None
         self._held_riders = []
+        if self._hive_seed is not None:
+            self.seed_mock_hive(self._hive_seed)
+            return self.get_mock_scene_state()
         self._scene_objects = {
             "keys": {"x": 0.27, "y": -0.06, "z": 0.0, "color": "blue", "shape": "cube", "radius_m": 0.025},
             "mug": {"x": 0.30, "y": 0.02, "z": 0.0, "color": "brown", "shape": "cylinder", "radius_m": 0.032},
@@ -228,15 +255,19 @@ class MockStationBridge:
         color: str = "blue",
         shape: str = "cube",
         radius_m: float = 0.025,
+        insect: str | None = None,
     ) -> dict[str, Any]:
+        shape = shape.strip().lower()
         self._scene_objects[name] = {
             "x": round(float(x), 4),
             "y": round(float(y), 4),
             "z": round(float(z), 4),
             "color": color.strip().lower(),
-            "shape": shape.strip().lower(),
-            "radius_m": float(radius_m),
+            "shape": shape,
+            "radius_m": TILE_RADIUS_M if shape == HIVE_SHAPE else float(radius_m),
         }
+        if shape == HIVE_SHAPE:
+            self._scene_objects[name]["insect"] = insect
         return self.get_mock_scene_state()
 
     @staticmethod
@@ -244,7 +275,7 @@ class MockStationBridge:
         heights = {
             "cylinder": 0.09, "mug": 0.09, "pen": 0.012, "wallet": 0.025,
             "airpods": 0.025, "wired_earphones": 0.015, "mobile_phone": 0.010,
-            "sphere": 0.048, "cube": 0.045,
+            "sphere": 0.048, "cube": 0.045, HIVE_SHAPE: TILE_THICKNESS_M,
         }
         return heights.get("mug" if name == "mug" else obj.get("shape", "cube"), 0.04)
 
@@ -319,7 +350,8 @@ class MockStationBridge:
     async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
         if camera in self._frame_overrides:
             return self._frame_overrides[camera]
-        if os.environ.get("DESK_MOCK_SYNTHETIC") != "1":
+        hive_active = any(obj["shape"] == HIVE_SHAPE for obj in self._scene_objects.values())
+        if not hive_active and os.environ.get("DESK_MOCK_SYNTHETIC") != "1":
             env_key = "DESK_MOCK_TOP_IMAGE" if camera == "top" else "DESK_MOCK_WRIST_IMAGE"
             candidates = []
             if os.environ.get(env_key, "").strip():
@@ -341,6 +373,8 @@ class MockStationBridge:
             "pink": (225, 105, 165),
             "brown": (125, 78, 48),
             "orange": (230, 125, 40),
+            "cream": (244, 224, 175),
+            "black": (38, 38, 42),
         }
         img = Image.new("RGB", (640, 480), (234, 232, 226) if camera == "top" else (34, 38, 46))
         d = ImageDraw.Draw(img)
@@ -362,6 +396,7 @@ class MockStationBridge:
             v = 240.0 - ((wx - cx_cam) / dz) * f_px
             return u, v, dz
 
+        hive_layers: dict[tuple[float, float], int] = {}
         for name, obj in sorted(self._scene_objects.items(), key=lambda kv: kv[1].get("z", 0.0)):
             u, v, dz = _proj(obj["x"], obj["y"], obj["z"])
             r_px = max(8, int(round((obj.get("radius_m", 0.025) / dz) * f_px)))
@@ -371,7 +406,16 @@ class MockStationBridge:
             shape = obj.get("shape", "cube")
             # Subtle drop shadow
             d.ellipse([u - r_px + 4, v - r_px + 5, u + r_px + 4, v + r_px + 5], fill=(185, 183, 177))
-            if shape == "cylinder" or name == "mug":
+            if shape == HIVE_SHAPE:
+                d.regular_polygon((u, v, r_px), 6, fill=rgb, outline=(70, 65, 58))
+                key = (obj["x"], obj["y"])
+                layers = hive_layers[key] = hive_layers.get(key, 0) + 1
+                ink = (255, 255, 255) if obj["color"] == "black" else (35, 35, 35)
+                d.text((u, v - 5 if layers > 1 else v), obj.get("insect") or "?", anchor="mm", fill=ink)
+                if layers > 1:
+                    d.text((u, v + 6), f"x{layers}", anchor="mm", fill=ink)
+                continue
+            elif shape == "cylinder" or name == "mug":
                 d.ellipse([u - r_px, v - r_px, u + r_px, v + r_px], fill=rgb, outline=(40, 40, 40), width=2)
                 inner = max(3, int(r_px * 0.6))
                 d.ellipse([u - inner, v - inner, u + inner, v + inner], fill=(70, 42, 26))
@@ -444,6 +488,17 @@ class MockStationBridge:
     async def wait_settle(self, targets: dict[int, int], tol_ticks: int = 25, timeout_s: float = 3.0) -> bool:
         return True
 
+    def get_mock_riders(self, name: str) -> list[str]:
+        held = self._scene_objects[name]
+        min_z = held["z"] + self._obj_height(name, held) * 0.5
+        return [
+            other_name
+            for other_name, other in sorted(self._scene_objects.items(), key=lambda kv: kv[1].get("z", 0.0))
+            if other_name != name and other["z"] >= min_z
+            and math.hypot(other["x"] - held["x"], other["y"] - held["y"])
+            < held["radius_m"] + other["radius_m"]
+        ]
+
     async def grasp_with_verify(self, close_ticks: int | None = None, open_ticks: int | None = None) -> dict:
         gid = max(self._motors)
         m = self._motors[gid]
@@ -462,16 +517,7 @@ class MockStationBridge:
                 best_dist_3d = d_3d
                 best_name = name
         self._held_object = best_name
-        self._held_riders = []
-        if best_name and best_name in self._scene_objects:
-            held = self._scene_objects[best_name]
-            held_h = self._obj_height(best_name, held)
-            for other_name, other in sorted(self._scene_objects.items(), key=lambda kv: kv[1].get("z", 0.0)):
-                if other_name == best_name:
-                    continue
-                d_xy = ((other["x"] - held["x"]) ** 2 + (other["y"] - held["y"]) ** 2) ** 0.5
-                if d_xy < (held.get("radius_m", 0.025) + other.get("radius_m", 0.025)) and other.get("z", 0.0) >= held.get("z", 0.0) + held_h * 0.5:
-                    self._held_riders.append(other_name)
+        self._held_riders = self.get_mock_riders(best_name) if best_name is not None else []
         if best_name is not None:
             m.position = max(m.position, min(m.range_max, m.range_min + GRIPPER_SLACK_STEPS + 80))
             gap = abs(m.position - m.range_min)
@@ -1162,7 +1208,8 @@ class LiveStationBridge:
             return ELROBOT_MOTOR_RANGES[motor.id]
         return 0, MAX_ANGLE_STEP
 
-    async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP) -> dict[int, int]:
+    async def send_joint_targets(self, targets: dict[int, int], max_step: int = DEFAULT_MAX_STEP, *,
+                                 preflight_start: RobotState | None = None) -> dict[int, int]:
         if self._aborted:
             raise EStopLatched("E-STOP latched: call observe() before moving")
         if hasattr(self.client, "read_from_tail"):
@@ -1177,6 +1224,14 @@ class LiveStationBridge:
         by_id = {m.id: m for m in st.motors}
         applied: dict[int, int] = {}
         self._require_fresh_motor_rx(st, targets)
+        if preflight_start is not None:
+            self._require_fresh_motor_rx(st, preflight_start.positions())
+            actual_ranges = {m.id: self._effective_motor_range(st.bus_serial, m) for m in st.motors}
+            if (st.bus_serial != preflight_start.bus_serial or st.positions() != preflight_start.positions()
+                    or actual_ranges != preflight_start.ranges() or any(m.error_status for m in st.motors)):
+                raise RuntimeError("Station no longer matches the preflighted starting state")
+            if not targets.keys() <= self._torque_started:
+                raise RuntimeError("Enable arm torque before executing a preflighted move")
 
         for raw_mid, raw_tgt in targets.items():
             mid = int(raw_mid)
@@ -1195,6 +1250,8 @@ class LiveStationBridge:
                 raise RuntimeError(f"Motor {mid} cannot enter its calibrated range within one safe step")
             applied[mid] = stepped
 
+        if preflight_start is not None and (self._aborted or applied != targets):
+            raise RuntimeError("Station cannot send the exact preflighted waypoint")
         if applied:
             need_start = [mid for mid in applied if mid not in self._torque_started]
             if need_start:
@@ -1206,7 +1263,12 @@ class LiveStationBridge:
                 RAM_GOAL_POSITION,
                 {mid: val.to_bytes(2, "little") for mid, val in applied.items()},
             )
-            await self._send_commands(self.client, [cmd])
+            try:
+                await self._send_commands(self.client, [cmd])
+            except Exception as exc:
+                if preflight_start is None:
+                    raise
+                raise PreflightWriteUncertain(f"Station waypoint write unconfirmed: {exc}") from exc
         return applied
 
     async def wait_settle(self, targets: dict[int, int], tol_ticks: int = 25, timeout_s: float = 3.0) -> bool:
@@ -1218,6 +1280,28 @@ class LiveStationBridge:
                 return True
             await asyncio.sleep(0.08)
         return False
+
+    async def wait_preflight_settle(self, targets: dict[int, int], tol_ticks: int, *,
+                                    moving_from: dict[int, int], timeout_s: float = 3.0) -> RobotState | None:
+        deadline = time.monotonic() + timeout_s
+        previous = None
+        while time.monotonic() < deadline and not self._aborted:
+            state = await self.get_state()
+            self._require_fresh_motor_rx(state, targets)
+            pos = state.positions()
+            samples = {mid: self.rx_received_at[(state.bus_serial, mid)] for mid in targets}
+            if (all(mid in pos and abs(pos[mid] - tick) <= tol_ticks for mid, tick in targets.items())
+                    and all(abs(pos[mid] - targets[mid]) <= PREFLIGHT_DEADBAND_TICKS
+                            or abs(pos[mid] - targets[mid]) < abs(start - targets[mid])
+                            for mid, start in moving_from.items())):
+                if previous is None or previous[0] != pos:
+                    previous = (pos, samples)
+                elif all(stamp > previous[1][mid] for mid, stamp in samples.items()):
+                    return state
+            else:
+                previous = None
+            await asyncio.sleep(0.08)
+        return None
 
     ### 7. Verify grip after bounded closing steps
     ## added by Abhi
