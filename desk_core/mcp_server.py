@@ -920,7 +920,7 @@ async def plan_and_move(
             ticks = _calib.rad_to_ticks(q.tolist(), motors)
             return np.asarray(_calib.ticks_to_rad([replace(m, position=ticks.get(m.id, m.position)) for m in motors]))
 
-        plan = planner.plan_trajectory(start, goal, quantize)
+        plan = planner.plan_trajectory(start, goal, quantize, sequential=live)
         targets = [_calib.rad_to_ticks(q.tolist(), motors) for q in plan.waypoints]
         if any(abs(second[mid] - tick) > DEFAULT_MAX_STEP for first, second in zip(targets, targets[1:])
                for mid, tick in first.items()):
@@ -959,8 +959,14 @@ async def plan_and_move(
                     if (np.any(np.abs(measured[2:4] - initial[2:4]) < 1e-6)
                             or abs(planner.shoulder_torque(measured)) >= abs(planner.shoulder_torque(initial))):
                         raise PlanningError("Measured elbow/wrist tuck did not reduce shoulder torque")
-                peak = planner.validate_segment(measured, plan.waypoints[index])
+                axis, = np.flatnonzero(plan.waypoints[index] != plan.waypoints[index - 1])
+                mid = expected.motors[axis].id
+                waypoint = measured.copy()
+                waypoint[axis] = plan.waypoints[index, axis]
+                peak = planner.validate_segment(measured, waypoint)
                 result["peak_shoulder_torque_nm"] = max(peak, result["peak_shoulder_torque_nm"])
+                target = {motor.id: target[mid] if motor.id == mid else motor.position
+                          for motor in expected.motors[:-1]}
                 applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP, preflight_start=expected)
             else:
                 applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP)
@@ -989,6 +995,9 @@ async def plan_and_move(
             result["peak_shoulder_torque_nm"] = max(torque, result["peak_shoulder_torque_nm"])
     if live:
         result["measured_joints_rad"] = measured.tolist()
+        final = expected.positions()
+        if any(abs(final[mid] - tick) > FLANGE_SETTLE_TOL_TICKS for mid, tick in targets[-1].items()):
+            return await stop_motion("Station did not finish within the planned joint tolerance")
     if isinstance(bridge, MockStationBridge):
         bridge.set_mock_ee_pose(*planner.flange_pose(plan.waypoints[-1])[0])
     return result

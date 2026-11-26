@@ -178,6 +178,8 @@ def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_
     send = bridge._send_commands
 
     async def send_with_shoulder_sag(client, commands):
+        before = state.positions()
+        assert all(sum(tick != before[mid] for mid, tick in command.items()) <= 1 for command in commands)
         previous = state.positions()[2]
         await send(client, commands)
         if state.motors[1].position > previous:
@@ -199,7 +201,8 @@ def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_
         assert len(packets) == moved["waypoints"] - 1
         assert all(8 not in target for target in packets)
         assert state.positions()[2] > start_ticks[2]
-        assert state.positions()[2] == packets[-1][2] - 1
+        planned = calib.rad_to_ticks(moved["joints_rad"], state.motors)
+        assert state.positions()[2] == planned[2] - 1
         assert calib.ticks_to_rad(state.motors) == moved["measured_joints_rad"]
 
     asyncio.run(run())

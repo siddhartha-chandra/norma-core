@@ -201,7 +201,7 @@ class MuJoCoPlanner:
         raise PlanningError(f"MuJoCo IK rejected: {failure}")
 
     def _validate_path(self, points: list[np.ndarray],
-                       quantize: Callable[[np.ndarray], np.ndarray]) -> JointPlan:
+                       quantize: Callable[[np.ndarray], np.ndarray], sequential: bool = False) -> JointPlan:
         path = [quantize(points[0])]
         peak = self._check(path[0])
         tuck_end = None
@@ -210,13 +210,20 @@ class MuJoCoPlanner:
             for q in np.linspace(start, end, count + 1)[1:]:
                 commanded = quantize(q)
                 try:
-                    peak = max(peak, self._check(commanded))
-                    if not np.array_equal(commanded, q):
-                        self._check(q)
+                    if sequential:
+                        for axis in np.flatnonzero(commanded != path[-1]):
+                            single = path[-1].copy()
+                            single[axis] = commanded[axis]
+                            peak = max(peak, self.validate_segment(path[-1], single))
+                            path.append(single)
+                    else:
+                        peak = max(peak, self._check(commanded))
+                        if not np.array_equal(commanded, q):
+                            self._check(q)
+                        if not np.array_equal(commanded, path[-1]):
+                            path.append(commanded)
                 except PlanningError as exc:
                     raise PlanningError(f"Waypoint {len(path)}: {exc}") from exc
-                if not np.array_equal(commanded, path[-1]):
-                    path.append(commanded)
             if len(points) == 4 and i == 0:
                 tuck_end = len(path) - 1
         return JointPlan(np.asarray(path), tuck_end, peak)
@@ -225,7 +232,8 @@ class MuJoCoPlanner:
         """Check a direct segment from the measured pose to a preflighted target."""
         return self._validate_path([start, goal], np.copy).peak_shoulder_torque_nm
 
-    def plan_trajectory(self, start, goal, quantize: Callable[[np.ndarray], np.ndarray] | None = None) -> JointPlan:
+    def plan_trajectory(self, start, goal, quantize: Callable[[np.ndarray], np.ndarray] | None = None, *,
+                        sequential: bool = False) -> JointPlan:
         """Preflight every waypoint, tucking j3/j4 before j2 changes on a lift."""
         quantize = quantize or np.copy
         start, goal = np.asarray(start, dtype=float), np.asarray(goal, dtype=float)
@@ -236,7 +244,7 @@ class MuJoCoPlanner:
         start_z = self.flange_pose(start)[0][2]
         rise = max(self.flange_pose(goal)[0][2], self.flange_pose(shoulder_only)[0][2]) - start_z
         if rise <= MAX_POSITION_ERROR_M or abs(goal[1] - start[1]) < 1e-6:
-            return self._validate_path([start, goal], quantize)
+            return self._validate_path([start, goal], quantize, sequential)
 
         initial_torque = abs(self.shoulder_torque(start))
         candidates = []
@@ -257,7 +265,7 @@ class MuJoCoPlanner:
             lifted = goal.copy()
             lifted[2:4] = tucked[2:4]
             try:
-                return self._validate_path([start, tucked, lifted, goal], quantize)
+                return self._validate_path([start, tucked, lifted, goal], quantize, sequential)
             except PlanningError as exc:
                 failure = str(exc)
         raise PlanningError(f"Tuck-first lift blocked: {failure}")
