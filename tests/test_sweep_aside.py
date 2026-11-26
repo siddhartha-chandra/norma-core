@@ -206,19 +206,19 @@ def test_mock_sweep_moves_only_pens_in_the_swept_corridor(calib, monkeypatch):
     monkeypatch.setattr(mcp_server, "_bridge", bridge)
     monkeypatch.setattr(mcp_server, "_obstacles", {})
     monkeypatch.setattr(mcp_server, "_calib", calib)
-    monkeypatch.setitem(calib.data, "z_table", 0.010)
-    bridge.add_mock_object("in-path", 0, 0.210, shape="pen", z=0.010)
-    bridge.add_mock_object("off-path", 0, 0.265, shape="pen", z=0.010)
-    bridge.add_mock_object("under-jaws", 0, 0.205, shape="pen", z=0.003)
-    bridge.add_mock_object("fixed-object", 0, 0.205, shape="cube", z=0.010)
+    monkeypatch.setitem(calib.data, "z_table", 0.0024)
+    bridge.add_mock_object("in-path", 0, 0.210, shape="pen", z=0.0024)
+    bridge.add_mock_object("off-path", 0, 0.265, shape="pen", z=0.0024)
+    bridge.add_mock_object("under-jaws", 0, 0.205, shape="pen", z=0.0)
+    bridge.add_mock_object("fixed-object", 0, 0.205, shape="cube", z=0.0024)
 
     async def run():
-        args = ((-0.064, 0.205), (0.063, 0.205), 6)
+        args = ((-0.064, 0.205), (0.063, 0.205), 11)
         before = bridge.get_mock_scene_state()["objects"]
         preview = await mcp_server.sweep_aside(*args)
-        assert preview["ok"] and bridge.get_mock_scene_state()["objects"] == before
+        assert preview["ok"] and bridge.get_mock_scene_state()["objects"] == before, preview
         moved = await mcp_server.sweep_aside(*args, execute=True)
-        assert moved["ok"] and moved["executed"]
+        assert moved["ok"] and moved["executed"], moved
         after = bridge.get_mock_scene_state()["objects"]
         assert after == {**before, "in-path": {**before["in-path"], "x": 0.063}}
 
