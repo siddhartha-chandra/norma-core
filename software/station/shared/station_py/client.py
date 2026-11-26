@@ -73,6 +73,11 @@ class Client:
         # Start connection management as a task in the provided loop
         self._connection_task = asyncio.create_task(self.manage_connection())
 
+    async def close(self):
+        self._connection_task.cancel()
+        await asyncio.gather(self._connection_task, return_exceptions=True)
+        self.close_connection()
+
     async def wait_ready(self, timeout: Optional[float] = None):
         """
         Waits until the client is connected and setup is done.
@@ -484,9 +489,7 @@ async def new_station_client(server: str, logger) -> StationClient:
     try:
         await client.wait_ready(timeout=10.0)
     except (Exception, asyncio.CancelledError):
-        client._connection_task.cancel()
-        await asyncio.gather(client._connection_task, return_exceptions=True)
-        client.close_connection()
+        await client.close()
         raise
     return client
 

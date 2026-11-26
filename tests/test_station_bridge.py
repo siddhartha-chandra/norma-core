@@ -50,6 +50,34 @@ def test_initial_station_setup_failure_stops_connection_task(monkeypatch, cancel
     asyncio.run(run())
 
 
+def test_station_client_setup_timeout_stops_connection_task(monkeypatch):
+    async def check():
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def manage_connection(_client):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                stopped.set()
+
+        async def wait_ready(_client, timeout):
+            await started.wait()
+            raise TimeoutError("offline")
+
+        monkeypatch.setattr(Client, "manage_connection", manage_connection)
+        monkeypatch.setattr(Client, "wait_ready", wait_ready)
+        for _ in range(2):
+            started.clear()
+            stopped.clear()
+            with pytest.raises(TimeoutError, match="offline"):
+                await new_station_client("localhost", logging.getLogger(__name__))
+            assert stopped.is_set()
+
+    asyncio.run(check())
+
+
 @pytest.mark.parametrize("stop_at_read", [1, 2])
 def test_reflex_stop_prevents_in_flight_servo_startup(monkeypatch, stop_at_read):
     bridge = LiveStationBridge("localhost", 1, follow_motor_rx=True)
