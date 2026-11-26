@@ -476,3 +476,15 @@ def test_pixel_to_world_uses_homography_for_explicit_z_table(tmp_path: Path):
     wx_exp, wy_exp, wz_exp = cs.pixel_to_world(u, v, z_m=cs.z_table(), camera="top")
     assert math.hypot(wx_none - 0.03, wy_none - 0.22) < 0.001
     assert (wx_exp, wy_exp, wz_exp) == (wx_none, wy_none, wz_none)
+
+
+def test_mcp_reanchor_plane_blocked_during_active_motion():
+    """MCP reanchor_plane must serialize against active checked moves via @_motion_tool."""
+    import desk_core.mcp_server as srv
+
+    async def _run() -> None:
+        async with srv._flange_lock:
+            with pytest.raises(RuntimeError, match="motion operation is running"):
+                await srv.reanchor_plane(clear=True)
+
+    asyncio.run(_run())

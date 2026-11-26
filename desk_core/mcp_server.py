@@ -807,6 +807,7 @@ async def reload_config() -> dict:
 
 @mcp.tool()
 @_traced
+@_motion_tool
 async def reanchor_plane(
     pixel_points: list[list[float]] | None = None,
     world_points: list[list[float]] | None = None,
