@@ -107,7 +107,7 @@ async def test_robo_jev() -> None:
 
     # Guarded recover 3: target shifts OUTSIDE safe boundary -> stay halted
     gk.safe_bounds = WorkspaceBounds(x_min=0.20, x_max=0.30, y_min=-0.05, y_max=0.05)
-    jpeg_far = _make_scene(1180, 620)
+    jpeg_far = _make_scene(785, 360)
 
     async def _far_frame(camera: str = "top", denoise: bool = True) -> bytes:
         return jpeg_far

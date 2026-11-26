@@ -202,7 +202,7 @@ class RoboJevGatekeeper:
             "shift_mm": round(shift_mm, 2),
             "match_score": round(match_score, 3),
             "mad_roi": round(mad_roi, 2),
-            "new_pixel": new_px if not vanished else None,
+            "new_pixel": new_px if match_score >= 0.45 else None,
             "latency_ms": latency_ms,
         }
 
@@ -460,6 +460,8 @@ async def guarded_recover(
         if watch := gatekeeper.watches.get(camera):
             query = watch.query
     q_rad = calib.ticks_to_rad((await bridge.get_state()).motors) if camera == "wrist" else None
+    watch = gatekeeper.watches.get(camera)
+    expected = calib.project_world_to_pixel(watch.world, camera, q_rad) if watch and watch.world is not None else None
     jpeg = await bridge.get_frame(camera, denoise=False)
     report = gatekeeper.evaluate(
         curr_jpeg=jpeg,
@@ -468,6 +470,7 @@ async def guarded_recover(
         target_xy=target_xy,
         start_xy=start_xy,
         camera=camera,
+        expected_pixel=expected,
     )
 
     def _can_rearm() -> bool:
@@ -531,11 +534,11 @@ async def guarded_recover(
             q_rad=q_rad,
             use_gemini=use_gemini,
         )
-        if det.get("found"):
+        if det.get("found") and det.get("backend") != "opencv-fallback":
             new_px = (float(det["pixel"][0]), float(det["pixel"][1]))
             wx, wy, wz = float(det["world"]["x"]), float(det["world"]["y"]), float(det["world"]["z"])
             depth_m = float(det["depth_m"])
-        elif report.get("target_shifted") and report.get("new_pixel"):
+        elif report.get("new_pixel") and not report["out_of_view"]:
             new_px = (float(report["new_pixel"][0]), float(report["new_pixel"][1]))
             wx, wy, wz = calib.pixel_to_world(new_px[0], new_px[1], camera=camera, q_rad=q_rad)
             depth_m = calib.get_metric_depth(new_px[0], new_px[1], camera=camera, q_rad=q_rad)

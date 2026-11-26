@@ -10,13 +10,16 @@ from desk_core import mcp_server as srv
 from desk_core.calib_store import CalibrationStore
 from desk_core.interfaces import SceneObstacle
 from desk_core.robo_jev import ReflexMonitor, RoboJevGatekeeper, guarded_recover
+from desk_core.vision_3d import localize_object_3d
 
 
-def _scene(x=None):
+def _scene(x=None, *, decoy=False):
     image = np.full((240, 320, 3), 225, dtype=np.uint8)
     if x is not None:
         cv2.rectangle(image, (x - 14, 104), (x + 14, 132), (200, 70, 20), -1)
         cv2.circle(image, (x, 115), 5, (255, 255, 255), -1)
+    if decoy:
+        cv2.rectangle(image, (228, 86), (286, 151), (200, 70, 20), -1)
     ok, encoded = cv2.imencode(".jpg", image)
     assert ok
     return encoded.tobytes()
@@ -63,6 +66,32 @@ def test_projected_wrist_watch_stops_if_the_target_disappears(calib, mock_bridge
         async with monitor:
             await asyncio.sleep(0.15)
         assert monitor.report and monitor.report["reason"] == "target_shifted"
+        assert mock_bridge.abort_source == "reflex"
+
+    asyncio.run(simulate())
+
+
+def test_recovery_does_not_rearm_on_a_larger_same_color_contour(mock_bridge):
+    calib = CalibrationStore()
+    calib.data.pop("T_world_cam_top", None)
+    calib.data.pop("H_table", None)
+    calib.data["K_top"] = [[560, 0, 160], [0, 560, 120], [0, 0, 1]]
+    calib.data["dist_top"] = [0] * 5
+    gatekeeper = RoboJevGatekeeper()
+    gatekeeper.arm_watch(_scene(90), (90, 120), query="blue keys", half_crop=24)
+    jpeg = _scene(130, decoy=True)
+    mock_bridge.set_frame_override("top", jpeg)
+
+    async def simulate():
+        color = await localize_object_3d(jpeg, "blue keys", calib, use_gemini=False)
+        assert color["found"] and color["pixel"][0] > 228
+        recovery = await guarded_recover(gatekeeper, mock_bridge, calib, query="blue keys")
+        assert recovery["ok"] and recovery["pixel"] == [130.0, 120.0], recovery
+        mock_bridge.set_frame_override("top", _scene(decoy=True))
+        gatekeeper.interruption = {"target_shifted": True, "camera": "top"}
+        await mock_bridge.abort(source="reflex")
+        lost = await guarded_recover(gatekeeper, mock_bridge, calib)
+        assert not lost["ok"] and lost["reason"] == "target_lost", lost
         assert mock_bridge.abort_source == "reflex"
 
     asyncio.run(simulate())
