@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -29,6 +30,7 @@ from pydantic import BaseModel, Field, ValidationError
 from .calib_store import CalibrationStore
 
 GEMINI_VISION_MODEL = os.environ.get("DESK_VISION_MODEL", "gemini-4-hydrogen").strip() or "gemini-4-hydrogen"
+_scene_provider_lock = threading.Lock()
 
 DEFAULT_PROVIDER_MODELS: dict[str, str] = {
     "gemini": GEMINI_VISION_MODEL,
@@ -544,6 +546,15 @@ def _call_vlm_sync(jpeg_bytes: bytes, query: str | None, provider: str, model: s
     raise ValueError(f"Unsupported vision provider: {provider!r}")
 
 
+def _call_scene_vlm_sync(jpeg_bytes: bytes, query: str | None, provider: str, model: str) -> list[dict[str, Any]]:
+    if not _scene_provider_lock.acquire(blocking=False):
+        raise RuntimeError("Previous scene vision request is still running.")
+    try:
+        return _call_vlm_sync(jpeg_bytes, query, provider, model)
+    finally:
+        _scene_provider_lock.release()
+
+
 async def localize_object_3d(
     jpeg_bytes: bytes,
     query: str,
@@ -588,9 +599,10 @@ async def localize_frame_3d(
         allowed = VISION_MODELS_BY_PROVIDER.get(resolved_provider)
         if allowed and model and model not in allowed:
             raise ValueError(f"Model {model!r} is not in vision-capable list for {resolved_provider}: {allowed}")
+        call_provider = _call_scene_vlm_sync if query is None else _call_vlm_sync
         try:
             detections = await asyncio.wait_for(
-                asyncio.to_thread(_call_vlm_sync, jpeg_bytes, query, resolved_provider, chosen_model),
+                asyncio.to_thread(call_provider, jpeg_bytes, query, resolved_provider, chosen_model),
                 timeout=timeout_s,
             )
             backend = chosen_model if resolved_provider == "gemini" else f"{resolved_provider}:{chosen_model}"

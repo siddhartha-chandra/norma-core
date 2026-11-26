@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from unittest.mock import AsyncMock
 
 import numpy as np
@@ -15,6 +16,34 @@ def test_opencv_scene_detection_on_a_saturated_mat():
     frame[150:190, 200:260] = (20, 30, 220)
     detections = vision_3d._localize_scene_opencv(frame)
     assert sorted(tuple(det["point"]) for det in detections) == [(206, 217), (706, 717)]
+
+
+def test_scene_provider_does_not_overlap_after_timeout(calib, mock_bridge, monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def provider(jpeg, query, provider, model):
+        started.set()
+        assert release.wait(5)
+        return []
+
+    monkeypatch.setattr(vision_3d, "_call_vlm_sync", provider)
+    monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
+
+    async def check():
+        try:
+            jpeg = await mock_bridge.get_frame("top")
+            first = await vision_3d.localize_frame_3d(jpeg, None, calib, provider="gemini", timeout_s=0.1)
+            assert started.is_set()
+            assert first and all(det["backend"] == "opencv-fallback" for det in first)
+            next_scan = await vision_3d.localize_frame_3d(jpeg, None, calib, provider="gemini", timeout_s=1)
+            assert next_scan and all(
+                det["fallback_reason"] == "Previous scene vision request is still running." for det in next_scan
+            )
+        finally:
+            release.set()
+
+    asyncio.run(check())
 
 
 def test_scene_scan_never_uses_wrist_as_overhead(monkeypatch):
