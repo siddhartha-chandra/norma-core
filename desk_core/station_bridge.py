@@ -205,11 +205,12 @@ class MockStationBridge:
         self._held_object: str | None = None
         self._held_riders: list[str] = []
         self._scene_objects: dict[str, dict[str, Any]] = {}
+        seed = os.environ.get("DESK_MOCK_HIVE_SEED")
+        self._hive_seed = int(seed) if seed else None
         self.reset_mock_scene()
-        if seed := os.environ.get("DESK_MOCK_HIVE_SEED"):
-            self.seed_mock_hive(int(seed))
 
     def seed_mock_hive(self, seed: int) -> None:
+        self._hive_seed = seed
         spots = [(x, y) for x in (0.17, 0.225, 0.28, 0.335, 0.39) for y in (-0.05, 0.0, 0.05)]
         rng = random.Random(seed)
         rng.shuffle(spots)
@@ -226,6 +227,9 @@ class MockStationBridge:
         self._ee_pos = [0.28, 0.0, 0.25]
         self._held_object = None
         self._held_riders = []
+        if self._hive_seed is not None:
+            self.seed_mock_hive(self._hive_seed)
+            return self.get_mock_scene_state()
         self._scene_objects = {
             "keys": {"x": 0.27, "y": -0.06, "z": 0.0, "color": "blue", "shape": "cube", "radius_m": 0.025},
             "mug": {"x": 0.30, "y": 0.02, "z": 0.0, "color": "brown", "shape": "cylinder", "radius_m": 0.032},

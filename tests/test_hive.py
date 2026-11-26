@@ -131,5 +131,8 @@ def test_hive_sorts_a_randomized_station_mock_scene(seed):
                     pile_centers.add((x0, y0))
                 assert len(pile_centers) == len(piles)
                 assert not (await call("hive_sort"))["moves"]
+                reset = await call("mock_reset_scene")
+                assert reset == before
+                assert await call("hive_sort") == preview
 
     asyncio.run(run())
