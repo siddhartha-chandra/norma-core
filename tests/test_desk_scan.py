@@ -111,6 +111,7 @@ def test_scene_scan_records_named_detections_and_skips_repeated_frame(tmp_path, 
         return vision_3d._parse_vlm_json(
             """{"detections": [
                 {"found": true, "label": "blue keys", "point": [400, 200], "box_2d": [360, 180, 440, 220]},
+                {"found": true, "label": "phone", "point": "invalid"},
                 {"found": true, "label": "brown mug", "point": [600, 500], "box_2d": [550, 460, 650, 540]},
                 {"found": false, "label": "wallet"},
                 {"found": true, "label": "notebook"}

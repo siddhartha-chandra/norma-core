@@ -24,7 +24,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from .calib_store import CalibrationStore
 
@@ -326,12 +326,23 @@ def _parse_vlm_json(raw_text: str, query: str | None) -> list[dict[str, Any]]:
     if m:
         txt = m.group(0)
     if query is None:
-        return [
-            _normalize_detection(det, det.label.strip())
-            for det in Scene2DResult.model_validate_json(txt).detections
-            if det.found and det.label.strip() and len(det.point) == 2 and len(det.box_2d) == 4
-            and {"point", "box_2d"} <= det.model_fields_set
-        ]
+        items = json.loads(txt).get("detections")
+        if not isinstance(items, list):
+            raise ValueError("Scene vision response must contain a detections array.")
+        detections = []
+        for item in items:
+            try:
+                det = GeminiPoint2DResult.model_validate(item)
+            except ValidationError:
+                continue
+            if (
+                det.found and det.label.strip()
+                and len(det.point) == 2 and len(det.box_2d) == 4
+                and {"point", "box_2d"} <= det.model_fields_set
+                and math.isfinite(det.yaw_deg) and math.isfinite(det.confidence)
+            ):
+                detections.append(_normalize_detection(det, det.label.strip()))
+        return detections
     parsed = GeminiPoint2DResult.model_validate_json(txt)
     return [_normalize_detection(parsed, parsed.label or query)]
 
