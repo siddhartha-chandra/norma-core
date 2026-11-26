@@ -1040,7 +1040,7 @@ async def _prerotate_wrist(roll, marker_xy, torque_limit, *, expected_start, wri
         )
 
     return await _run_mujoco_motion(
-        torque_limit, True, build, expected_start=expected_start, wrist_planner=wrist_planner,
+        torque_limit, True, build, expected_start=expected_start, wrist_planner=wrist_planner, adaptive_steps=True,
     )
 
 
@@ -1120,7 +1120,7 @@ async def _run_mujoco_motion(
     shoulder_torque_limit_nm: float, execute: bool,
     build: Callable[[MuJoCoPlanner, np.ndarray, Callable[[np.ndarray], np.ndarray], bool], JointPlan],
     *, on_mock_success: Callable[[MockStationBridge], None] | None = None,
-    expected_start=None, wrist_planner=None,
+    expected_start=None, wrist_planner=None, adaptive_steps: bool = False,
 ) -> dict:
     from .ik_mujoco import PlanningError
     from .motion import FLANGE_SETTLE_TOL_TICKS
@@ -1185,8 +1185,12 @@ async def _run_mujoco_motion(
 
     expected = replace(st, motors=motors)
     measured = plan.waypoints[0]
-    for index, planned_target in enumerate(targets[1:], start=1):
+    index = 1
+    while index < len(targets):
+        planned_target = targets[index]
         target = planned_target
+        settle_target = planned_target
+        limited = False
         cartesian_check = plan.cartesian_checks.get(index)
         validate = (planner.validate_segment if cartesian_check is None else
                     functools.partial(planner.validate_cartesian_segment, check=cartesian_check))
@@ -1199,9 +1203,20 @@ async def _run_mujoco_motion(
                         raise PlanningError("Measured elbow/wrist tuck did not reduce shoulder torque")
                 axis, = np.flatnonzero(plan.waypoints[index] != plan.waypoints[index - 1])
                 mid = expected.motors[axis].id
-                peak = validate(measured, plan.waypoints[index])
+                start_tick = expected.motors[axis].position
+                waypoint = plan.waypoints[index]
+                if adaptive_steps:
+                    delta = planned_target[mid] - start_tick
+                    bounded = start_tick + max(-DEFAULT_MAX_STEP, min(DEFAULT_MAX_STEP, delta))
+                    limited = bounded != planned_target[mid]
+                    settle_target = {**planned_target, mid: bounded}
+                    target = settle_target if index == 1 else {mid: bounded}
+                    waypoint = np.asarray(_calib.ticks_to_rad([
+                        replace(m, position=target.get(m.id, m.position)) for m in expected.motors
+                    ]))
+                peak = validate(measured, waypoint)
                 result["peak_shoulder_torque_nm"] = max(peak, result["peak_shoulder_torque_nm"])
-                if index > 1:
+                if index > 1 and not adaptive_steps:
                     target = {mid: planned_target[mid]}
                 applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP, preflight_start=expected)
             else:
@@ -1216,7 +1231,7 @@ async def _run_mujoco_motion(
         if live:
             try:
                 settled = await bridge.wait_preflight_settle(
-                    planned_target, tol_ticks=FLANGE_SETTLE_TOL_TICKS, moving_from={mid: expected.motors[axis].position}
+                    settle_target, tol_ticks=FLANGE_SETTLE_TOL_TICKS, moving_from={mid: start_tick}
                 )
             except RuntimeError as exc:
                 return await stop_motion(str(exc))
@@ -1228,7 +1243,7 @@ async def _run_mujoco_motion(
                 return await stop_motion("Station bus, motor inventory or gripper changed during execution")
             expected = replace(expected, motors=[replace(m, position=positions[m.id]) for m in expected.motors])
             if wrist_planner is not None:
-                stamps = [bridge.rx_station_ns.get((settled.bus_serial, mid), 0) for mid in planned_target]
+                stamps = [bridge.rx_station_ns.get((settled.bus_serial, mid), 0) for mid in settle_target]
                 result["settled_station_ns"] = max(stamps) if all(stamps) else 0
             measured = np.asarray(_calib.ticks_to_rad(expected.motors))
             try:
@@ -1236,6 +1251,11 @@ async def _run_mujoco_motion(
             except PlanningError as exc:
                 return await stop_motion(str(exc))
             result["peak_shoulder_torque_nm"] = max(torque, result["peak_shoulder_torque_nm"])
+            if limited and abs(positions[mid] - planned_target[mid]) > FLANGE_SETTLE_TOL_TICKS:
+                if abs(positions[mid] - planned_target[mid]) >= abs(start_tick - planned_target[mid]):
+                    return await stop_motion("Station did not advance toward the preflighted waypoint")
+                continue
+        index += 1
     if live:
         result["measured_joints_rad"] = measured.tolist()
         final = expected.positions()

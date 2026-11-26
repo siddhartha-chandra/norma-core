@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from desk_core import mcp_server
+from desk_core import mcp_server, station_bridge
 from desk_core.pose_estimation import pixels_on_plane
 from desk_core.station_bridge import LiveStationBridge, MockStationBridge, RobotState
 from desk_core.stereo_sweep import _blob_mask
@@ -156,8 +156,10 @@ def test_live_feedback_skips_frames_from_before_settle(monkeypatch, calib, settl
     assert accepted == [0, 200]
 
 
-@pytest.mark.parametrize("torque_limit, marker_at_edge", [(0.6, False), (0.001, False), (0.6, True)])
-def test_live_large_yaw_uses_coarse_preflighted_roll(monkeypatch, calib, torque_limit, marker_at_edge):
+@pytest.mark.parametrize("torque_limit, marker_at_edge, settle_shortfall", [
+    (0.6, False, 0), (0.001, False, 0), (0.6, True, 0), (0.6, False, 14),
+])
+def test_live_large_yaw_uses_coarse_preflighted_roll(monkeypatch, calib, torque_limit, marker_at_edge, settle_shortfall):
     bus = calib.hardware_config()["bus_serial"]
     wrist_id = calib.hardware_config()["camera_wrist"]
     bridge = LiveStationBridge(target_bus=bus, cam_wrist=wrist_id, follow_motor_rx=True)
@@ -173,6 +175,9 @@ def test_live_large_yaw_uses_coarse_preflighted_roll(monkeypatch, calib, torque_
     monkeypatch.setattr(mcp_server, "_calib", calib)
     monkeypatch.setattr(mcp_server, "_bridge", bridge)
     monkeypatch.setattr(mcp_server, "_logger", None)
+    if settle_shortfall:
+        monkeypatch.setattr(mcp_server, "DEFAULT_MAX_STEP", 260)
+        monkeypatch.setattr(station_bridge, "DEFAULT_MAX_STEP", 260)
 
     q = np.array(calib.ticks_to_rad(motors))
     flange = calib.fk_ee_pose(q)
@@ -218,6 +223,8 @@ def test_live_large_yaw_uses_coarse_preflighted_roll(monkeypatch, calib, torque_
                        if m.id in targets and targets[m.id] != m.position}
             writes.append(changed)
             for mid, tick in targets.items():
+                if len(writes) == 1 and mid == 7 and settle_shortfall:
+                    tick -= int(math.copysign(settle_shortfall, changed[mid]))
                 motors[mid - 1].position = tick
 
     monkeypatch.setattr(bridge, "get_state", get_state)
@@ -239,3 +246,5 @@ def test_live_large_yaw_uses_coarse_preflighted_roll(monkeypatch, calib, torque_
         return
     assert all(set(step) == {7} and 200 < abs(step[7]) < 400 for step in writes[:2])
     assert len(writes) > 2
+    if settle_shortfall:
+        assert abs(writes[1][7]) == mcp_server.DEFAULT_MAX_STEP
