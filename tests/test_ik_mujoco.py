@@ -224,6 +224,19 @@ def test_live_bridge_refuses_pose_drift_and_clamping_before_writing(live_station
     asyncio.run(run())
 
 
+def test_live_waypoint_within_tolerance_still_requires_progress(live_station):
+    bridge, state, _ = live_station
+    start = state.positions()[2]
+    target = {2: start + 5}
+
+    async def run():
+        assert await bridge.wait_preflight_settle(target, 15, moving_from={2: start}, timeout_s=0.2) is None
+        state.motors[1].position = target[2] - 1
+        assert await bridge.wait_preflight_settle(target, 15, moving_from={2: start}, timeout_s=0.2) is state
+
+    asyncio.run(run())
+
+
 @pytest.mark.parametrize("write_uncertain", [False, True])
 def test_live_failure_replaces_active_target_with_present_position(live_station, calib, monkeypatch, write_uncertain):
     bridge, state, packets = live_station
@@ -233,7 +246,7 @@ def test_live_failure_replaces_active_target_with_present_position(live_station,
     xyz, rotation = planner.flange_pose(goal)
     args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
 
-    async def stall(targets, tol_ticks):
+    async def stall(targets, tol_ticks, *, moving_from):
         state.motors[2].position -= 1
         return None
 

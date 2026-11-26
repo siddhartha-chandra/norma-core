@@ -979,7 +979,9 @@ async def plan_and_move(
             return await stop_motion("Station did not apply the preflighted waypoint")
         if live:
             try:
-                settled = await bridge.wait_preflight_settle(target, tol_ticks=FLANGE_SETTLE_TOL_TICKS)
+                settled = await bridge.wait_preflight_settle(
+                    target, tol_ticks=FLANGE_SETTLE_TOL_TICKS, moving_from={mid: expected.motors[axis].position}
+                )
             except RuntimeError as exc:
                 return await stop_motion(str(exc))
             if settled is None:

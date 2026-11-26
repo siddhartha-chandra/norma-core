@@ -1211,8 +1211,8 @@ class LiveStationBridge:
             await asyncio.sleep(0.08)
         return False
 
-    async def wait_preflight_settle(self, targets: dict[int, int], tol_ticks: int,
-                                    timeout_s: float = 3.0) -> RobotState | None:
+    async def wait_preflight_settle(self, targets: dict[int, int], tol_ticks: int, *,
+                                    moving_from: dict[int, int], timeout_s: float = 3.0) -> RobotState | None:
         deadline = time.monotonic() + timeout_s
         previous = None
         while time.monotonic() < deadline and not self._aborted:
@@ -1220,7 +1220,9 @@ class LiveStationBridge:
             self._require_fresh_motor_rx(state, targets)
             pos = state.positions()
             samples = {mid: self.rx_received_at[(state.bus_serial, mid)] for mid in targets}
-            if all(mid in pos and abs(pos[mid] - tick) <= tol_ticks for mid, tick in targets.items()):
+            if (all(mid in pos and abs(pos[mid] - tick) <= tol_ticks for mid, tick in targets.items())
+                    and all(start == targets[mid] or abs(pos[mid] - targets[mid]) < abs(start - targets[mid])
+                            for mid, start in moving_from.items())):
                 if previous is None or previous[0] != pos:
                     previous = (pos, samples)
                 elif all(stamp > previous[1][mid] for mid, stamp in samples.items()):
