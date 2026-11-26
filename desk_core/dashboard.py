@@ -216,6 +216,7 @@ async def api_localize(req: LocalizeReq) -> dict[str, Any]:
     if req.camera in ("both", "dual"):
         raise HTTPException(status_code=400, detail="camera='both' is disabled: dual-camera localization is pending the epipolar step")
     bridge = await srv._get_bridge()
+    positions = await _arm_joint_positions(bridge) if req.camera == "wrist" else None
     jpeg = await bridge.get_frame(req.camera, denoise=True)
     q = await srv._live_arm_q(None, req.camera)
     det = await localize_object_3d(
@@ -229,7 +230,7 @@ async def api_localize(req: LocalizeReq) -> dict[str, Any]:
         provider=req.provider,
     )
     _last_detection = det
-    _detection_positions = await _arm_joint_positions(bridge) if req.camera == "wrist" else None
+    _detection_positions = positions
     fb = f" ({det['fallback_reason']})" if det.get("fallback_reason") else ""
     _log_event("LOCALIZE", f"{req.query} via {det['backend']}{fb} -> {det['world']}", ok=det["found"])
     return det
