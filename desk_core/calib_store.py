@@ -371,11 +371,12 @@ class CalibrationStore:
     ) -> tuple[float, float, float]:
         """Project 2D pixel (x, y) into metric robot base-frame (X, Y, Z) in meters."""
         H = self.data.get("H_table")
-        if H is not None and camera == "top" and z_m is None:
+        if H is not None and camera == "top" and (z_m is None or self.T_world_cam("top") is None):
             H_mat = np.asarray(H, dtype=float).reshape(3, 3)
             pt = H_mat @ np.array([float(x), float(y), 1.0])
             if abs(pt[2]) > 1e-8:
-                return (round(float(pt[0] / pt[2]), 5), round(float(pt[1] / pt[2]), 5), round(self.z_table(), 5))
+                target_z = self.z_table() if z_m is None else float(z_m)
+                return (round(float(pt[0] / pt[2]), 5), round(float(pt[1] / pt[2]), 5), round(target_z, 5))
 
         ray_cam = self._ray_cam(x, y, camera)
         T = self.T_world_cam(camera, q_rad=q_rad)
@@ -438,6 +439,10 @@ class CalibrationStore:
             missing.append("joint_signs")
         return missing
 
+    def table_anchors(self) -> dict[str, Any] | None:
+        anchors = self.data.get("table_anchors")
+        return dict(anchors) if isinstance(anchors, dict) else None
+
     def status(self) -> dict[str, Any]:
         missing = self.missing_required_fields()
         calibrated_flag = bool(self.data["calibrated"]) if "calibrated" in self.data else (len(missing) == 0)
@@ -451,6 +456,7 @@ class CalibrationStore:
             "has_dist_top": "dist_top" in self.data,
             "has_T_world_cam_top": "T_world_cam_top" in self.data,
             "has_H_table": "H_table" in self.data,
+            "has_table_anchors": isinstance(self.data.get("table_anchors"), dict),
             "has_K_wrist": "K_wrist" in self.data,
             "has_dist_wrist": "dist_wrist" in self.data,
             "has_T_ee_cam_wrist": "T_ee_cam_wrist" in self.data,
