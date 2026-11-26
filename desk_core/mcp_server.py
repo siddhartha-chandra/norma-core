@@ -48,7 +48,7 @@ from .station_bridge import (DEFAULT_MAX_STEP, MAX_ANGLE_STEP, REPO_ROOT, LiveSt
 from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
 from .vision_3d import localize_object_3d
-from .wrist_ibvs import MAX_ROLL_STEP_RAD, PERIOD_S, TIMEOUT_S, YAW_TOL_RAD, alignment_step
+from .wrist_ibvs import MAX_ROLL_STEP_RAD, MAX_START_ERROR_M, PERIOD_S, TIMEOUT_S, YAW_TOL_RAD, alignment_step
 
 if TYPE_CHECKING:
     from .ik_mujoco import JointPlan, MuJoCoPlanner
@@ -997,9 +997,23 @@ async def _plan_and_move(x, y, z, shoulder_torque_limit_nm, qx, qy, qz, qw, exec
     )
 
 
-async def _prerotate_wrist(roll, torque_limit, *, expected_start, wrist_planner):
-    from .ik_mujoco import JointPlan, PlanningError
+async def _prerotate_wrist(roll, marker_xy, torque_limit, *, expected_start, wrist_planner):
+    from .ik_mujoco import MAX_WAYPOINT_STEP_RAD, PlanningError
+    from .ik_tracik import TOOL_FRAME, get_solver
+    from .pose_estimation import pixels_on_plane
     from .urdf_fk import load_urdf
+
+    K, dist, plane_z = _calib._K("wrist"), _calib._dist("wrist"), _calib.z_table()
+
+    def optical_hit(q):
+        return pixels_on_plane([K[:2, 2]], K, dist, _calib.T_world_cam("wrist", q), plane_z)[0, :2]
+
+    def in_range(q):
+        return np.linalg.norm(marker_xy - optical_hit(q)) <= MAX_START_ERROR_M
+
+    def keep_marker(q):
+        if not in_range(q):
+            raise PlanningError("Wrist pre-rotation would move the marker outside the alignment range")
 
     def build(planner, start, quantize, _live):
         axis = _calib.joint_names().index("rev_motor_07")
@@ -1010,10 +1024,20 @@ async def _prerotate_wrist(roll, torque_limit, *, expected_start, wrist_planner)
         goal[axis] -= roll
         if not planner.lower[axis] <= goal[axis] <= planner.upper[axis]:
             raise PlanningError("Wrist pre-rotation exceeds calibrated joint limits")
-        count = math.ceil(abs(roll) * TICKS_PER_RAD / DEFAULT_MAX_STEP)
-        waypoints = np.asarray([quantize(q) for q in np.linspace(start, goal, count + 1)])
-        peak = max(planner.validate_segment(a, b) for a, b in zip(waypoints, waypoints[1:]))
-        return JointPlan(waypoints, None, peak)
+        samples = max(1, math.ceil(abs(roll) / MAX_WAYPOINT_STEP_RAD))
+        if not all(in_range(q) for q in np.linspace(start, quantize(goal), samples + 1)):
+            flange = _calib.fk_ee_pose(goal, TOOL_FRAME)
+            flange[:2, 3] += marker_xy - optical_hit(goal)
+            solution = get_solver(_calib.urdf_path()).solve(
+                flange[:3, 3], flange[:3, :3], goal, planner.lower, planner.upper,
+            )
+            if not solution.ok:
+                raise PlanningError(f"Wrist pre-rotation could not keep the marker in range: {solution.reason}")
+            goal = solution.q
+        return planner.plan_trajectory(
+            start, goal, quantize, sequential=True, command_step_rad=DEFAULT_MAX_STEP / TICKS_PER_RAD,
+            check=keep_marker,
+        )
 
     return await _run_mujoco_motion(
         torque_limit, True, build, expected_start=expected_start, wrist_planner=wrist_planner,
@@ -1711,7 +1735,7 @@ async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
 
     Start with the marker isolated and already near the wrist image center, gripper open and pointing down.
     This moves the arm but does not descend or grasp. The effective position tolerance is capped below 1 mm.
-    Large initial yaw errors get a wrist-only pre-rotation before the 1.5 s fine-alignment budget.
+    Large initial yaw errors get a pre-rotation before the 1.5 s fine-alignment budget.
     """
     from .ik_tracik import TOOL_FRAME
 
@@ -1805,7 +1829,8 @@ async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
                     loop = asyncio.get_running_loop()
                     deadline.reschedule(loop.time() + TIMEOUT_S)
                     move = await _prerotate_wrist(
-                        measurement.roll_error_rad, limit, expected_start=expected_start, wrist_planner=wrist_planner,
+                        measurement.roll_error_rad, measurement.marker_xy, limit, expected_start=expected_start,
+                        wrist_planner=wrist_planner,
                     )
                     fine_start = time.monotonic()
                     prerotation_s = fine_start - prerotation_start

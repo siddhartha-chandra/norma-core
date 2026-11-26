@@ -223,14 +223,16 @@ class MuJoCoPlanner:
 
     def _validate_path(self, points: list[np.ndarray],
                        quantize: Callable[[np.ndarray], np.ndarray], sequential: bool = False,
-                       check: Callable[[np.ndarray], None] | None = None) -> JointPlan:
+                       check: Callable[[np.ndarray], None] | None = None, *,
+                       command_step_rad: float = MAX_WAYPOINT_STEP_RAD) -> JointPlan:
         path = [quantize(points[0])]
         peak = self._check(path[0])
         if check is not None:
             check(path[0])
         tuck_end = None
         for i, (start, end) in enumerate(zip(points, points[1:])):
-            count = max(1, math.ceil(float(np.max(np.abs(end - start))) / MAX_WAYPOINT_STEP_RAD))
+            step_rad = command_step_rad if sequential else MAX_WAYPOINT_STEP_RAD
+            count = max(1, math.ceil(float(np.max(np.abs(end - start))) / step_rad))
             for q in np.linspace(start, end, count + 1)[1:]:
                 commanded = quantize(q)
                 try:
@@ -289,10 +291,20 @@ class MuJoCoPlanner:
         return plan
 
     def plan_trajectory(self, start, goal, quantize: Callable[[np.ndarray], np.ndarray] | None = None, *,
-                        sequential: bool = False) -> JointPlan:
+                        sequential: bool = False, command_step_rad: float = MAX_WAYPOINT_STEP_RAD,
+                        check: Callable[[np.ndarray], None] | None = None) -> JointPlan:
         """Preflight every waypoint, tucking j3/j4 before j2 changes on a lift."""
         quantize = quantize or np.copy
         start, goal = np.asarray(start, dtype=float), np.asarray(goal, dtype=float)
+        if not math.isfinite(command_step_rad) or command_step_rad <= 0:
+            raise PlanningError("Command step must be positive and finite")
+
+        def validate(points):
+            plan = self._validate_path(points, quantize, sequential, check, command_step_rad=command_step_rad)
+            if check is not None:
+                plan.cartesian_checks = dict.fromkeys(range(1, len(plan.waypoints)), check)
+            return plan
+
         self._check(start)
         self._check(goal)
         shoulder_only = start.copy()
@@ -300,7 +312,7 @@ class MuJoCoPlanner:
         start_z = self.flange_pose(start)[0][2]
         rise = max(self.flange_pose(goal)[0][2], self.flange_pose(shoulder_only)[0][2]) - start_z
         if rise <= MAX_POSITION_ERROR_M or abs(goal[1] - start[1]) < 1e-6:
-            return self._validate_path([start, goal], quantize, sequential)
+            return validate([start, goal])
 
         initial_torque = abs(self.shoulder_torque(start))
         candidates = []
@@ -321,7 +333,7 @@ class MuJoCoPlanner:
             lifted = goal.copy()
             lifted[2:4] = tucked[2:4]
             try:
-                return self._validate_path([start, tucked, lifted, goal], quantize, sequential)
+                return validate([start, tucked, lifted, goal])
             except PlanningError as exc:
                 failure = str(exc)
         raise PlanningError(f"Tuck-first lift blocked: {failure}")

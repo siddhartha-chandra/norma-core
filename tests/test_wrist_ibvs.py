@@ -156,8 +156,8 @@ def test_live_feedback_skips_frames_from_before_settle(monkeypatch, calib, settl
     assert accepted == [0, 200]
 
 
-@pytest.mark.parametrize("torque_limit", [0.6, 0.001])
-def test_live_large_yaw_uses_coarse_preflighted_roll(monkeypatch, calib, torque_limit):
+@pytest.mark.parametrize("torque_limit, marker_at_edge", [(0.6, False), (0.001, False), (0.6, True)])
+def test_live_large_yaw_uses_coarse_preflighted_roll(monkeypatch, calib, torque_limit, marker_at_edge):
     bus = calib.hardware_config()["bus_serial"]
     wrist_id = calib.hardware_config()["camera_wrist"]
     bridge = LiveStationBridge(target_bus=bus, cam_wrist=wrist_id, follow_motor_rx=True)
@@ -181,7 +181,18 @@ def test_live_large_yaw_uses_coarse_preflighted_roll(monkeypatch, calib, torque_
     rolled[-1] += math.pi / 4
     z = calib.z_table()
     eye = calib.T_world_cam("wrist", rolled)
-    target = pixels_on_plane([K[:2, 2]], K, None, eye, z)[0, :2] + [0.0016, 0]
+    rolled_hit = pixels_on_plane([K[:2, 2]], K, None, eye, z)[0, :2]
+    target = rolled_hit + [0.0016, 0]
+    if marker_at_edge:
+        initial_eye = calib.T_world_cam("wrist", q)
+        initial_hit = pixels_on_plane([K[:2, 2]], K, None, initial_eye, z)[0, :2]
+        drift = rolled_hit - initial_hit
+        target = initial_hit - 0.022 * drift / np.linalg.norm(drift)
+        frame = frame_of_marker(initial_eye, target, yaw, z)
+        assert alignment_step(frame, K, None, initial_eye, flange, z).error_mm < 35
+        frame = frame_of_marker(eye, target, yaw, z)
+        with pytest.raises(ValueError, match="outside the final-approach alignment range"):
+            alignment_step(frame, K, None, eye, calib.fk_ee_pose(rolled), z)
     writes = []
 
     async def get_state():
@@ -223,5 +234,8 @@ def test_live_large_yaw_uses_coarse_preflighted_roll(monkeypatch, calib, torque_
     assert result["ok"], result
     assert result["error_mm"] < 1 and abs(result["yaw_error_deg"]) < 2
     assert 0.16 <= result["prerotation_s"] and result["ibvs_s"] < 1.5
+    if marker_at_edge:
+        assert any(set(step) - {7} for step in writes)
+        return
     assert all(set(step) == {7} and 200 < abs(step[7]) < 400 for step in writes[:2])
     assert len(writes) > 2
