@@ -306,7 +306,8 @@ def test_live_failure_replaces_active_target_with_present_position(live_station,
     monkeypatch.setattr(mcp_server._robo_jev, "evaluate", lambda **kwargs: {"ok": True})
 
     async def check_latch():
-        assert (await mcp_server.robo_jev_guard())["ok"]
+        recovery = await mcp_server.robo_jev_guard()
+        assert not recovery["ok"] and recovery["reason"] == "manual_estop", recovery
         with pytest.raises(EStopLatched):
             await bridge.send_joint_targets({1: state.positions()[1]})
         assert len(packets) == 2
