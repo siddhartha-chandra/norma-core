@@ -728,6 +728,8 @@ async def localize_3d(
         xy = bridge.synthetic_top_unproject(*res["pixel"][:2], float(world.get("z", 0.0)))
         if xy is not None:
             res["world"] = {**world, "x": xy[0], "y": xy[1]}
+            if isinstance(res.get("pose_6d"), dict):
+                res["pose_6d"] = {**res["pose_6d"], "x": xy[0], "y": xy[1]}
     if res.get("found"):
         try:
             write_res = await _get_sightings_store().record_localization(
