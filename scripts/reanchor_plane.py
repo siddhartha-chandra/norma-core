@@ -77,6 +77,8 @@ def parse_points(raw: str) -> list[list[float]]:
 def _make_bridge(live: bool, calib: CalibrationStore, *, follow_motor_rx: bool = False) -> Any:
     if not live:
         return MockStationBridge()
+    if os.environ.get("DESK_MOCK") == "1":
+        raise RuntimeError("DESK_MOCK=1 is set; refusing to open a live Station connection.")
     hw = calib.hardware_config()
     host = os.environ.get("STATION_HOST", "").strip() or "127.0.0.1"
     port = int(os.environ.get("STATION_PORT", "8888"))

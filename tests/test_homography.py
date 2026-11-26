@@ -565,9 +565,13 @@ def test_cli_mock_without_explicit_calib_does_not_overwrite_default_rig(tmp_path
     assert "H_table" not in json.loads(calib_file.read_text(encoding="utf-8"))
 
 
-def test_cli_make_bridge_live_enables_motor_rx_and_target_bus(tmp_path: Path):
+def test_cli_make_bridge_live_enables_motor_rx_and_target_bus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """LiveStationBridge factory in scripts/reanchor_plane.py must pass target_bus and follow_motor_rx."""
     import importlib.util
+
+    for var in ("DESK_MOCK", "STATION_HOST", "STATION_PORT", "STATION_BUS_SERIAL", "CAMERA_TOP", "CAMERA_WRIST"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("DESK_NO_DOTENV", "1")
 
     spec = importlib.util.spec_from_file_location("reanchor_plane_cli", REPO_ROOT / "scripts" / "reanchor_plane.py")
     assert spec is not None and spec.loader is not None
@@ -580,3 +584,7 @@ def test_cli_make_bridge_live_enables_motor_rx_and_target_bus(tmp_path: Path):
     bridge = mod._make_bridge(live=True, calib=cs, follow_motor_rx=True)
     assert bridge.target_bus == "BUS123"
     assert bridge._follow_motor_rx is True
+
+    monkeypatch.setenv("DESK_MOCK", "1")
+    with pytest.raises(RuntimeError, match="DESK_MOCK=1"):
+        mod._make_bridge(live=True, calib=cs, follow_motor_rx=True)
