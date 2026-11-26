@@ -51,7 +51,7 @@ async def _require_token(request: Request, call_next):
     if not token:
         return await call_next(request)
     given = request.query_params.get("token") or request.headers.get("x-dashboard-token") or request.cookies.get("dashboard_token")
-    if not given or not secrets.compare_digest(given, token):
+    if not given or not secrets.compare_digest(given.encode(), token.encode()):
         return PlainTextResponse("Dashboard token required (open /?token=...)", status_code=401)
     response = await call_next(request)
     if request.query_params.get("token"):
