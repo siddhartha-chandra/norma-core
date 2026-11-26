@@ -181,6 +181,45 @@ def test_list_sightings_merges_normfs_and_sqlite_with_filters(tmp_path):
     assert before[0].time == 100.0
 
 
+@pytest.mark.parametrize("station_available", [True, False])
+def test_mcp_history_reads_normfs_and_sqlite_on_cold_start(tmp_path, monkeypatch, mock_bridge, station_available):
+    client = _FakeNormFSClient()
+    db_path = tmp_path / "sightings.db"
+    writer = SightingsStore(normfs_client=client, db_path=db_path, normfs_enabled=True)
+    mock_bridge.client = client
+
+    def create_bridge(*, follow_motor_rx):
+        if not station_available:
+            async def connect():
+                raise OSError("Station offline")
+            monkeypatch.setattr(mock_bridge, "connect", connect)
+        return mock_bridge
+
+    monkeypatch.setenv("DESK_SIGHTINGS_DB", str(db_path))
+    monkeypatch.setenv("DESK_SIGHTINGS_NORMFS", "1")
+    monkeypatch.setattr(srv, "_bridge", None)
+    monkeypatch.setattr(srv, "_connect_cooldown_until", 0.0)
+    monkeypatch.setattr(srv, "_sightings", None)
+    monkeypatch.setattr(srv, "create_bridge", create_bridge)
+
+    async def run():
+        client.connected = False
+        await writer.record("keys", 0.20, 0.01, time_s=100.0, frame_ref="mock://top#1")
+        client.connected = True
+        await writer.record("keys", 0.23, 0.04, time_s=200.0, frame_ref="normfs://cam#2")
+
+        latest = await srv.last_seen(" KEYS ")
+        assert latest["found"] is True
+        assert (latest["time"], latest["frame_ref"]) == (
+            (200.0, "normfs://cam#2") if station_available else (100.0, "mock://top#1")
+        )
+        assert await srv.where_was("keys", 150.0) == {
+            "found": True, "label": "keys", "x": 0.20, "y": 0.01, "time": 100.0, "frame_ref": "mock://top#1",
+        }
+
+    asyncio.run(run())
+
+
 def test_sighting_validation(tmp_path):
     store = SightingsStore(db_path=tmp_path / "sightings.db", normfs_enabled=False)
     with pytest.raises(ValueError):
