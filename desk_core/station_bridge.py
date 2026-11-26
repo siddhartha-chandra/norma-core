@@ -397,6 +397,14 @@ class MockStationBridge:
             return self._project_mock_top
         return None
 
+    def synthetic_top_unproject(self, u: float, v: float, z: float) -> tuple[float, float] | None:
+        """Invert the synthetic top projection onto the plane at height z (None for non-synthetic frames)."""
+        if self.synthetic_top_projector() is None:
+            return None
+        cx, cy, cz = self._mock_top_camera()
+        dz = max(0.06, cz - z)
+        return cx - (v - 240.0) * dz / 680.0, cy - (u - 320.0) * dz / 680.0
+
     def _mock_top_camera(self):
         return (0.0, 0.21, 0.65) if self._heading_out_scene else (0.28, 0.0, 0.65)
 
@@ -1159,9 +1167,10 @@ class LiveStationBridge:
     def _resolve_cam_key(self, camera: str) -> str:
         want = self._cam_map.get(camera, "")
         if want:
-            for key in self._frames:
+            for key in (*self._frames, *self._key_to_qid, *self._frame_order):
                 if want in key:
                     return key
+            raise RuntimeError(f"Configured {camera} camera {want!r} is not streaming.")
         idx = 1 if (camera == "wrist" and len(self._frame_order) > 1) else 0
         return self._frame_order[idx]
 
@@ -1170,7 +1179,7 @@ class LiveStationBridge:
             return None
         try:
             key = self._resolve_cam_key(camera)
-        except (IndexError, KeyError):
+        except (IndexError, KeyError, RuntimeError):
             return None
         qid = self._key_to_qid.get(key)
         entry_id = self._video_entry_ids.get(key)
