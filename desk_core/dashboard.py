@@ -294,6 +294,7 @@ async def api_guarded_recover() -> dict[str, Any]:
     q = (_last_detection or {}).get("query") or (srv._robo_jev.watch.query if srv._robo_jev.watch else "keys")
     res = await srv.robo_jev_guard(
         query=q,
+        camera=_armed_camera,
         use_gemini=bool(os.environ.get("GEMINI_API_KEY")),
     )
     if res.get("ok") and res.get("action") == "recalibrated" and res.get("world"):
