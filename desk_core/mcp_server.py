@@ -42,6 +42,7 @@ from .ik_adapter import IKAdapter
 from .interfaces import SceneObstacle
 from .robo_jev import ReflexMonitor, RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
+from .sightings import SightingsStore
 from .station_bridge import (DEFAULT_MAX_STEP, MAX_ANGLE_STEP, REPO_ROOT, LiveStationBridge, MockStationBridge,
                              PreflightWriteUncertain, RobotState, StationBridge, create_bridge)
 from .tts import SpeakerTTS
@@ -75,7 +76,15 @@ _tts = SpeakerTTS()
 RUNS_DIR = Path(os.environ.get("DESK_RUNS_DIR") or (REPO_ROOT / "runs"))
 FIXED_POSITIONS_PATH = REPO_ROOT / "calib" / "fixed_positions.json"
 _logger: RunLogger | None = None
+_sightings: SightingsStore | None = None
 _frame_seq = 0
+
+
+def _get_sightings_store() -> SightingsStore:
+    global _sightings
+    if _sightings is None:
+        _sightings = SightingsStore(client_provider=lambda: getattr(_bridge, "client", None))
+    return _sightings
 
 
 def _traced(fn):
@@ -690,8 +699,14 @@ async def localize_3d(
         raise ValueError("camera='both' is disabled: dual-camera 3D localization is pending the epipolar step; use 'top' or 'wrist'.")
     bridge = await _get_bridge()
     jpeg = await bridge.get_frame(camera, denoise=denoise)
+    seen_at = time.time()
+    frame_ref = (
+        bridge.last_frame_ref(camera)
+        if hasattr(bridge, "last_frame_ref")
+        else None
+    ) or f"{camera}@{int(seen_at * 1000)}"
     q = await _live_arm_q(None, camera)
-    return await localize_object_3d(
+    res = await localize_object_3d(
         jpeg_bytes=jpeg,
         query=query,
         calib=_calib,
@@ -703,6 +718,18 @@ async def localize_3d(
         model=model,
         provider=provider,
     )
+    if res.get("found"):
+        try:
+            write_res = await _get_sightings_store().record_localization(
+                res,
+                frame_ref=frame_ref,
+                time_s=seen_at,
+            )
+            if write_res is not None:
+                res["sighting"] = write_res.to_dict()
+        except Exception:
+            pass
+    return res
 
 
 @mcp.tool()

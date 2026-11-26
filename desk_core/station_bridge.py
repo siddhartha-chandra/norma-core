@@ -199,6 +199,8 @@ class MockStationBridge:
         self._aborted = False
         self._abort_source: str | None = None
         self._frame_overrides: dict[str, bytes] = {}
+        self._frame_seq: dict[str, int] = {}
+        self._last_frame_refs: dict[str, str] = {}
         self._motors: dict[int, MotorState] = {
             mid: MotorState(
                 mid,
@@ -403,7 +405,13 @@ class MockStationBridge:
             return None
         return self._project_mock_point(point, *self._mock_top_camera(), 680.0)[:2]
 
+    def last_frame_ref(self, camera: str = "top") -> str | None:
+        return self._last_frame_refs.get(camera)
+
     async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
+        seq = self._frame_seq.get(camera, 0) + 1
+        self._frame_seq[camera] = seq
+        self._last_frame_refs[camera] = f"mock://{camera}#{seq}"
         if camera in self._frame_overrides:
             return self._frame_overrides[camera]
         if path := self._mock_frame_path(camera):
@@ -1032,7 +1040,8 @@ class LiveStationBridge:
             else:
                 if self._video_entry_ids.get(key) == entry_id:
                     return
-                self._video_entry_ids[key] = entry_id
+        if entry_id is not None:
+            self._video_entry_ids[key] = entry_id
         self.frame_received_at[key] = time.monotonic()
         self.frame_station_ns[key] = capture_ns
 
@@ -1155,6 +1164,22 @@ class LiveStationBridge:
                     return key
         idx = 1 if (camera == "wrist" and len(self._frame_order) > 1) else 0
         return self._frame_order[idx]
+
+    def last_frame_ref(self, camera: str = "top") -> str | None:
+        if not self._frames and not self._frame_order:
+            return None
+        try:
+            key = self._resolve_cam_key(camera)
+        except (IndexError, KeyError):
+            return None
+        qid = self._key_to_qid.get(key)
+        entry_id = self._video_entry_ids.get(key)
+        capture_ns = self.frame_station_ns.get(key)
+        if qid and entry_id:
+            return f"normfs://{qid}#{entry_id.hex()}"
+        if qid and capture_ns:
+            return f"normfs://{qid}@{capture_ns}"
+        return f"camera://{key}" if key else None
 
     async def get_reflex_frame(self, camera: str) -> bytes:
         opposite = "top" if camera == "wrist" else "wrist"
