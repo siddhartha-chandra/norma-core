@@ -951,7 +951,8 @@ async def plan_and_move(
 
     expected = replace(st, motors=motors)
     measured = plan.waypoints[0]
-    for index, target in enumerate(targets[1:], start=1):
+    for index, planned_target in enumerate(targets[1:], start=1):
+        target = planned_target
         try:
             if live:
                 if plan.tuck_end is not None and index == plan.tuck_end + 1:
@@ -965,8 +966,8 @@ async def plan_and_move(
                 waypoint[axis] = plan.waypoints[index, axis]
                 peak = planner.validate_segment(measured, waypoint)
                 result["peak_shoulder_torque_nm"] = max(peak, result["peak_shoulder_torque_nm"])
-                target = {motor.id: target[mid] if motor.id == mid else motor.position
-                          for motor in expected.motors[:-1]}
+                if index > 1:
+                    target = {mid: planned_target[mid]}
                 applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP, preflight_start=expected)
             else:
                 applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP)
@@ -980,7 +981,7 @@ async def plan_and_move(
         if live:
             try:
                 settled = await bridge.wait_preflight_settle(
-                    target, tol_ticks=FLANGE_SETTLE_TOL_TICKS, moving_from={mid: expected.motors[axis].position}
+                    planned_target, tol_ticks=FLANGE_SETTLE_TOL_TICKS, moving_from={mid: expected.motors[axis].position}
                 )
             except RuntimeError as exc:
                 return await stop_motion(str(exc))

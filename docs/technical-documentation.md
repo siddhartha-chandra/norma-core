@@ -201,8 +201,10 @@ Live execution also requires arm torque to be already enabled. The planner uses 
 conversion as Desk Core FK; Station refuses to clamp or send
 a target from a different measured pose. The next segment is checked from the stable measured pose,
 which must be within the same 15-tick tolerance used by the flange-motion stream. Each live waypoint
-moves one joint at a time and commands the others to hold their measured positions, so the planned
-motion does not depend on servos moving at synchronized rates. This does not model physical overshoot.
+moves one joint at a time. After the first command establishes the inactive joints' initial targets,
+each later command updates only the moving joint; the others keep their last targets instead of
+following measured sag. The planned motion does not depend on synchronized rates, but the model
+does not account for physical overshoot.
 On a stall or an unconfirmed target write, Station attempts to hold the measured position.
 The model does not account for payload or dynamic torque. A simulation budget is not a hardware rating.
 To request just the MuJoCo IK solution, pass the same limit to `solve_ik`; without it the existing IK

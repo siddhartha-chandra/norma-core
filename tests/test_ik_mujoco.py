@@ -176,13 +176,16 @@ def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_
     xyz, rotation = planner.flange_pose(target)
     args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
     send = bridge._send_commands
+    shoulder_loaded = False
 
     async def send_with_shoulder_sag(client, commands):
+        nonlocal shoulder_loaded
         before = state.positions()
         assert all(sum(tick != before[mid] for mid, tick in command.items()) <= 1 for command in commands)
         previous = state.positions()[2]
         await send(client, commands)
-        if state.motors[1].position > previous:
+        shoulder_loaded |= state.motors[1].position > previous
+        if shoulder_loaded and any(2 in command for command in commands):
             state.motors[1].position -= 1
 
     monkeypatch.setattr(bridge, "_send_commands", send_with_shoulder_sag)
@@ -200,6 +203,7 @@ def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_
         assert moved["ok"] and moved["executed"]
         assert len(packets) == moved["waypoints"] - 1
         assert all(8 not in target for target in packets)
+        assert all(len(target) == 1 for target in packets[1:])
         assert state.positions()[2] > start_ticks[2]
         planned = calib.rad_to_ticks(moved["joints_rad"], state.motors)
         assert state.positions()[2] == planned[2] - 1
