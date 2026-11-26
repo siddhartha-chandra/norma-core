@@ -366,3 +366,47 @@ def test_mcp_localize_3d_logs_to_normfs_when_available_and_skips_when_not_found(
     assert res3["found"] is False
     assert "sighting" not in res3
     assert len(store.read_sqlite()) == 1
+
+
+def test_hung_normfs_enqueue_falls_back_within_write_timeout(tmp_path):
+    import time
+
+    class _HangingClient:
+        connected = True
+        setup_done = True
+
+        async def enqueue(self, queue_id: str, data: bytes):
+            await asyncio.sleep(5.0)
+            return b"\x00"
+
+    store = SightingsStore(
+        normfs_client=_HangingClient(),
+        db_path=tmp_path / "sightings.db",
+        timeout_s=5.0,
+        write_timeout_s=0.05,
+    )
+    t0 = time.monotonic()
+    res = asyncio.run(store.record("keys", 0.25, 0.05, time_s=1700000100.0, frame_ref="normfs://cam#1"))
+    elapsed = time.monotonic() - t0
+    assert elapsed < 1.0
+    assert res.backend == "sqlite"
+    assert res.fallback_reason is not None and "TimeoutError" in res.fallback_reason
+
+
+def test_mcp_localize_3d_logs_warning_on_sighting_write_failure(tmp_path, monkeypatch, mock_bridge, caplog):
+    import logging
+    import desk_core.mcp_server as srv
+
+    monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
+    # Point SQLite db_path at an existing directory so sqlite3.connect fails.
+    bad_db_path = tmp_path / "not_a_file"
+    bad_db_path.mkdir()
+    store = SightingsStore(db_path=bad_db_path, normfs_enabled=False)
+    monkeypatch.setattr(srv, "_sightings", store)
+
+    with caplog.at_level(logging.WARNING, logger="desk_core.mcp_server"):
+        res = asyncio.run(srv.localize_3d(query="blue block", camera="top", use_gemini=False, denoise=False))
+
+    assert res["found"] is True
+    assert "sighting" not in res
+    assert any("Failed to record sighting" in rec.message for rec in caplog.records)

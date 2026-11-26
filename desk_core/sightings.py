@@ -170,6 +170,7 @@ class SightingsStore:
         db_path: str | os.PathLike | None = None,
         normfs_enabled: bool | None = None,
         timeout_s: float = 5.0,
+        write_timeout_s: float = 0.5,
     ):
         self._normfs_client = normfs_client
         self._client_provider = client_provider
@@ -177,6 +178,7 @@ class SightingsStore:
         self._db_path = Path(db_path) if db_path is not None else None
         self._normfs_enabled = normfs_enabled
         self.timeout_s = float(timeout_s)
+        self.write_timeout_s = float(write_timeout_s)
         self._sqlite_initialized: set[Path] = set()
 
     @property
@@ -294,7 +296,7 @@ class SightingsStore:
         try:
             entry_id = await asyncio.wait_for(
                 client.enqueue(self.queue_id, sighting.to_bytes()),
-                timeout=self.timeout_s,
+                timeout=self.write_timeout_s,
             )
             rec_id = (
                 bytes(entry_id).hex()
