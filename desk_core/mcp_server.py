@@ -713,6 +713,17 @@ async def localize_3d(
     bridge = await _get_bridge()
     if query is None and isinstance(bridge, LiveStationBridge):
         jpeg = await bridge.get_frame(camera, denoise=denoise, strict_camera=True)
+        if after_frame_ref is None:
+            baseline = bridge.last_frame_ref(camera)
+            try:
+                async with asyncio.timeout(3.0):
+                    while True:
+                        await asyncio.sleep(0.1)
+                        jpeg = await bridge.get_frame(camera, denoise=denoise, strict_camera=True)
+                        if (current := bridge.last_frame_ref(camera)) and current != baseline:
+                            break
+            except TimeoutError:
+                return {"detections": [], "frame_ref": baseline, "stale_frame": True}
     else:
         jpeg = await bridge.get_frame(camera, denoise=denoise)
     seen_at = time.time()

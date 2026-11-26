@@ -19,6 +19,31 @@ def test_scene_scan_never_uses_wrist_as_overhead(monkeypatch):
         asyncio.run(mcp_server.localize_3d(provider="opencv"))
 
 
+@pytest.mark.parametrize("queue_advances", [False, True])
+def test_live_scan_waits_for_a_new_frame_on_startup(monkeypatch, queue_advances):
+    bridge = LiveStationBridge("localhost", 8888, cam_top="overhead-id", follow_motor_rx=True)
+    bridge.client = type("Client", (), {"read_from_tail": None})()
+    bridge._frames["overhead-id"] = b"archived"
+    bridge._key_to_qid["overhead-id"] = "usbvideo/overhead"
+    bridge._frame_order.append("overhead-id")
+    monkeypatch.setattr(mcp_server, "_bridge", bridge)
+    monkeypatch.setattr(mcp_server, "_logger", None)
+    archived = [("overhead-id", b"archived", 1, b"1")]
+    tail = AsyncMock(return_value=archived)
+    if queue_advances:
+        tail.side_effect = [archived, [("overhead-id", b"live", 2, b"2")]]
+    monkeypatch.setattr(bridge, "_fetch_tail_frames", tail)
+    localize = AsyncMock(return_value=[])
+    monkeypatch.setattr(mcp_server, "localize_frame_3d", localize)
+
+    result = asyncio.run(mcp_server.localize_3d(provider="opencv"))
+    assert result["stale_frame"] is not queue_advances
+    if queue_advances:
+        assert localize.await_args.args[0] == b"live"
+    else:
+        localize.assert_not_awaited()
+
+
 def test_default_ten_minute_scan_in_mock_simulation(tmp_path, monkeypatch, mock_bridge):
     monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
     monkeypatch.setattr(mcp_server, "_bridge", mock_bridge)
