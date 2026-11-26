@@ -332,18 +332,25 @@ def _parse_vlm_json(raw_text: str, query: str | None) -> list[dict[str, Any]]:
         if not isinstance(items, list):
             raise ValueError("Scene vision response must contain a detections array.")
         detections = []
+        has_valid_item = False
         for item in items:
             try:
                 det = GeminiPoint2DResult.model_validate(item)
             except ValidationError:
                 continue
+            if not det.found:
+                has_valid_item = True
+                continue
             if (
-                det.found and det.label.strip()
+                det.label.strip()
                 and len(det.point) == 2 and len(det.box_2d) == 4
                 and {"point", "box_2d"} <= det.model_fields_set
                 and math.isfinite(det.yaw_deg) and math.isfinite(det.confidence)
             ):
                 detections.append(_normalize_detection(det, det.label.strip()))
+                has_valid_item = True
+        if items and not has_valid_item:
+            raise ValueError("Scene vision response had no valid detections.")
         return detections
     parsed = GeminiPoint2DResult.model_validate_json(txt)
     return [_normalize_detection(parsed, parsed.label or query)]

@@ -18,6 +18,24 @@ def test_opencv_scene_detection_on_a_saturated_mat():
     assert sorted(tuple(det["point"]) for det in detections) == [(206, 217), (706, 717)]
 
 
+@pytest.mark.parametrize("invalid", [False, True])
+def test_scene_provider_distinguishes_empty_from_malformed(calib, mock_bridge, monkeypatch, invalid):
+    monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
+    payload = '{"detections": [{"found": true, "label": "phone", "point": "invalid"}]}' if invalid else '{"detections": []}'
+    monkeypatch.setattr(vision_3d, "_call_vlm_sync", lambda jpeg, query, provider, model: vision_3d._parse_vlm_json(payload, query))
+
+    async def scan():
+        jpeg = await mock_bridge.get_frame("top")
+        return await vision_3d.localize_frame_3d(jpeg, None, calib, provider="gemini")
+
+    detections = asyncio.run(scan())
+    if invalid:
+        assert detections
+        assert {det["backend"] for det in detections} == {"opencv-fallback"}
+    else:
+        assert detections == []
+
+
 def test_scene_provider_does_not_overlap_after_timeout(calib, mock_bridge, monkeypatch):
     started = threading.Event()
     release = threading.Event()
