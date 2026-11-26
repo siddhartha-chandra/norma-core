@@ -92,7 +92,7 @@ def _traced(fn):
 
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
-        if _logger is None:
+        if _logger is None or kwargs.get("log_frame") is False:
             return await fn(*args, **kwargs)
         t0 = time.perf_counter()
         call_args = dict(kwargs)
@@ -145,10 +145,14 @@ async def _get_bridge() -> StationBridge:
             raise RuntimeError("desk-core: Station still unreachable, retry in a few seconds.")
         ## added by Abhi
         bridge = create_bridge(follow_motor_rx=True)
+        tasks_before = asyncio.all_tasks()
         try:
             await bridge.connect()
         except Exception as exc:
             _connect_cooldown_until = time.monotonic() + 5.0
+            for task in asyncio.all_tasks() - tasks_before:
+                if getattr(task.get_coro(), "__qualname__", "").endswith("manage_connection"):
+                    task.cancel()
             mode = "mock" if (os.environ.get("DESK_MOCK") == "1" or not os.environ.get("STATION_HOST", "").strip()) else "live"
             raise RuntimeError(f"desk-core: {mode} bridge connect failed: {exc}") from exc
         _bridge = bridge
@@ -534,8 +538,9 @@ async def get_frame(
     max_dim: int = 0,
     save_npy: bool = True,
     show_overlay: bool = False,
+    log_frame: bool = True,
 ) -> list:
-    """Fetch a camera JPEG and RGB matrix reference; show_overlay draws X-Ray on the top view."""
+    """Fetch a camera JPEG and RGB matrix reference; show_overlay draws X-Ray on the top view. log_frame=False skips the replay log (live previews)."""
     global _frame_seq
     _frame_seq += 1
     bridge = await _get_bridge()
@@ -718,6 +723,11 @@ async def localize_3d(
         model=model,
         provider=provider,
     )
+    if res.get("found") and camera == "top" and isinstance(bridge, MockStationBridge) and res.get("pixel"):
+        world = res.get("world") or {}
+        xy = bridge.synthetic_top_unproject(*res["pixel"][:2], float(world.get("z", 0.0)))
+        if xy is not None:
+            res["world"] = {**world, "x": xy[0], "y": xy[1]}
     if res.get("found"):
         try:
             write_res = await _get_sightings_store().record_localization(

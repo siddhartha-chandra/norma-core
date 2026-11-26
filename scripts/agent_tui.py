@@ -941,7 +941,7 @@ class RobotAgentTUI(App):
         try:
             r_top, r_wrist = await asyncio.gather(
                 self.session.call_tool("get_frame", {
-                    "camera": "top", "denoise": False, "save_npy": False, "show_overlay": True,
+                    "camera": "top", "denoise": False, "save_npy": False, "show_overlay": True, "log_frame": False,
                 }),
                 self.session.call_tool("get_frame", {"camera": "wrist", "denoise": False, "save_npy": False}),
             )
