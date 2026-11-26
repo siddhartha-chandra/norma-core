@@ -33,6 +33,7 @@ def test_wrist_watch_latches_stale_until_relocalized():
 
     dashboard._armed_positions = armed
     assert client.post("/api/robo_jev/check").json()["reason"] == "wrist_moved_relocalize"
+    assert client.post("/api/robo_jev/arm").status_code == 409
 
     _arm_wrist_watch(client)
     assert client.post("/api/robo_jev/check").json()["reason"] != "wrist_moved_relocalize"

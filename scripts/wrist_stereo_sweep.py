@@ -377,7 +377,7 @@ async def run(args) -> int:
         jpeg, ticks = await settled_capture(bridge, camera_key)
         save_capture(directory, samples, jpeg, ticks, camera_key, bus)
         run_result = await stream_joint_path(bridge, calib, slide.plan["path"], slide.plan["duration_s"], limits)
-        if not run_result["ok"]:
+        if run_result.get("aborted"):
             print("move aborted (tracking lag): stopping, no automatic retry", json.dumps(run_result))
             return 2
         await correct_final_pose(bridge, calib, slide.plan["path"], limits)

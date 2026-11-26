@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS sightings (
 CREATE INDEX IF NOT EXISTS idx_sightings_label_time ON sightings (label, time DESC);
 CREATE INDEX IF NOT EXISTS idx_sightings_time ON sightings (time DESC);
 """
+_ABANDONED_READS: set[asyncio.Task] = set()
 
 
 def normfs_sightings_enabled() -> bool:
@@ -353,6 +354,17 @@ class SightingsStore:
             confidence=confidence,
         )
 
+    @staticmethod
+    def _discard_rest(qr: Any) -> None:
+        """Keep consuming an abandoned read so the Station reader can finish instead of blocking on a full buffer."""
+        async def _discard() -> None:
+            while await qr.data.get() is not None:
+                pass
+
+        task = asyncio.get_running_loop().create_task(_discard())
+        _ABANDONED_READS.add(task)
+        task.add_done_callback(_ABANDONED_READS.discard)
+
     async def _drain_queue_read(
         self, qr: Any, deadline: float
     ) -> tuple[list[Sighting], bytes | None, bytes | None, int]:
@@ -382,8 +394,11 @@ class SightingsStore:
                 except Exception as exc:
                     log.debug("Skipping malformed NormFS sighting entry: %s", exc)
         finally:
-            if not finished and hasattr(qr, "aclose"):
-                await qr.aclose()
+            if not finished:
+                if hasattr(qr, "aclose"):
+                    await qr.aclose()
+                else:
+                    self._discard_rest(qr)
         return entries, first_id, last_id, raw_count
 
     async def read_normfs(
