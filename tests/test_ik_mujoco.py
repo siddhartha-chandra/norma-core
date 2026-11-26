@@ -219,3 +219,24 @@ def test_live_bridge_refuses_pose_drift_and_clamping_before_writing(live_station
         assert not packets
 
     asyncio.run(run())
+
+
+def test_live_stall_replaces_active_target_with_present_position(live_station, calib, monkeypatch):
+    bridge, state, packets = live_station
+    planner = mcp_server._mujoco_planner(state, [], 0.6)
+    goal = np.asarray(calib.ticks_to_rad(state.motors))
+    goal[1] -= 0.2
+    xyz, rotation = planner.flange_pose(goal)
+    args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
+
+    async def stall(targets, tol_ticks):
+        state.motors[2].position -= 1
+        return None
+
+    monkeypatch.setattr(bridge, "wait_preflight_settle", stall)
+    result = asyncio.run(mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True))
+    assert not result["ok"] and result["executed"]
+    assert result["hold"]["mode"] == "hold"
+    assert len(packets) == 2
+    assert packets[1][3] == packets[0][3] - 1
+    assert packets[1] == state.positions()

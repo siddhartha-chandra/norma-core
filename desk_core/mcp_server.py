@@ -933,6 +933,16 @@ async def plan_and_move(
     current = await bridge.get_state()
     if current.bus_serial != st.bus_serial or current.positions() != initial_ticks or list(_obstacles.values()) != obstacles:
         return {"ok": False, "executed": False, "problems": ["Start pose or obstacles changed during preflight"]}
+
+    async def stop_motion(problem: str) -> dict:
+        result.update(ok=False, problems=[problem])
+        if result["executed"]:
+            try:
+                result["hold"] = await bridge.abort(source="mujoco_preflight")
+            except Exception as exc:
+                result["problems"].append(f"Station hold failed: {exc}")
+        return result
+
     expected = replace(st, motors=motors)
     measured = plan.waypoints[0]
     for index, target in enumerate(targets[1:], start=1):
@@ -949,29 +959,27 @@ async def plan_and_move(
             else:
                 applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP)
         except (PlanningError, RuntimeError) as exc:
-            result.update(ok=False, problems=[str(exc)])
-            return result
+            return await stop_motion(str(exc))
         result["executed"] = True
         if applied != target:
-            result.update(ok=False, problems=["Station did not apply the preflighted waypoint"])
-            return result
+            return await stop_motion("Station did not apply the preflighted waypoint")
         if live:
-            settled = await bridge.wait_preflight_settle(target, tol_ticks=FLANGE_SETTLE_TOL_TICKS)
+            try:
+                settled = await bridge.wait_preflight_settle(target, tol_ticks=FLANGE_SETTLE_TOL_TICKS)
+            except RuntimeError as exc:
+                return await stop_motion(str(exc))
             if settled is None:
-                result.update(ok=False, problems=["Station did not settle near the preflighted waypoint"])
-                return result
+                return await stop_motion("Station did not settle near the preflighted waypoint")
             positions = settled.positions()
             if (settled.bus_serial != expected.bus_serial or positions.keys() != expected.positions().keys()
                     or positions[8] != initial_ticks[8]):
-                result.update(ok=False, problems=["Station bus, motor inventory or gripper changed during execution"])
-                return result
+                return await stop_motion("Station bus, motor inventory or gripper changed during execution")
             expected = replace(expected, motors=[replace(m, position=positions[m.id]) for m in expected.motors])
             measured = np.asarray(_calib.ticks_to_rad(expected.motors))
             try:
                 torque = planner.validate_segment(measured, measured)
             except PlanningError as exc:
-                result.update(ok=False, problems=[str(exc)])
-                return result
+                return await stop_motion(str(exc))
             result["peak_shoulder_torque_nm"] = max(torque, result["peak_shoulder_torque_nm"])
     if live:
         result["measured_joints_rad"] = measured.tolist()
