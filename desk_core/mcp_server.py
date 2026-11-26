@@ -867,6 +867,47 @@ async def reload_config() -> dict:
     return {"calibration": cal_status, "ik_backend": _ik.backend_name()}
 
 
+@mcp.tool()
+@_traced
+@_motion_tool
+async def reanchor_plane(
+    pixel_points: list[list[float]] | None = None,
+    world_points: list[list[float]] | None = None,
+    z_table: float | None = None,
+    max_error_cm: float = 1.0,
+    allow_high_error: bool = False,
+    clear: bool = False,
+) -> dict:
+    """Fast <60s tabletop re-anchor: fit 4+ point planar homography H_table, save to rig_calib.json, and hot-reload.
+
+    Pass 4+ overhead camera pixels [[u, v], ...] and tabletop world coordinates [[x, y], ...] (meters),
+    or omit world_points to reuse previously saved table_anchors. Pass clear=True to remove H_table.
+    """
+    from .homography import clear_plane_homography, reanchor_plane as _reanchor_plane
+
+    global _main_control
+    if clear:
+        res = clear_plane_homography(calib_path=_calib.path)
+        cal_status = _calib.reload()
+        _main_control = None
+        return {**res, "calibration": cal_status}
+
+    if pixel_points is None:
+        raise ValueError("pixel_points (4+ [u, v] coordinates) is required unless clear=True.")
+
+    res = _reanchor_plane(
+        pixel_points=pixel_points,
+        world_points=world_points,
+        z_table=z_table,
+        calib_path=_calib.path,
+        max_error_m=float(max_error_cm) / 100.0,
+        allow_high_error=bool(allow_high_error),
+    )
+    cal_status = _calib.reload()
+    _main_control = None
+    return {**res, "calibration": cal_status}
+
+
 # =============================================================================
 # 4. Composite Execution Tools & Declarative Pipeline Runner
 # =============================================================================
@@ -1655,6 +1696,7 @@ _SEQ_TOOLS = {
     "update_scene_obstacle": update_scene_obstacle,
     "get_calib_status": get_calib_status,
     "reload_config": reload_config,
+    "reanchor_plane": reanchor_plane,
     "grasp": grasp,
     "release": release,
     "go_home": go_home,
