@@ -1129,6 +1129,8 @@ class LiveStationBridge:
         mids = motor_ids or [m.id for m in st.motors]
         pack = []
         if enable:
+            if self._aborted:
+                raise EStopLatched("E-STOP latched: call observe() before moving")
             self._require_fresh_motor_rx(st, mids)
             present = {m.id: m.position.to_bytes(2, "little") for m in st.motors if m.id in mids}
             pack.append(self._sync_write(st.bus_serial, RAM_GOAL_POSITION, present))
