@@ -73,7 +73,8 @@ def test_projected_wrist_watch_stops_if_the_target_disappears(calib, mock_bridge
     asyncio.run(simulate())
 
 
-def test_stationary_wrist_target_moves_in_image_as_robot_joints_move(mock_bridge, monkeypatch):
+@pytest.mark.parametrize("perspective", [False, True], ids=["translation", "perspective"])
+def test_stationary_wrist_target_moves_in_image_as_robot_joints_move(mock_bridge, monkeypatch, perspective):
     calib = CalibrationStore()
     q0 = rad(calib, FRONT_POSE_TICKS)
     calib.data.pop("T_world_cam_wrist", None)
@@ -88,12 +89,25 @@ def test_stationary_wrist_target_moves_in_image_as_robot_joints_move(mock_bridge
     stopped = asyncio.Event()
     slide = False
     abort = mock_bridge.abort
+    offsets = np.array([[0.015, 0.015, 0], [0.015, -0.015, 0], [-0.015, -0.015, 0], [-0.015, 0.015, 0]])
+
+    def quadrilateral(point, q):
+        return np.float32([calib.project_world_to_pixel(corner, "wrist", q) for corner in point + offsets])
+
+    reference = quadrilateral(world, q0)
+    artwork = cv2.imdecode(np.frombuffer(_scene(160), dtype=np.uint8), cv2.IMREAD_COLOR)
 
     async def render(camera, **kwargs):
         q = calib.ticks_to_rad((await mock_bridge.get_state()).motors)
         point = (world[0], world[1] + 0.025, world[2]) if slide else world
         x, y = calib.project_world_to_pixel(point, camera, q)
         frame_checked.set()
+        if perspective:
+            transform = cv2.getPerspectiveTransform(reference, quadrilateral(point, q))
+            warped = cv2.warpPerspective(artwork, transform, (320, 240), borderValue=(225, 225, 225))
+            ok, encoded = cv2.imencode(".jpg", warped)
+            assert ok
+            return encoded.tobytes()
         return _scene(round(x), y=round(y))
 
     async def record_abort(*args, **kwargs):
@@ -113,11 +127,18 @@ def test_stationary_wrist_target_moves_in_image_as_robot_joints_move(mock_bridge
         nonlocal slide
         before = calib.project_world_to_pixel(world, "wrist", q0)
         assert (await srv.robo_jev_arm_watch(*before, camera="wrist"))["armed"]
-        q1 = q0 + np.array([0.06, 0, 0, 0, 0, 0, 0])
+        q1 = q0 + np.array([0.06, 0, 0, 0, 0, 0, 0.10 if perspective else 0])
         await mock_bridge.send_joint_targets(calib.rad_to_ticks(q1, (await mock_bridge.get_state()).motors))
         state = await mock_bridge.get_state()
-        after = calib.project_world_to_pixel(world, "wrist", calib.ticks_to_rad(state.motors))
+        measured_q = calib.ticks_to_rad(state.motors)
+        after = calib.project_world_to_pixel(world, "wrist", measured_q)
         assert np.linalg.norm(np.subtract(after, before)) > 18
+        if perspective:
+            projected = quadrilateral(world, measured_q)
+            edge = projected[1] - projected[0]
+            original_edge = reference[1] - reference[0]
+            assert abs(np.linalg.norm(edge) / np.linalg.norm(original_edge) - 1) > 0.05
+            assert abs(np.degrees(np.arctan2(edge[1], edge[0]))) > 5
         frame_checked.clear()
         monitor = ReflexMonitor(gatekeeper, mock_bridge, calib, lambda: [])
         monitor.state = state
