@@ -15,11 +15,11 @@ from desk_core.robo_jev import ReflexMonitor, RoboJevGatekeeper, guarded_recover
 from desk_core.vision_3d import localize_object_3d
 
 
-def _scene(x=None, *, decoy=False):
+def _scene(x=None, *, y=120, decoy=False):
     image = np.full((240, 320, 3), 225, dtype=np.uint8)
     if x is not None:
-        cv2.rectangle(image, (x - 14, 104), (x + 14, 132), (200, 70, 20), -1)
-        cv2.circle(image, (x, 115), 5, (255, 255, 255), -1)
+        cv2.rectangle(image, (x - 14, y - 16), (x + 14, y + 12), (200, 70, 20), -1)
+        cv2.circle(image, (x, y - 5), 5, (255, 255, 255), -1)
     if decoy:
         cv2.rectangle(image, (228, 86), (286, 151), (200, 70, 20), -1)
     ok, encoded = cv2.imencode(".jpg", image)
@@ -69,6 +69,66 @@ def test_projected_wrist_watch_stops_if_the_target_disappears(calib, mock_bridge
             await asyncio.sleep(0.15)
         assert monitor.report and monitor.report["reason"] == "target_shifted"
         assert mock_bridge.abort_source == "reflex"
+
+    asyncio.run(simulate())
+
+
+def test_stationary_wrist_target_moves_in_image_as_robot_joints_move(mock_bridge, monkeypatch):
+    calib = CalibrationStore()
+    q0 = rad(calib, FRONT_POSE_TICKS)
+    calib.data.pop("T_world_cam_wrist", None)
+    top_down = np.array([[0, -1, 0, 0.28], [-1, 0, 0, 0], [0, 0, -1, 0.25], [0, 0, 0, 1]])
+    calib.data["T_ee_cam_wrist"] = (np.linalg.inv(calib.fk_ee_pose(q0)) @ top_down).tolist()
+    calib.data["K_wrist"] = [[520, 0, 160], [0, 520, 120], [0, 0, 1]]
+    calib.data["dist_wrist"] = [0] * 5
+    calib.data["z_table"] = 0.0
+    world = (0.28, 0.0, 0.0)
+    gatekeeper = RoboJevGatekeeper()
+    frame_checked = asyncio.Event()
+    stopped = asyncio.Event()
+    slide = False
+    abort = mock_bridge.abort
+
+    async def render(camera, **kwargs):
+        q = calib.ticks_to_rad((await mock_bridge.get_state()).motors)
+        point = (world[0], world[1] + 0.025, world[2]) if slide else world
+        x, y = calib.project_world_to_pixel(point, camera, q)
+        frame_checked.set()
+        return _scene(round(x), y=round(y))
+
+    async def record_abort(*args, **kwargs):
+        result = await abort(*args, **kwargs)
+        stopped.set()
+        return result
+
+    monkeypatch.setattr(srv, "_bridge", mock_bridge)
+    monkeypatch.setattr(srv, "_calib", calib)
+    monkeypatch.setattr(srv, "_robo_jev", gatekeeper)
+    monkeypatch.setattr(srv, "_logger", None)
+    monkeypatch.setattr(mock_bridge, "get_frame", render)
+    monkeypatch.setattr(mock_bridge, "abort", record_abort)
+    monkeypatch.setattr(mock_bridge, "link_status", lambda: {"bridge": "live"})
+
+    async def simulate():
+        nonlocal slide
+        before = calib.project_world_to_pixel(world, "wrist", q0)
+        assert (await srv.robo_jev_arm_watch(*before, camera="wrist"))["armed"]
+        q1 = q0 + np.array([0.06, 0, 0, 0, 0, 0, 0])
+        await mock_bridge.send_joint_targets(calib.rad_to_ticks(q1, (await mock_bridge.get_state()).motors))
+        state = await mock_bridge.get_state()
+        after = calib.project_world_to_pixel(world, "wrist", calib.ticks_to_rad(state.motors))
+        assert np.linalg.norm(np.subtract(after, before)) > 18
+        frame_checked.clear()
+        monitor = ReflexMonitor(gatekeeper, mock_bridge, calib, lambda: [])
+        monitor.state = state
+        async with monitor:
+            await asyncio.wait_for(frame_checked.wait(), 0.5)
+            await asyncio.sleep(0.08)
+            assert monitor.report is None, monitor.report
+            assert gatekeeper.watches["wrist"].world == pytest.approx(world)
+            slide = True
+            await asyncio.wait_for(stopped.wait(), 0.5)
+        assert monitor.report["reason"] == "target_shifted"
 
     asyncio.run(simulate())
 
