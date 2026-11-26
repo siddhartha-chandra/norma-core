@@ -85,6 +85,7 @@ EXECUTE_GATED_TOOLS = {
     "master_pick_place",
     "hive_sort",
     "heading_out",
+    "sweep_aside",
 }
 
 

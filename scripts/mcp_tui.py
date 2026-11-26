@@ -71,6 +71,7 @@ SAFETY_GROUPS: dict[str, tuple[str, str]] = {
     "pick_at": ("MOTION", "red"),
     "place_at": ("MOTION", "red"),
     "pick_pixel": ("MOTION", "red"),
+    "sweep_aside": ("MOTION", "red"),
     "execute_sequence": ("MOTION", "red"),
 }
 
@@ -463,13 +464,6 @@ class DeskCoreTUI(App):
         armed = self.query_one("#arm-motion", Checkbox).value
         log = self.query_one("#output-log", RichLog)
 
-        if badge == "MOTION" and not armed:
-            log.write(
-                f"[bold yellow]Blocked {name}:[/bold yellow] check [b]Arm Motion[/b] first "
-                "(safety interlock for physical arm movement)."
-            )
-            return
-
         raw = self.query_one("#args-editor", TextArea).text.strip() or "{}"
         try:
             args = json.loads(raw)
@@ -477,6 +471,14 @@ class DeskCoreTUI(App):
                 raise ValueError("Arguments must be a JSON object")
         except Exception as exc:
             log.write(f"[bold red]Invalid JSON arguments:[/bold red] {exc}")
+            return
+
+        requires_arm = badge == "MOTION" and (name != "sweep_aside" or args.get("execute") is True)
+        if requires_arm and not armed:
+            log.write(
+                f"[bold yellow]Blocked {name}:[/bold yellow] check [b]Arm Motion[/b] first "
+                "(safety interlock for physical arm movement)."
+            )
             return
 
         await self._call_tool(name, args)

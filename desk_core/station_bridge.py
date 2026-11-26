@@ -304,6 +304,21 @@ class MockStationBridge:
                     r_obj["y"] = round(r_obj["y"] + dy, 4)
                     r_obj["z"] = max(0.0, round(r_obj.get("z", 0.0) + dz, 4))
 
+    def push_mock_pens(self, start: tuple[float, float], end: tuple[float, float], jaw_z_m: float) -> None:
+        """Approximate a completed sweep in the synthetic scene, preserving lateral offsets."""
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length = math.hypot(dx, dy)
+        ux, uy = dx / length, dy / length
+        for name, obj in self._scene_objects.items():
+            if obj["shape"] != "pen" or not obj["z"] <= jaw_z_m < obj["z"] + self._obj_height(name, obj):
+                continue
+            x, y = obj["x"] - start[0], obj["y"] - start[1]
+            along, across = x * ux + y * uy, y * ux - x * uy
+            radius = obj["radius_m"]
+            if 0 <= along < length and abs(across) <= radius:
+                obj["x"] = round(end[0] - across * uy, 4)
+                obj["y"] = round(end[1] + across * ux, 4)
+
     def release_mock_object(self) -> str | None:
         released = self._held_object
         riders = list(self._held_riders)

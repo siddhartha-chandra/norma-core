@@ -5,7 +5,7 @@ Exposes:
      move_to_home, estop
   2. Core robotics primitives: move_joint, get_frame, solve_ik, get_joint_angles, get_metric_depth
   3. Calibration & scene tools: pixel_to_world, update_scene_obstacle, get_calib_status, reload_config
-  4. Composite execution tools: move_to_pose, move_flange, pick_at, place_at, pick_pixel, execute_sequence
+  4. Composite execution tools: move_to_pose, move_flange, pick_at, place_at, pick_pixel, sweep_aside, execute_sequence
   5. Numbered wrist stereo workflow: detect_requested_object, aim_wrist, capture_wrist_stereo, estimate_wrist_depth,
      measure_graspability, estimate_grasp_pose, plan_tolerant_grasp, retract_to_hover, move_to_drop,
      master_pick_place
@@ -21,8 +21,10 @@ import atexit
 import functools
 import io
 import json
+import math
 import os
 import time
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -33,7 +35,7 @@ from dotenv import dotenv_values
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from PIL import Image as PILImage
-from pydantic import TypeAdapter
+from pydantic import StrictBool, TypeAdapter
 
 from .calib_store import CalibrationStore, TICKS_PER_RAD
 from .hive import HIVE_SHAPE, POSITION_TOL_M, Layout, Obstacle, Tile, plan_hive
@@ -48,6 +50,7 @@ from .command_planner import plan_command as _plan_command
 from .vision_3d import localize_object_3d
 
 if TYPE_CHECKING:
+    from .ik_mujoco import JointPlan, MuJoCoPlanner
     from .main_control import MainControl
 
 if os.environ.get("DESK_NO_DOTENV") != "1":
@@ -287,6 +290,7 @@ async def grasp(close_ticks: int | None = None) -> dict:
 ### 7 and 8. Open the gripper before the pick and during placement
 # Existing MCP tool
 GRIPPER_OPEN_TOL_TICKS = 25
+SWEEP_HOVER_M = 0.04
 
 
 @mcp.tool()
@@ -988,6 +992,90 @@ async def plan_and_move(
     execute: bool = False,
 ) -> dict:
     """Preflight a flange pose in MuJoCo. Live execution requires aligned, unloaded ElRobot hardware."""
+    def build(planner, start, quantize, live):
+        goal = planner.solve_ik([x, y, z], [qx, qy, qz, qw], start)
+        return planner.plan_trajectory(start, goal, quantize, sequential=live)
+
+    return await _run_mujoco_motion(shoulder_torque_limit_nm, execute, build)
+
+
+@mcp.tool()
+@_traced
+@_motion_tool
+async def sweep_aside(
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+    z_mm: float,
+    execute: StrictBool = False,
+    shoulder_torque_limit_nm: float = 0.6,
+) -> dict:
+    """Push a pen or marker sideways with the open gripper, without grasping it.
+
+    Provide the jaw-tip midpoint's start/end XY in base_link meters and the
+    lowest jaw's clearance z_mm above the calibrated desk/mat surface. Start
+    just behind the object, end in the side pen zone, and register obstacles
+    other than the intended push target. Preview with execute=False (default),
+    then execute with an empty open gripper and re-observe the object's location.
+    """
+    if type(execute) is not bool:
+        return {"ok": False, "executed": False, "problems": ["execute must be a JSON boolean"]}
+
+    from scipy.spatial.transform import Rotation
+
+    from .ik_mujoco import CONTACT_MARGIN_M, JointPlan, PlanningError
+    from .motion import TCP_IN_FLANGE
+
+    xy = np.asarray([start_xy, end_xy], dtype=float)
+    if (xy.shape != (2, 2) or not np.all(np.isfinite(xy)) or not math.isfinite(z_mm)
+            or np.array_equal(xy[0], xy[1]) or z_mm <= CONTACT_MARGIN_M * 1000):
+        return {"ok": False, "executed": False,
+                "problems": ["Provide distinct finite XY points and a clearance above the collision margin"]}
+
+    low_z = _calib.z_table() + z_mm / 1000
+
+    def build(planner, start, quantize, live):
+        low_start, low_end = np.column_stack((xy, [low_z, low_z]))
+        lift = np.array([0, 0, SWEEP_HOVER_M])
+        hover_start, hover_end = low_start + lift, low_end + lift
+        center = xy.mean(axis=0)
+        yaw = math.atan2(center[1], center[0]) - math.pi / 2
+        radial = Rotation.from_euler("z", yaw)
+        rotations = (radial * Rotation.from_euler("x", -pitch, degrees=True)
+                     * Rotation.from_euler("y", roll, degrees=True)
+                     for pitch in (80, 70, 60, 90) for roll in (0, 180))
+        failure = None
+        for rotation in rotations:
+            tip = planner.jaw_tip_offset(start, rotation, TCP_IN_FLANGE)
+            try:
+                # Reject unreachable endpoints before sampling the line.
+                goal = planner.solve_ik(hover_start - rotation.apply(tip), rotation.as_quat(), start)
+                planner.solve_ik(low_end - rotation.apply(tip), rotation.as_quat(), goal)
+                approach = planner.plan_trajectory(start, goal, quantize, sequential=live)
+                waypoints, peak = list(approach.waypoints), approach.peak_shoulder_torque_nm
+                checks = {}
+                for begin, end in ((hover_start, low_start), (low_start, low_end), (low_end, hover_end)):
+                    leg = planner.plan_cartesian_segment(waypoints[-1], begin, end, rotation, tip,
+                                                         quantize=quantize, sequential=live)
+                    checks.update({len(waypoints) - 1 + i: check for i, check in leg.cartesian_checks.items()})
+                    waypoints.extend(leg.waypoints[1:])
+                    peak = max(peak, leg.peak_shoulder_torque_nm)
+                return JointPlan(np.asarray(waypoints), approach.tuck_end, peak, checks)
+            except PlanningError as exc:
+                if failure is None:
+                    failure = exc
+        raise PlanningError(f"Sweep preflight rejected: {failure}") from failure
+
+    def push_mock(bridge):
+        bridge.push_mock_pens(tuple(xy[0]), tuple(xy[1]), low_z)
+
+    return await _run_mujoco_motion(shoulder_torque_limit_nm, execute, build, on_mock_success=push_mock)
+
+
+async def _run_mujoco_motion(
+    shoulder_torque_limit_nm: float, execute: bool,
+    build: Callable[[MuJoCoPlanner, np.ndarray, Callable[[np.ndarray], np.ndarray], bool], JointPlan],
+    *, on_mock_success: Callable[[MockStationBridge], None] | None = None,
+) -> dict:
     from .ik_mujoco import PlanningError
     from .motion import FLANGE_SETTLE_TOL_TICKS
 
@@ -1016,9 +1104,8 @@ async def plan_and_move(
         fraction = motors[-1].to_norm() if live else 1.0
         planner = _mujoco_planner(replace(st, motors=motors), obstacles, shoulder_torque_limit_nm, fraction)
         start = np.asarray(_calib.ticks_to_rad(motors))
-        goal = planner.solve_ik([x, y, z], [qx, qy, qz, qw], start)
 
-        plan = planner.plan_trajectory(start, goal, lambda q: _quantize_joints(q, motors), sequential=live)
+        plan = build(planner, start, lambda q: _quantize_joints(q, motors), live)
         targets = [_calib.rad_to_ticks(q.tolist(), motors) for q in plan.waypoints]
         if any(abs(second[mid] - tick) > DEFAULT_MAX_STEP for first, second in zip(targets, targets[1:])
                for mid, tick in first.items()):
@@ -1058,6 +1145,9 @@ async def plan_and_move(
     measured = plan.waypoints[0]
     for index, planned_target in enumerate(targets[1:], start=1):
         target = planned_target
+        cartesian_check = plan.cartesian_checks.get(index)
+        validate = (planner.validate_segment if cartesian_check is None else
+                    functools.partial(planner.validate_cartesian_segment, check=cartesian_check))
         try:
             if live:
                 if plan.tuck_end is not None and index == plan.tuck_end + 1:
@@ -1067,7 +1157,7 @@ async def plan_and_move(
                         raise PlanningError("Measured elbow/wrist tuck did not reduce shoulder torque")
                 axis, = np.flatnonzero(plan.waypoints[index] != plan.waypoints[index - 1])
                 mid = expected.motors[axis].id
-                peak = planner.validate_segment(measured, plan.waypoints[index])
+                peak = validate(measured, plan.waypoints[index])
                 result["peak_shoulder_torque_nm"] = max(peak, result["peak_shoulder_torque_nm"])
                 if index > 1:
                     target = {mid: planned_target[mid]}
@@ -1097,7 +1187,7 @@ async def plan_and_move(
             expected = replace(expected, motors=[replace(m, position=positions[m.id]) for m in expected.motors])
             measured = np.asarray(_calib.ticks_to_rad(expected.motors))
             try:
-                torque = planner.validate_segment(measured, measured)
+                torque = validate(measured, measured)
             except PlanningError as exc:
                 return await stop_motion(str(exc))
             result["peak_shoulder_torque_nm"] = max(torque, result["peak_shoulder_torque_nm"])
@@ -1108,6 +1198,8 @@ async def plan_and_move(
             return await stop_motion("Station did not finish within the planned joint tolerance")
     if isinstance(bridge, MockStationBridge):
         bridge.set_mock_ee_pose(*planner.flange_pose(plan.waypoints[-1])[0])
+        if on_mock_success is not None and result["executed"]:
+            on_mock_success(bridge)
     return result
 
 
@@ -1881,6 +1973,7 @@ _SEQ_TOOLS = {
     "place_at": place_at,
     "pick_pixel": pick_pixel,
     "heading_out": heading_out,
+    "sweep_aside": sweep_aside,
     "hive_sort": hive_sort,
     ## added by Abhi
     "detect_requested_object": detect_requested_object,
@@ -1947,9 +2040,12 @@ def desk_operator_skill() -> str:
         "3. Register obstacles (e.g. mug, departure_tray) via `update_scene_obstacle(...)` before moving.\n"
         "4. Prefer composite tools (`move_to_pose`, `pick_at`, `place_at`, `execute_sequence`) or "
         "`solve_ik -> move_joint -> grasp` over raw `move_joints` tick guesses.\n"
-        "5. Before a localized reach, call `robo_jev_arm_watch` on the top target pixel and the wrist target pixel "
-        "when visible in both views, using the same query.\n"
-        "6. If anything shifts or stalls, call `estop()` immediately and re-`observe()`. "
+        "5. For pens and other rolling markers, preview `sweep_aside` to push them into the side pen zone "
+        "instead of grasping. Leave the intended push target out of registered obstacles.\n"
+        "6. Before reaching for a target that should stay still, call `robo_jev_arm_watch` on the top target pixel "
+        "and the wrist target pixel when visible in both views, using the same query. "
+        "The fixed-target watch does not run during `sweep_aside`, which deliberately moves the target.\n"
+        "7. If anything shifts or stalls, call `estop()` immediately and re-`observe()`. "
         "If Robo-Jev has already latched the emergency stop, re-`observe()` without replacing the reflex latch "
         "with a manual stop. Call `robo_jev_guard` and stop if it fails. "
         "Use its `world` result if it re-localized the target; otherwise obtain fresh world coordinates via "
