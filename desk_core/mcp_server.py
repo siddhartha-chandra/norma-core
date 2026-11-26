@@ -1461,9 +1461,10 @@ def desk_operator_skill() -> str:
         "`solve_ik -> move_joint -> grasp` over raw `move_joints` tick guesses.\n"
         "5. Before a localized reach, call `robo_jev_arm_watch` on the top target pixel and the wrist target pixel "
         "when visible in both views, using the same query.\n"
-        "6. If Robo-Jev stops the reach, call `robo_jev_guard` to re-localize; only on success, plan a new reach "
-        "from the current position to the returned world coordinates. Never resume the old trajectory. "
-        "For other unexpected slips, obstructions or stalls, call `estop()` and re-`observe()`."
+        "6. If anything shifts or stalls, call `estop()` immediately and re-`observe()`. "
+        "If Robo-Jev has already latched the emergency stop, re-`observe()` without replacing the reflex latch "
+        "with a manual stop. Then call `robo_jev_guard` to re-localize. Only on success, plan a fresh reach "
+        "from the stopped pose; never resume the interrupted trajectory."
     )
 
 

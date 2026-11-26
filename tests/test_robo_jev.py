@@ -193,6 +193,12 @@ def test_target_shift_during_final_correction_stops_remaining_writes(calib, monk
     assert corrections_sent == 1
 
 
+def test_operator_skill_requires_fresh_observation_before_reflex_recovery():
+    recovery_instructions = srv.desk_operator_skill().split("6. ", 1)[1]
+    assert recovery_instructions.index("`estop()`") < recovery_instructions.index("`observe()`")
+    assert recovery_instructions.index("`observe()`") < recovery_instructions.index("`robo_jev_guard`")
+
+
 @pytest.mark.parametrize("trigger_camera", ["top", "wrist"])
 def test_eight_cm_slide_halts_stream_and_allows_a_fresh_reach(mock_bridge, monkeypatch, trigger_camera):
     monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
