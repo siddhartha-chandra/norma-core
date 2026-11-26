@@ -11,9 +11,9 @@ Examples:
   # 2. Repeat Sunday-morning re-anchor using previously saved world_points (only 4 new clicks)
   uv run --offline --managed-python python scripts/reanchor_plane.py --live --interactive
 
-  # 3. Automatic <1s checkerboard re-anchor on a captured or live frame
+  # 3. Automatic <1s checkerboard re-anchor on a captured or live frame (matches calib_frames/session1/camera_calibration.json)
   uv run --offline --managed-python python scripts/reanchor_plane.py \\
-      --image calib_frames/scene_1/scene.jpg --checkerboard 7 5 --square-size-m 0.025
+      --image calib_frames/scene_1/scene.jpg --checkerboard 10 7 --square-size-m 0.015 --origin-hint 320 240
 
   # 4. Offline mock simulation re-anchor + move-above-pixel (<1 cm) verification (--mock implies --dry-run unless --calib is passed)
   DESK_MOCK_SYNTHETIC=1 uv run --offline --managed-python python scripts/reanchor_plane.py \\
