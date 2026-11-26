@@ -410,3 +410,25 @@ def test_mcp_localize_3d_logs_warning_on_sighting_write_failure(tmp_path, monkey
     assert res["found"] is True
     assert "sighting" not in res
     assert any("Failed to record sighting" in rec.message for rec in caplog.records)
+
+
+def test_drain_past_deadline_keeps_consuming_so_reader_finishes(tmp_path):
+    store = SightingsStore(normfs_client=_FakeNormFSClient(), db_path=tmp_path / "sightings.db")
+
+    class _Read:
+        data: asyncio.Queue
+
+    async def scenario():
+        qr = _Read()
+        qr.data = asyncio.Queue(maxsize=1)
+
+        async def reader():
+            for _ in range(5):
+                await qr.data.put(object())
+            await qr.data.put(None)
+
+        producer = asyncio.create_task(reader())
+        await store._drain_queue_read(qr, deadline=0.0)
+        await asyncio.wait_for(producer, timeout=1.0)
+
+    asyncio.run(scenario())
