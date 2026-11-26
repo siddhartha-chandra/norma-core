@@ -351,6 +351,30 @@ class SightingsStore:
             confidence=confidence,
         )
 
+    async def _drain_queue_read(
+        self, qr: Any, deadline: float
+    ) -> tuple[list[Sighting], bytes | None, int]:
+        entries: list[Sighting] = []
+        last_id: bytes | None = None
+        raw_count = 0
+        while time.monotonic() < deadline:
+            rem = max(0.05, deadline - time.monotonic())
+            try:
+                entry = await asyncio.wait_for(qr.data.get(), timeout=rem)
+            except asyncio.TimeoutError:
+                break
+            if entry is None:
+                break
+            raw_count += 1
+            raw_id = getattr(getattr(entry, "ID", None), "ID", None)
+            if isinstance(raw_id, (bytes, bytearray, memoryview)):
+                last_id = bytes(raw_id)
+            try:
+                entries.append(Sighting.from_bytes(entry.Data))
+            except Exception as exc:
+                log.debug("Skipping malformed NormFS sighting entry: %s", exc)
+        return entries, last_id, raw_count
+
     async def read_normfs(
         self,
         limit: int = 1000,
@@ -365,31 +389,43 @@ class SightingsStore:
         if client is None:
             return []
 
-        fetch_limit = max(limit, 1000) if (label is not None or before_time is not None) else limit
-        buf_size = min(max(fetch_limit, 16), 256)
+        deadline = time.monotonic() + self.timeout_s
+        filtered = label is not None or before_time is not None
+
+        # When filtering by label/time, paginate from offset 0 so sightings older than
+        # a fixed tail window are never silently missed.
+        if filtered and hasattr(client, "read_from_offset"):
+            page_size = 1000
+            buf_size = 256
+            next_idx = 0
+            matched: list[Sighting] = []
+            want_label = label.strip().casefold() if label is not None else None
+            cutoff = float(before_time) if before_time is not None else None
+            while time.monotonic() < deadline:
+                offset = next_idx.to_bytes(8, "little") if next_idx > 0 else b"\x00"
+                qr = client.read_from_offset(self.queue_id, offset=offset, limit=page_size, step=1, buf_size=buf_size)
+                page, last_id, raw_count = await self._drain_queue_read(qr, deadline)
+                for s in page:
+                    if want_label is not None and s.label.casefold() != want_label:
+                        continue
+                    if cutoff is not None and s.time > cutoff:
+                        continue
+                    matched.append(s)
+                if raw_count < page_size or last_id is None:
+                    break
+                next_idx = int.from_bytes(last_id, "little") + 1
+            return _filter_and_sort(matched, limit=limit, label=label, before_time=before_time)
+
+        buf_size = min(max(limit, 16), 256)
         if hasattr(client, "read_from_tail"):
-            offset = (fetch_limit - 1).to_bytes(8, "little") if fetch_limit > 1 else b"\x00"
-            qr = client.read_from_tail(self.queue_id, offset=offset, limit=fetch_limit, step=1, buf_size=buf_size)
+            offset = (limit - 1).to_bytes(8, "little") if limit > 1 else b"\x00"
+            qr = client.read_from_tail(self.queue_id, offset=offset, limit=limit, step=1, buf_size=buf_size)
         elif hasattr(client, "read_from_offset"):
-            qr = client.read_from_offset(self.queue_id, offset=b"\x00", limit=fetch_limit, step=1, buf_size=buf_size)
+            qr = client.read_from_offset(self.queue_id, offset=b"\x00", limit=limit, step=1, buf_size=buf_size)
         else:
             return []
 
-        entries: list[Sighting] = []
-        deadline = time.monotonic() + self.timeout_s
-        while time.monotonic() < deadline:
-            rem = max(0.05, deadline - time.monotonic())
-            try:
-                entry = await asyncio.wait_for(qr.data.get(), timeout=rem)
-            except asyncio.TimeoutError:
-                break
-            if entry is None:
-                break
-            try:
-                entries.append(Sighting.from_bytes(entry.Data))
-            except Exception as exc:
-                log.debug("Skipping malformed NormFS sighting entry: %s", exc)
-
+        entries, _, _ = await self._drain_queue_read(qr, deadline)
         return _filter_and_sort(entries, limit=limit, label=label, before_time=before_time)
 
     def read_sqlite(

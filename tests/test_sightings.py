@@ -50,6 +50,13 @@ class _FakeNormFSClient:
         bucket.append((entry_id, bytes(data)))
         return memoryview(entry_id)
 
+    def read_from_offset(self, queue_id: str, offset: bytes, limit: int, step: int, buf_size: int) -> _FakeQueueRead:
+        bucket = self.queues.get(queue_id, [])
+        start = int.from_bytes(offset, "little") if offset else 0
+        selected = bucket[start : start + limit : max(1, step)]
+        entries = [_FakeEntry(_FakeEntryId(eid), memoryview(payload)) for eid, payload in selected]
+        return _FakeQueueRead(entries)
+
     def read_from_tail(self, queue_id: str, offset: bytes, limit: int, step: int, buf_size: int) -> _FakeQueueRead:
         bucket = self.queues.get(queue_id, [])
         if not bucket:
@@ -95,6 +102,25 @@ def test_normfs_primary_write_and_read(tmp_path):
     only_keys = asyncio.run(store.read_normfs(label="KEYS"))
     assert len(only_keys) == 1
     assert only_keys[0].frame_ref == "normfs://usbvideo/abc#01"
+
+
+def test_read_normfs_filtered_paginates_past_1000_entries(tmp_path):
+    client = _FakeNormFSClient()
+    store = SightingsStore(normfs_client=client, db_path=tmp_path / "sightings.db")
+
+    async def populate_and_query():
+        await store.record("keys", 0.11, 0.22, time_s=10.0, frame_ref="normfs://cam#0")
+        for i in range(1200):
+            await store.record("mug", 0.30, 0.02, time_s=100.0 + i, frame_ref=f"normfs://cam#{i + 1}")
+        by_label = await store.read_normfs(limit=10, label="keys")
+        by_cutoff = await store.read_normfs(limit=10, before_time=50.0)
+        return by_label, by_cutoff
+
+    by_label, by_cutoff = asyncio.run(populate_and_query())
+    assert len(by_label) == 1
+    assert by_label[0].frame_ref == "normfs://cam#0"
+    assert len(by_cutoff) == 1
+    assert by_cutoff[0].label == "keys"
 
 
 def test_sqlite_fallback_when_normfs_disabled(tmp_path, monkeypatch):
