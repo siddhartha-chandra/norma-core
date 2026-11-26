@@ -38,9 +38,16 @@ from typing import Any
 import cv2
 import numpy as np
 
+from dotenv import dotenv_values
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+if os.environ.get("DESK_NO_DOTENV") != "1":
+    for _k, _v in dotenv_values(REPO_ROOT / ".env").items():
+        if _v is not None and not os.environ.get(_k, "").strip():
+            os.environ[_k] = _v
 
 from desk_core.calib_store import CalibrationStore, resolve_default_calib_path  # noqa: E402
 from desk_core.homography import (  # noqa: E402
