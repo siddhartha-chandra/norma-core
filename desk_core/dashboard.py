@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
 from collections import deque
 from pathlib import Path
@@ -24,8 +25,8 @@ from typing import Any
 import cv2
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from . import mcp_server as srv
@@ -40,6 +41,21 @@ from .vision_3d import (
 )
 
 app = FastAPI(title="DESK-CORE Mission Control")
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    token = os.environ.get("DASHBOARD_TOKEN", "").strip()
+    if not token:
+        return await call_next(request)
+    given = request.query_params.get("token") or request.headers.get("x-dashboard-token") or request.cookies.get("dashboard_token")
+    if not given or not secrets.compare_digest(given, token):
+        return PlainTextResponse("Dashboard token required (open /?token=...)", status_code=401)
+    response = await call_next(request)
+    if request.query_params.get("token"):
+        response.set_cookie("dashboard_token", token, httponly=True, samesite="strict")
+    return response
 
 _action_log: deque[dict[str, Any]] = deque(maxlen=40)
 _last_detection: dict[str, Any] | None = None
@@ -207,11 +223,13 @@ async def api_arm_watch() -> dict[str, Any]:
         px = tuple(_last_detection["pixel"])
         q = _last_detection["query"]
         d = float(_last_detection["depth_m"])
+        cam = _last_detection.get("camera") or "top"
     else:
         px = (320.0, 240.0)
         q = "center-roi"
         d = 0.62
-    res = await srv.robo_jev_arm_watch(*px, query=q, depth_m=d)
+        cam = "top"
+    res = await srv.robo_jev_arm_watch(*px, query=q, camera=cam, depth_m=d)
     _log_event("ROBO-JEV", f"Armed watch on {q} @ {res['ref_pixel']}")
     return res
 
@@ -863,6 +881,8 @@ async def index() -> str:
 def main() -> None:
     host = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("DASHBOARD_PORT", "8765"))
+    if host not in _LOOPBACK_HOSTS and not os.environ.get("DASHBOARD_TOKEN", "").strip():
+        raise SystemExit(f"Refusing to serve the dashboard on {host} without DASHBOARD_TOKEN; set one or bind 127.0.0.1.")
     uvicorn.run(app, host=host, port=port, log_level="info")
 
 
