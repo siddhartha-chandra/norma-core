@@ -1,7 +1,7 @@
 """MuJoCo preflight for unloaded ElRobot flange motions."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from pathlib import Path
 from typing import Callable
@@ -30,6 +30,7 @@ class JointPlan:
     waypoints: np.ndarray
     tuck_end: int | None
     peak_shoulder_torque_nm: float
+    cartesian_checks: dict[int, Callable[[np.ndarray], None]] = field(default_factory=dict)
 
 
 class MuJoCoPlanner:
@@ -61,7 +62,8 @@ class MuJoCoPlanner:
             self._add_obstacle(spec, obstacle, i)
         for geom in spec.geoms:
             geom.margin = CONTACT_MARGIN_M
-        self.model = spec.compile()
+        self.spec = spec
+        self.model = self.spec.compile()
         self.data = mujoco.MjData(self.model)
         joints = [self.model.joint(name).id for name in DEFAULT_ARM_JOINTS]
         self.qadr = self.model.jnt_qposadr[joints]
@@ -137,6 +139,25 @@ class MuJoCoPlanner:
         self._forward(q)
         return self.data.xpos[self.flange].copy(), Rotation.from_matrix(self.data.xmat[self.flange].reshape(3, 3))
 
+    def jaw_tip_offset(self, q: np.ndarray, rotation: Rotation, nominal_tip: np.ndarray) -> np.ndarray:
+        """Use the nominal tip XY with the lowest point of either jaw at the requested orientation."""
+        flange, actual = self.flange_pose(q)
+        lowest = np.inf
+        for geom_id, body_id in enumerate(self.model.geom_bodyid):
+            if not self.model.body(body_id).name.startswith("Gripper_Jaw_"):
+                continue
+            mesh = self.model.geom_dataid[geom_id]
+            first, count = self.model.mesh_vertadr[mesh], self.model.mesh_vertnum[mesh]
+            verts = self.model.mesh_vert[first:first + count]
+            geom_rotation = self.data.geom_xmat[geom_id].reshape(3, 3)
+            world = verts @ geom_rotation.T + self.data.geom_xpos[geom_id]
+            lowest = min(lowest, (rotation * actual.inv()).apply(world - flange)[:, 2].min())
+        if not np.isfinite(lowest):
+            raise PlanningError("MuJoCo model is missing gripper jaw geometry")
+        offset = rotation.apply(nominal_tip)
+        offset[2] = lowest
+        return rotation.inv().apply(offset)
+
     def _shoulder_torque(self) -> float:
         # Holding torque = -axis · (lever arm × total downstream gravity force).
         lever = self.data.subtree_com[self.shoulder_body] - self.data.xanchor[self.shoulder]
@@ -201,9 +222,12 @@ class MuJoCoPlanner:
         raise PlanningError(f"MuJoCo IK rejected: {failure}")
 
     def _validate_path(self, points: list[np.ndarray],
-                       quantize: Callable[[np.ndarray], np.ndarray], sequential: bool = False) -> JointPlan:
+                       quantize: Callable[[np.ndarray], np.ndarray], sequential: bool = False,
+                       check: Callable[[np.ndarray], None] | None = None) -> JointPlan:
         path = [quantize(points[0])]
         peak = self._check(path[0])
+        if check is not None:
+            check(path[0])
         tuck_end = None
         for i, (start, end) in enumerate(zip(points, points[1:])):
             count = max(1, math.ceil(float(np.max(np.abs(end - start))) / MAX_WAYPOINT_STEP_RAD))
@@ -214,10 +238,13 @@ class MuJoCoPlanner:
                         for axis in np.flatnonzero(commanded != path[-1]):
                             single = path[-1].copy()
                             single[axis] = commanded[axis]
-                            peak = max(peak, self.validate_segment(path[-1], single))
+                            segment = self._validate_path([path[-1], single], np.copy, check=check)
+                            peak = max(peak, segment.peak_shoulder_torque_nm)
                             path.append(single)
                     else:
                         peak = max(peak, self._check(commanded))
+                        if check is not None:
+                            check(commanded)
                         if not np.array_equal(commanded, q):
                             self._check(q)
                         if not np.array_equal(commanded, path[-1]):
@@ -231,6 +258,35 @@ class MuJoCoPlanner:
     def validate_segment(self, start: np.ndarray, goal: np.ndarray) -> float:
         """Check a direct segment from the measured pose to a preflighted target."""
         return self._validate_path([start, goal], np.copy).peak_shoulder_torque_nm
+
+    def validate_cartesian_segment(self, start: np.ndarray, goal: np.ndarray, *,
+                                   check: Callable[[np.ndarray], None]) -> float:
+        return self._validate_path([start, goal], np.copy, check=check).peak_shoulder_torque_nm
+
+    def plan_cartesian_segment(self, start: np.ndarray, from_xyz: np.ndarray, to_xyz: np.ndarray,
+                               rotation: Rotation, tip_in_flange: np.ndarray, *,
+                               quantize: Callable[[np.ndarray], np.ndarray], sequential: bool) -> JointPlan:
+        """Solve and check the motion of a fixed tool point along a Cartesian line."""
+        delta = to_xyz - from_xyz
+        length = float(np.linalg.norm(delta))
+        direction = delta / length
+        flange_offset = rotation.apply(tip_in_flange)
+        points = [start]
+        for distance in np.linspace(0, length, math.ceil(length / 0.005) + 1)[1:]:
+            xyz = from_xyz + distance * direction - flange_offset
+            points.append(self.solve_ik(xyz, rotation.as_quat(), points[-1]))
+
+        def check(q):
+            flange, actual = self.flange_pose(q)
+            tip = flange + actual.apply(tip_in_flange)
+            along = np.clip((tip - from_xyz) @ direction, 0, length)
+            if (np.linalg.norm(tip - from_xyz - along * direction) > 0.004
+                    or (actual * rotation.inv()).magnitude() > math.radians(3)):
+                raise PlanningError("Joint motion deviates from the Cartesian line")
+
+        plan = self._validate_path(points, quantize, sequential, check)
+        plan.cartesian_checks = dict.fromkeys(range(1, len(plan.waypoints)), check)
+        return plan
 
     def plan_trajectory(self, start, goal, quantize: Callable[[np.ndarray], np.ndarray] | None = None, *,
                         sequential: bool = False) -> JointPlan:
