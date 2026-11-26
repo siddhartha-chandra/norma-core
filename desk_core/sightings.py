@@ -380,19 +380,25 @@ class SightingsStore:
         while True:
             entries: list[Sighting] = []
             first_id = None
-            while (remaining := deadline - time.monotonic()) > 0:
-                try:
-                    entry = await asyncio.wait_for(qr.data.get(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    break
-                if entry is None:
-                    break
-                if page_back and first_id is None:
-                    first_id = bytes(entry.ID.ID)
-                try:
-                    entries.append(Sighting.from_bytes(entry.Data))
-                except Exception as exc:
-                    log.debug("Skipping malformed NormFS sighting entry: %s", exc)
+            finished = False
+            try:
+                while (remaining := deadline - time.monotonic()) > 0:
+                    try:
+                        entry = await asyncio.wait_for(qr.data.get(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        break
+                    if entry is None:
+                        finished = True
+                        break
+                    if page_back and first_id is None:
+                        first_id = bytes(entry.ID.ID)
+                    try:
+                        entries.append(Sighting.from_bytes(entry.Data))
+                    except Exception as exc:
+                        log.debug("Skipping malformed NormFS sighting entry: %s", exc)
+            finally:
+                if not finished and hasattr(qr, "aclose"):
+                    await qr.aclose()
 
             matches = _filter_and_sort(matches + entries, limit=limit, label=label, before_time=before_time)
             if not first_id or time.monotonic() >= deadline:

@@ -3,14 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 from desk_core import mcp_server as srv
+from desk_core import sightings as sightings_module
 from desk_core.sightings import DEFAULT_NORMFS_QUEUE, Sighting, SightingsStore
 from desk_core.station_bridge import LiveStationBridge, MockStationBridge
+from station_py import Client
+from target.gen_python.protobuf.normfs import normfs as normfs_pb2
 
 
 @dataclass
@@ -245,6 +250,57 @@ def test_mcp_history_finds_matches_beyond_first_normfs_page(tmp_path, monkeypatc
         assert (await srv.last_seen("keys"))["frame_ref"] == "old-keys"
         assert (await srv.where_was("pen", 30.0))["frame_ref"] == "old-pen"
         assert (await srv.last_seen("pen"))["frame_ref"] == "new-pen"
+
+    asyncio.run(run())
+
+
+def test_normfs_page_deadline_cancels_backpressured_reader(tmp_path, monkeypatch):
+    sighting = Sighting("keys", 0.2, 0.1, 20.0, "old-keys")
+    from_bytes = Sighting.from_bytes
+    now = 0.0
+
+    async def wait_for_connection(self):
+        await asyncio.Future()
+
+    def expire_after_first_entry(data):
+        nonlocal now
+        now = 5.0
+        return from_bytes(data)
+
+    monkeypatch.setattr(Client, "manage_connection", wait_for_connection)
+    monkeypatch.setattr(sightings_module, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(Sighting, "from_bytes", staticmethod(expire_after_first_entry))
+
+    async def run():
+        client = Client("localhost:8888", logging.getLogger(__name__))
+        client.connected = client.setup_done = True
+        page = client.read_from_tail(DEFAULT_NORMFS_QUEUE, offset=b"\x00", limit=4, step=1, buf_size=1)
+        backpressured = asyncio.Event()
+        put = page.data.put
+
+        async def track_put(entry):
+            if page.data.full():
+                backpressured.set()
+            await put(entry)
+
+        monkeypatch.setattr(page.data, "put", track_put)
+        await asyncio.wait_for(client.c2s.get(), timeout=1.0)
+        read_id, responses = next(iter(client.pending_reads.items()))
+        response_type = normfs_pb2.ReadResponse_Result
+        def respond(result, **fields):
+            response = normfs_pb2.ServerResponse(read=normfs_pb2.ReadResponse(read_id=read_id, result=result, **fields))
+            responses.put_nowait(normfs_pb2.ServerResponseReader(response.encode()))
+
+        respond(response_type.RR_START)
+        for _ in range(3):
+            respond(response_type.RR_ENTRY, id=normfs_pb2.Id(raw=b"\x00"), data=sighting.to_bytes())
+
+        await asyncio.wait_for(backpressured.wait(), timeout=1.0)
+        monkeypatch.setattr(client, "read_from_tail", lambda *args, **kwargs: page)
+        store = SightingsStore(normfs_client=client, db_path=tmp_path / "sightings.db", normfs_enabled=True)
+        assert await asyncio.wait_for(store.read_normfs(label="keys", limit=1), timeout=1.0) == [sighting]
+        assert not client.pending_reads
+        assert page._task.cancelled()
 
     asyncio.run(run())
 
