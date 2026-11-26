@@ -46,7 +46,7 @@ class _FakeNormFSClient:
         if self.fail_write is not None:
             raise self.fail_write
         bucket = self.queues.setdefault(queue_id, [])
-        entry_id = len(bucket).to_bytes(8, "big")
+        entry_id = len(bucket).to_bytes(8, "little")
         bucket.append((entry_id, bytes(data)))
         return entry_id
 
@@ -56,6 +56,11 @@ class _FakeNormFSClient:
             return _FakeQueueRead([])
         shift = int.from_bytes(offset, "little") if offset else 0
         start = max(0, len(bucket) - 1 - shift)
+        return self.read_from_offset(queue_id, start.to_bytes(8, "little"), limit, step, buf_size)
+
+    def read_from_offset(self, queue_id: str, offset: bytes, limit: int, step: int, buf_size: int) -> _FakeQueueRead:
+        bucket = self.queues.get(queue_id, [])
+        start = int.from_bytes(offset, "little")
         selected = bucket[start : start + limit : max(1, step)]
         entries = [_FakeEntry(_FakeEntryId(eid), memoryview(payload)) for eid, payload in selected]
         return _FakeQueueRead(entries)
@@ -216,6 +221,30 @@ def test_mcp_history_reads_normfs_and_sqlite_on_cold_start(tmp_path, monkeypatch
         assert await srv.where_was("keys", 150.0) == {
             "found": True, "label": "keys", "x": 0.20, "y": 0.01, "time": 100.0, "frame_ref": "mock://top#1",
         }
+
+    asyncio.run(run())
+
+
+def test_mcp_history_finds_matches_beyond_first_normfs_page(tmp_path, monkeypatch, mock_bridge):
+    client = _FakeNormFSClient()
+    store = SightingsStore(normfs_client=client, db_path=tmp_path / "sightings.db", normfs_enabled=True)
+    monkeypatch.setattr(srv, "_sightings", store)
+    monkeypatch.setattr(srv, "_bridge", mock_bridge)
+
+    async def run():
+        await store.record("keys", 0.2, 0.1, time_s=20.0, frame_ref="old-keys")
+        await store.record("pen", 0.3, 0.1, time_s=30.0, frame_ref="old-pen")
+        for _ in range(1000):
+            await store.record("mug", 0.2, 0.1, time_s=40.0, frame_ref="mug")
+        await store.record("pen", 0.1, 0.2, time_s=50.0, frame_ref="new-pen")
+
+        client.connected = False
+        await store.record("keys", 0.4, 0.1, time_s=10.0, frame_ref="older-sqlite-keys")
+        client.connected = True
+
+        assert (await srv.last_seen("keys"))["frame_ref"] == "old-keys"
+        assert (await srv.where_was("pen", 30.0))["frame_ref"] == "old-pen"
+        assert (await srv.last_seen("pen"))["frame_ref"] == "new-pen"
 
     asyncio.run(run())
 

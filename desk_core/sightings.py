@@ -361,32 +361,53 @@ class SightingsStore:
         if client is None:
             return []
 
-        fetch_limit = max(limit, 1000) if (label is not None or before_time is not None) else limit
+        filtered = label is not None or before_time is not None
+        fetch_limit = max(limit, 1000) if filtered else limit
         buf_size = min(max(fetch_limit, 16), 256)
+        page_back = False
         if hasattr(client, "read_from_tail"):
             offset = (fetch_limit - 1).to_bytes(8, "little") if fetch_limit > 1 else b"\x00"
             qr = client.read_from_tail(self.queue_id, offset=offset, limit=fetch_limit, step=1, buf_size=buf_size)
+            page_back = filtered and hasattr(client, "read_from_offset")
         elif hasattr(client, "read_from_offset"):
             qr = client.read_from_offset(self.queue_id, offset=b"\x00", limit=fetch_limit, step=1, buf_size=buf_size)
         else:
             return []
 
-        entries: list[Sighting] = []
         deadline = time.monotonic() + self.timeout_s
-        while time.monotonic() < deadline:
-            rem = max(0.05, deadline - time.monotonic())
-            try:
-                entry = await asyncio.wait_for(qr.data.get(), timeout=rem)
-            except asyncio.TimeoutError:
-                break
-            if entry is None:
-                break
-            try:
-                entries.append(Sighting.from_bytes(entry.Data))
-            except Exception as exc:
-                log.debug("Skipping malformed NormFS sighting entry: %s", exc)
+        matches: list[Sighting] = []
+        previous_end = None
+        while True:
+            entries: list[Sighting] = []
+            first_id = None
+            while (remaining := deadline - time.monotonic()) > 0:
+                try:
+                    entry = await asyncio.wait_for(qr.data.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+                if entry is None:
+                    break
+                if page_back and first_id is None:
+                    first_id = bytes(entry.ID.ID)
+                try:
+                    entries.append(Sighting.from_bytes(entry.Data))
+                except Exception as exc:
+                    log.debug("Skipping malformed NormFS sighting entry: %s", exc)
 
-        return _filter_and_sort(entries, limit=limit, label=label, before_time=before_time)
+            matches = _filter_and_sort(matches + entries, limit=limit, label=label, before_time=before_time)
+            if not first_id or time.monotonic() >= deadline:
+                break
+            end = int.from_bytes(first_id, "little")
+            if end == 0 or (previous_end is not None and end >= previous_end):
+                break
+            start = max(0, end - fetch_limit)
+            previous_end = end
+            qr = client.read_from_offset(
+                self.queue_id, offset=start.to_bytes(len(first_id), "little"),
+                limit=end - start, step=1, buf_size=buf_size,
+            )
+
+        return matches
 
     def read_sqlite(
         self,
