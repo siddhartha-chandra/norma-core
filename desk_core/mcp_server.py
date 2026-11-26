@@ -370,7 +370,7 @@ async def go_home(look_at_table: bool = True) -> dict:
 
     if hasattr(bridge, "set_mock_ee_pose"):
         bridge.set_mock_ee_pose(0.0, 0.27, 0.25 if look_at_table else 0.22)
-    return {"home": targets, "applied": applied, "look_at_table": look_at_table, "settled": settled}
+    return {"ok": settled, "home": targets, "applied": applied, "look_at_table": look_at_table, "settled": settled}
 
 
 ### 9. Return to the calibrated saved home
