@@ -179,7 +179,7 @@ Tool names are the public contract. Agents should call them by name.
 | **Observation** | `observe(views, denoise)`, `get_state`, `get_frame(camera)`, `get_joint_angles(include_gripper)`, `get_calib_status`, `reload_config` |
 | **Bare-metal control** | `set_torque`, `move_joints(targets, max_step, wait)`, `move_joint(...)`, `grasp(close_ticks)`, `release`, `go_home`, `move_to_home(max_step, timeout_s)`, `estop` |
 | **Kinematics and 3D** | `solve_ik(x, y, z, qx, qy, qz, qw)`, `get_metric_depth(x, y, camera, q_rad)`, `pixel_to_world(...)`, `localize_3d(...)` |
-| **Composite motion** | `plan_and_move` (MuJoCo preflight; dry run unless `execute=True`), `move_to_pose`, `move_flange` (dry run unless `execute=True`), `pick_at`, `place_at`, `pick_pixel(x, y, yaw)`, `execute_sequence(steps, stop_on_false)` |
+| **Composite motion** | `plan_and_move` and `sweep_aside` (MuJoCo preflight; dry run unless `execute=True`), `move_to_pose`, `move_flange` (dry run unless `execute=True`), `pick_at`, `place_at`, `pick_pixel(x, y, yaw)`, `execute_sequence(steps, stop_on_false)` |
 | **Wrist-stereo pipeline** | `detect_requested_object`, `aim_wrist`, `capture_wrist_stereo`, `estimate_wrist_depth`, `measure_graspability`, `estimate_grasp_pose` (legacy), `plan_tolerant_grasp`, `retract_to_hover`, `move_to_drop`, `master_pick_place` |
 | **Wrist final approach** | `servo_align_wrist(tol_mm=1.5)` |
 | **Safety and scene** | `update_scene_obstacle`, `robo_jev_arm_watch`, `robo_jev_check`, `robo_jev_guard`, `speak_status` |
@@ -220,6 +220,19 @@ turns the jaws perpendicular to the marker's long axis. It uses local CPU vision
 It reuses the MuJoCo path preflight with a 1.5 s control deadline; live Station feedback and settling can reduce
 the update rate. For live use, configure the measured wrist calibration and camera ID, enable arm
 torque, and set an appropriate `shoulder_torque_limit_nm` model budget in the active rig JSON.
+
+Use `sweep_aside(start_xy, end_xy, z_mm)` to push a rolling marker instead of grasping it.
+XY points are jaw-tip midpoint coordinates in `base_link` meters. `z_mm` is the clearance from the
+calibrated top of the desk mat to the lowest jaw, not the flange height or a camera depth.
+Start behind the marker and choose an end point in the side pen zone. Register obstacles along the
+route, but leave the intended push target out of the obstacle list. The open jaws approach from above,
+descend, sweep at constant height, and lift vertically. It preflights the entire route with the same
+collision and shoulder holding-torque checks (`shoulder_torque_limit_nm` defaults to 0.6 N·m).
+Call again with `execute=True` to move, then re-observe to confirm the marker arrived; a successful
+return confirms arm motion, not the marker's position. Calibrate the tabletop to the mat surface first.
+
+The rolling-marker contact test can be run without hardware with `uv run pytest -s tests/test_sweep_aside.py`.
+It drives the ElRobot collision geometry with the live bridge's single-joint commands and simulated encoder feedback.
 
 ### 4.2 Motion lock and run log
 
@@ -359,7 +372,9 @@ Recorded results: the wrist mount was refit on 19 poses, and a 4-pose held-out v
 | `will_tip` | Proximity to fragile obstacles (for example a mug) or a high-aspect target | Margin-based |
 | `path_clear` | 2D segment from end effector to target intersects a registered obstacle | Geometric |
 
-On a trigger, the gatekeeper calls `bridge.abort()`. Workspace bounds are `x ∈ [0.08, 0.44]` m, `y ≤ 0.26` m, and `z ≤ 0.35` m. `guarded_recover` is the recovery path after a trigger; the dashboard exposes guarded recover controls for it.
+Arm a localized target with `robo_jev_arm_watch` before starting a reach. Use separate top and wrist pixels and the same query when the object is visible in both views. `master_pick_place` arms the top view at scene localization and adds the wrist crop once stereo confirms the target. A wrist watch uses the current joint pose to account for camera translation in the image.
+
+Armed crops are checked while streaming, independently of the agent. A hazard calls `bridge.abort(source="reflex")` and ends the interrupted trajectory. If Robo-Jev has already latched the stop, the agent calls `observe()` before `robo_jev_guard` (also available from the dashboard), then plans a new reach from the stopped pose after successful recovery. Observing the cameras does not clear a reflex stop, and guarded recovery cannot clear a manual E-stop. If the agent notices a shift or stall before Robo-Jev stops the arm, call `estop()` immediately and re-observe.
 
 ### 5.9 Replay and observability
 
