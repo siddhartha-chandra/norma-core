@@ -42,6 +42,7 @@ from .vision_3d import (
 
 app = FastAPI(title="DESK-CORE Mission Control")
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_armed_camera = "top"
 
 
 @app.middleware("http")
@@ -229,7 +230,9 @@ async def api_arm_watch() -> dict[str, Any]:
         q = "center-roi"
         d = 0.62
         cam = "top"
+    global _armed_camera
     res = await srv.robo_jev_arm_watch(*px, query=q, camera=cam, depth_m=d)
+    _armed_camera = cam
     _log_event("ROBO-JEV", f"Armed watch on {q} @ {res['ref_pixel']}")
     return res
 
@@ -242,7 +245,7 @@ async def api_check_reflex() -> dict[str, Any]:
         bridge=bridge,
         calib=srv._calib,
         obstacles=list(srv._obstacles.values()),
-        camera="top",
+        camera=_armed_camera,
     )
     if res.get("aborted"):
         srv._tts.speak(f"Reflex abort: {res['reason'].replace('_', ' ')}.")
