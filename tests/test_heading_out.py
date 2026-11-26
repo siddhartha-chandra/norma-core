@@ -7,7 +7,7 @@ import pytest
 
 from desk_core import mcp_server as srv
 from desk_core.dashboard import api_frame
-from desk_core.station_bridge import MockStationBridge
+from desk_core.station_bridge import LiveStationBridge, MockStationBridge
 
 
 @pytest.fixture
@@ -17,6 +17,7 @@ def desk(monkeypatch):
     bridge = MockStationBridge()
     monkeypatch.setattr(srv, "_bridge", bridge)
     monkeypatch.setattr(srv, "_obstacles", {})
+    monkeypatch.setattr(srv, "_unlocalized_obstacles", set())
     monkeypatch.setattr(srv, "_overlay_path", ())
     return bridge
 
@@ -121,6 +122,7 @@ def test_live_detections_register_primitives_without_moving(monkeypatch):
 
     monkeypatch.setattr(srv, "_bridge", CameraOnly())
     monkeypatch.setattr(srv, "_obstacles", {})
+    monkeypatch.setattr(srv, "_unlocalized_obstacles", set())
     monkeypatch.setattr(srv, "_overlay_path", ())
     detection = AsyncMock(side_effect=detector)
     monkeypatch.setattr(srv, "localize_object_3d", detection)
@@ -133,3 +135,31 @@ def test_live_detections_register_primitives_without_moving(monkeypatch):
     assert tray.shape == "box" and tray.y == -0.10
     assert mug.z - mug.height_m / 2 == pytest.approx(srv._calib.z_table())
     assert tray.z - tray.size_xyz[2] / 2 == pytest.approx(srv._calib.z_table())
+
+
+def test_missed_live_mug_is_retired_and_blocks_mujo_co_preflight(monkeypatch):
+    live = LiveStationBridge.__new__(LiveStationBridge)
+    live.get_frame = AsyncMock(return_value=b"test camera frame")
+    live.get_state = AsyncMock()
+    monkeypatch.setattr(srv, "_bridge", live)
+    monkeypatch.setattr(srv, "_obstacles", {})
+    monkeypatch.setattr(srv, "_unlocalized_obstacles", set())
+    monkeypatch.setattr(srv, "_overlay_path", ())
+    vision = AsyncMock(side_effect=[
+        {"found": False},
+        {"found": True, "backend": "gemini", "size_m": [0.08, 0.10], "world": {"x": 0.25, "y": -0.10}},
+    ])
+    monkeypatch.setattr(srv, "localize_object_3d", vision)
+
+    async def run():
+        await srv.update_scene_obstacle("mug", 0.20, 0.10)
+        report = await srv.heading_out(execute=True)
+        assert not report["executed"] and report["unlocalized_obstacles"] == ["mug"]
+        assert set(srv._obstacles) == {"departure_tray"}
+        plan = await srv.plan_and_move(0.20, 0.10, 0.15, 0.60)
+        assert not plan["ok"] and plan["problems"] == ["Obstacle positions unknown: mug"]
+        live.get_state.assert_not_awaited()
+        await srv.update_scene_obstacle("mug", 0.21, 0.11)
+        assert not srv._unlocalized_obstacles
+
+    asyncio.run(run())

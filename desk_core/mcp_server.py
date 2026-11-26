@@ -68,6 +68,7 @@ _connect_cooldown_until = 0.0
 _calib = CalibrationStore()
 _ik = IKAdapter()
 _obstacles: dict[str, SceneObstacle] = {}
+_unlocalized_obstacles: set[str] = set()
 _overlay_path: tuple = ()
 _hive_tiles = TypeAdapter(list[Tile])
 _robo_jev = RoboJevGatekeeper()
@@ -822,6 +823,7 @@ async def update_scene_obstacle(
             name=name, shape=shape, x=float(x), y=float(y), z=float(z),
             radius_m=float(radius_m), height_m=float(height_m), size_xyz=size_xyz,
         )
+    _unlocalized_obstacles.discard(name)
     return {"obstacles": sorted(_obstacles.keys())}
 
 
@@ -835,6 +837,7 @@ async def get_calib_status() -> dict:
         "calibration": _calib.status(),
         "ik_backend": _ik.backend_name(),
         "obstacles": [vars(o) for o in _obstacles.values()],
+        "unlocalized_obstacles": sorted(_unlocalized_obstacles),
     }
 
 
@@ -922,6 +925,9 @@ async def plan_and_move(
     _overlay_path = ()
     bridge = await _get_bridge()
     live = isinstance(bridge, LiveStationBridge)
+    if live and _unlocalized_obstacles:
+        names = ", ".join(sorted(_unlocalized_obstacles))
+        return {"ok": False, "executed": False, "problems": [f"Obstacle positions unknown: {names}"]}
     if execute and not (live or isinstance(bridge, MockStationBridge)):
         return {"ok": False, "executed": False, "problems": ["Unsupported Station bridge"]}
     if isinstance(bridge, MockStationBridge) and bridge.get_mock_scene_state()["held_object"]:
@@ -1177,11 +1183,16 @@ async def mock_reset_scene() -> dict:
 
 
 async def _observe_heading_out_obstacles(bridge: StationBridge) -> None:
+    targets = (("coffee mug", "mug", 0.10), ("Departure Tray", "departure_tray", 0.02))
+    for _, name, _ in targets:
+        _obstacles.pop(name, None)
+        _unlocalized_obstacles.add(name)
+
     table = _calib.z_table()
-    jpeg = await bridge.get_frame("top", denoise=True)
     if _calib.T_world_cam("top") is None:
         return
-    for query, name, height in (("coffee mug", "mug", 0.10), ("Departure Tray", "departure_tray", 0.02)):
+    jpeg = await bridge.get_frame("top", denoise=True)
+    for query, name, height in targets:
         detection = await localize_object_3d(jpeg, query, _calib, z_m=table + height, camera="top")
         if not detection["found"] or detection["backend"] == "opencv-fallback":
             continue
@@ -1212,6 +1223,7 @@ async def heading_out(execute: bool = False) -> dict:
     if not isinstance(bridge, MockStationBridge):
         await _observe_heading_out_obstacles(bridge)
         return {"ok": False, "executed": False,
+                "unlocalized_obstacles": sorted(_unlocalized_obstacles),
                 "problems": ["Heading Out transfer requires mock mode; live grasp and payload are not calibrated"]}
 
     scene = bridge.get_mock_scene_state()
