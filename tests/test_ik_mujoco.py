@@ -166,7 +166,7 @@ def live_station(scene, calib, monkeypatch):
 
 
 def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_station, calib, monkeypatch):
-    _, state, packets = live_station
+    bridge, state, packets = live_station
     monkeypatch.setitem(calib.data["joint_signs"], "2", -1)
     monkeypatch.setitem(calib.data["joint_zero_ticks"], "2", 2057)
     planner = mcp_server._mujoco_planner(state, [], 0.6)
@@ -175,6 +175,15 @@ def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_
     target[1] -= 0.2
     xyz, rotation = planner.flange_pose(target)
     args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
+    send = bridge._send_commands
+
+    async def send_with_shoulder_sag(client, commands):
+        previous = state.positions()[2]
+        await send(client, commands)
+        if state.motors[1].position > previous:
+            state.motors[1].position -= 1
+
+    monkeypatch.setattr(bridge, "_send_commands", send_with_shoulder_sag)
 
     async def run():
         start_ticks = state.positions()
@@ -190,7 +199,8 @@ def test_live_plan_uses_rig_alignment_and_sends_nothing_for_rejected_paths(live_
         assert len(packets) == moved["waypoints"] - 1
         assert all(8 not in target for target in packets)
         assert state.positions()[2] > start_ticks[2]
-        assert calib.ticks_to_rad(state.motors) == moved["joints_rad"]
+        assert state.positions()[2] == packets[-1][2] - 1
+        assert calib.ticks_to_rad(state.motors) == moved["measured_joints_rad"]
 
     asyncio.run(run())
 

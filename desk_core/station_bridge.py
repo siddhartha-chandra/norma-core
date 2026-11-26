@@ -1202,6 +1202,25 @@ class LiveStationBridge:
             await asyncio.sleep(0.08)
         return False
 
+    async def wait_preflight_settle(self, targets: dict[int, int], tol_ticks: int,
+                                    timeout_s: float = 3.0) -> RobotState | None:
+        deadline = time.monotonic() + timeout_s
+        previous = None
+        while time.monotonic() < deadline and not self._aborted:
+            state = await self.get_state()
+            self._require_fresh_motor_rx(state, targets)
+            pos = state.positions()
+            samples = {mid: self.rx_received_at[(state.bus_serial, mid)] for mid in targets}
+            if all(mid in pos and abs(pos[mid] - tick) <= tol_ticks for mid, tick in targets.items()):
+                if previous is None or previous[0] != pos:
+                    previous = (pos, samples)
+                elif all(stamp > previous[1][mid] for mid, stamp in samples.items()):
+                    return state
+            else:
+                previous = None
+            await asyncio.sleep(0.08)
+        return None
+
     ### 7. Verify grip after bounded closing steps
     ## added by Abhi
     def _gripper_rx(self, state: RobotState, bus: str, mid: int) -> tuple[MotorState, float]:

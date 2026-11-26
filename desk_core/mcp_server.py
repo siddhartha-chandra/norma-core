@@ -887,6 +887,7 @@ async def plan_and_move(
 ) -> dict:
     """Preflight a flange pose in MuJoCo. Live execution requires aligned, unloaded ElRobot hardware."""
     from .ik_mujoco import PlanningError
+    from .motion import FLANGE_SETTLE_TOL_TICKS
 
     bridge = await _get_bridge()
     live = isinstance(bridge, LiveStationBridge)
@@ -918,10 +919,10 @@ async def plan_and_move(
         if any(abs(second[mid] - tick) > DEFAULT_MAX_STEP for first, second in zip(targets, targets[1:])
                for mid, tick in first.items()):
             raise PlanningError("Preflight path exceeds Station's per-command step limit")
-        return plan, targets, planner.flange_pose(plan.waypoints[-1])[0]
+        return planner, plan, targets
 
     try:
-        plan, targets, position = await asyncio.to_thread(preflight)
+        planner, plan, targets = await asyncio.to_thread(preflight)
     except PlanningError as exc:
         return {"ok": False, "executed": False, "problems": [str(exc)]}
     result = {"ok": True, "executed": False, "waypoints": len(targets),
@@ -933,13 +934,21 @@ async def plan_and_move(
     if current.bus_serial != st.bus_serial or current.positions() != initial_ticks or list(_obstacles.values()) != obstacles:
         return {"ok": False, "executed": False, "problems": ["Start pose or obstacles changed during preflight"]}
     expected = replace(st, motors=motors)
-    for target in targets[1:]:
+    measured = plan.waypoints[0]
+    for index, target in enumerate(targets[1:], start=1):
         try:
             if live:
+                if plan.tuck_end is not None and index == plan.tuck_end + 1:
+                    initial = plan.waypoints[0]
+                    if (np.any(np.abs(measured[2:4] - initial[2:4]) < 1e-6)
+                            or abs(planner.shoulder_torque(measured)) >= abs(planner.shoulder_torque(initial))):
+                        raise PlanningError("Measured elbow/wrist tuck did not reduce shoulder torque")
+                peak = planner.validate_segment(measured, plan.waypoints[index])
+                result["peak_shoulder_torque_nm"] = max(peak, result["peak_shoulder_torque_nm"])
                 applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP, preflight_start=expected)
             else:
                 applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP)
-        except RuntimeError as exc:
+        except (PlanningError, RuntimeError) as exc:
             result.update(ok=False, problems=[str(exc)])
             return result
         result["executed"] = True
@@ -947,14 +956,27 @@ async def plan_and_move(
             result.update(ok=False, problems=["Station did not apply the preflighted waypoint"])
             return result
         if live:
-            if not await bridge.wait_settle(target, tol_ticks=0):
-                result.update(ok=False, problems=["Station did not settle at the exact preflighted waypoint"])
+            settled = await bridge.wait_preflight_settle(target, tol_ticks=FLANGE_SETTLE_TOL_TICKS)
+            if settled is None:
+                result.update(ok=False, problems=["Station did not settle near the preflighted waypoint"])
                 return result
-            expected = replace(expected, motors=[
-                replace(m, position=target.get(m.id, m.position)) for m in expected.motors
-            ])
+            positions = settled.positions()
+            if (settled.bus_serial != expected.bus_serial or positions.keys() != expected.positions().keys()
+                    or positions[8] != initial_ticks[8]):
+                result.update(ok=False, problems=["Station bus, motor inventory or gripper changed during execution"])
+                return result
+            expected = replace(expected, motors=[replace(m, position=positions[m.id]) for m in expected.motors])
+            measured = np.asarray(_calib.ticks_to_rad(expected.motors))
+            try:
+                torque = planner.validate_segment(measured, measured)
+            except PlanningError as exc:
+                result.update(ok=False, problems=[str(exc)])
+                return result
+            result["peak_shoulder_torque_nm"] = max(torque, result["peak_shoulder_torque_nm"])
+    if live:
+        result["measured_joints_rad"] = measured.tolist()
     if isinstance(bridge, MockStationBridge):
-        bridge.set_mock_ee_pose(*position)
+        bridge.set_mock_ee_pose(*planner.flange_pose(plan.waypoints[-1])[0])
     return result
 
 

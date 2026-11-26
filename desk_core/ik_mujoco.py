@@ -190,6 +190,10 @@ class MuJoCoPlanner:
                 tuck_end = len(path) - 1
         return JointPlan(np.asarray(path), tuck_end, peak)
 
+    def validate_segment(self, start: np.ndarray, goal: np.ndarray) -> float:
+        """Check a direct segment from the measured pose to a preflighted target."""
+        return self._validate_path([start, goal], np.copy).peak_shoulder_torque_nm
+
     def plan_trajectory(self, start, goal, quantize: Callable[[np.ndarray], np.ndarray] | None = None) -> JointPlan:
         """Preflight every waypoint, tucking j3/j4 before j2 changes on a lift."""
         quantize = quantize or np.copy

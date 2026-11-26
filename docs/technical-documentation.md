@@ -197,7 +197,8 @@ It rejects paths that do not clear these checks without issuing a joint target.
 rig calibration. Live execution requires fresh, fault-free telemetry, explicit calibrated joint signs
 and zeros, effective motor ranges, arm torque already enabled, and a fully open, unloaded gripper.
 The planner uses the same tick↔radian conversion as Desk Core FK; Station refuses to clamp or send
-a target from a different measured pose, and the next waypoint waits for an exact tick match.
+a target from a different measured pose. The next segment is checked from the stable measured pose,
+which must be within the same 15-tick tolerance used by the flange-motion stream.
 The model does not account for payload or dynamic torque. A simulation budget is not a hardware rating.
 To request just the MuJoCo IK solution, pass the same limit to `solve_ik`; without it the existing IK
 backend is unchanged. The other motion tools do not run this preflight.
