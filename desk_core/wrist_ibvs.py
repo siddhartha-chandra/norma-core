@@ -24,6 +24,7 @@ class Alignment:
     yaw_error_rad: float
     position: np.ndarray
     rotation: Rotation
+    roll_error_rad: float
 
 
 def _marker_moments(frame, center, K, dist, camera_pose, plane_z, optical_xy):
@@ -103,4 +104,4 @@ def alignment_step(frame, K, dist, camera_pose, flange_pose, plane_z) -> Alignme
     if distance > MAX_XY_STEP_M:
         correction *= MAX_XY_STEP_M / distance
     position[:2] += correction
-    return Alignment(float(error_m * 1000), yaw_error, position, next_rotation)
+    return Alignment(float(error_m * 1000), yaw_error, position, next_rotation, roll)

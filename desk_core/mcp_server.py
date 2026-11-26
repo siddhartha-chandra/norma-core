@@ -48,7 +48,7 @@ from .station_bridge import (DEFAULT_MAX_STEP, MAX_ANGLE_STEP, REPO_ROOT, LiveSt
 from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
 from .vision_3d import localize_object_3d
-from .wrist_ibvs import PERIOD_S, TIMEOUT_S, YAW_TOL_RAD, alignment_step
+from .wrist_ibvs import MAX_ROLL_STEP_RAD, PERIOD_S, TIMEOUT_S, YAW_TOL_RAD, alignment_step
 
 if TYPE_CHECKING:
     from .ik_mujoco import JointPlan, MuJoCoPlanner
@@ -997,6 +997,29 @@ async def _plan_and_move(x, y, z, shoulder_torque_limit_nm, qx, qy, qz, qw, exec
     )
 
 
+async def _prerotate_wrist(roll, torque_limit, *, expected_start, wrist_planner):
+    from .ik_mujoco import JointPlan, PlanningError
+    from .urdf_fk import load_urdf
+
+    def build(planner, start, quantize, _live):
+        axis = _calib.joint_names().index("rev_motor_07")
+        joint = load_urdf(_calib.urdf_path()).joints_by_name["rev_motor_07"]
+        if joint.axis[1] > -0.99:
+            raise PlanningError("Wrist roll axis does not match the ElRobot flange")
+        goal = start.copy()
+        goal[axis] -= roll
+        if not planner.lower[axis] <= goal[axis] <= planner.upper[axis]:
+            raise PlanningError("Wrist pre-rotation exceeds calibrated joint limits")
+        count = math.ceil(abs(roll) * TICKS_PER_RAD / DEFAULT_MAX_STEP)
+        waypoints = np.asarray([quantize(q) for q in np.linspace(start, goal, count + 1)])
+        peak = max(planner.validate_segment(a, b) for a, b in zip(waypoints, waypoints[1:]))
+        return JointPlan(waypoints, None, peak)
+
+    return await _run_mujoco_motion(
+        torque_limit, True, build, expected_start=expected_start, wrist_planner=wrist_planner,
+    )
+
+
 @mcp.tool()
 @_traced
 @_motion_tool
@@ -1688,6 +1711,7 @@ async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
 
     Start with the marker isolated and already near the wrist image center, gripper open and pointing down.
     This moves the arm but does not descend or grasp. The effective position tolerance is capped below 1 mm.
+    Large initial yaw errors get a wrist-only pre-rotation before the 1.5 s fine-alignment budget.
     """
     from .ik_tracik import TOOL_FRAME
 
@@ -1715,6 +1739,9 @@ async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
     next_sample = start
     measurement = None
     iterations = 0
+    fine_start = start
+    prerotation_start = None
+    prerotation_s = 0.0
     motion_in_flight = False
     error = None
     planner_key = planner = None
@@ -1728,7 +1755,7 @@ async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
         return planner
 
     try:
-        async with asyncio.timeout(TIMEOUT_S):
+        async with asyncio.timeout(TIMEOUT_S) as deadline:
             state = await bridge.get_state()
             if live:
                 state = _live_preflight_state(bridge, state)
@@ -1772,10 +1799,23 @@ async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
                         break
                     continue
                 motion_in_flight = True
-                move = await _plan_and_move(
-                    *measurement.position, limit, *measurement.rotation.as_quat(), True, expected_start=expected_start,
-                    wrist_planner=wrist_planner,
-                )
+                if (iterations == 1 and abs(measurement.yaw_error_rad) > YAW_TOL_RAD
+                        and abs(measurement.roll_error_rad) > MAX_ROLL_STEP_RAD):
+                    prerotation_start = time.monotonic()
+                    loop = asyncio.get_running_loop()
+                    deadline.reschedule(loop.time() + TIMEOUT_S)
+                    move = await _prerotate_wrist(
+                        measurement.roll_error_rad, limit, expected_start=expected_start, wrist_planner=wrist_planner,
+                    )
+                    fine_start = time.monotonic()
+                    prerotation_s = fine_start - prerotation_start
+                    prerotation_start = None
+                    deadline.reschedule(loop.time() + TIMEOUT_S)
+                else:
+                    move = await _plan_and_move(
+                        *measurement.position, limit, *measurement.rotation.as_quat(), True,
+                        expected_start=expected_start, wrist_planner=wrist_planner,
+                    )
                 motion_in_flight = False
                 if not move["ok"]:
                     error = "; ".join(move["problems"])
@@ -1793,7 +1833,12 @@ async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
                 await bridge.abort()
             except RuntimeError as exc:
                 error = f"{error or 'Wrist alignment interrupted.'} Station hold failed: {exc}"
-    result = {"ok": error is None, "elapsed_s": time.monotonic() - start, "iterations": iterations}
+    end = time.monotonic()
+    if prerotation_start is not None:
+        prerotation_s = end - prerotation_start
+        fine_start = end
+    result = {"ok": error is None, "elapsed_s": end - start, "iterations": iterations,
+              "prerotation_s": prerotation_s, "ibvs_s": end - fine_start}
     if error is not None:
         result["error"] = error
     if measurement is not None:

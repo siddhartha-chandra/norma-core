@@ -217,8 +217,10 @@ gripper pointing down and an isolated, elongated, saturated-color marker near th
 view. It projects the marker to the calibrated table plane, centers the camera's optical ray there, and
 turns the jaws perpendicular to the marker's long axis. It uses local CPU vision at a target rate of
 10 Hz, caps the centering tolerance at 0.99 mm, and requires yaw within 2° before returning success.
-It reuses the MuJoCo path preflight with a 1.5 s control deadline; live Station feedback and settling can reduce
-the update rate. For live use, configure the measured wrist calibration and camera ID, enable arm
+Large initial yaw errors trigger a wrist-only pre-rotation. MuJoCo checks the entire roll path before
+Station moves; the 1.5 s fine-alignment deadline starts after that pre-rotation. The result reports
+`prerotation_s`, `ibvs_s`, and total `elapsed_s`. Live Station feedback and settling can reduce the
+update rate. For live use, configure the measured wrist calibration and camera ID, enable arm
 torque, and set an appropriate `shoulder_torque_limit_nm` model budget in the active rig JSON.
 
 Use `sweep_aside(start_xy, end_xy, z_mm)` to push a rolling marker instead of grasping it.

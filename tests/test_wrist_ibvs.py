@@ -1,5 +1,6 @@
 import asyncio
 import math
+import time
 from types import SimpleNamespace
 
 import cv2
@@ -9,7 +10,7 @@ from scipy.spatial.transform import Rotation
 
 from desk_core import mcp_server
 from desk_core.pose_estimation import pixels_on_plane
-from desk_core.station_bridge import LiveStationBridge, MockStationBridge
+from desk_core.station_bridge import LiveStationBridge, MockStationBridge, RobotState
 from desk_core.stereo_sweep import _blob_mask
 from desk_core.wrist_ibvs import alignment_step
 
@@ -23,12 +24,12 @@ MOUNT[:3, :3] = Rotation.from_euler("x", -90, degrees=True).as_matrix()
 MOUNT[:3, 3] = [0.004, 0, 0.01]
 
 
-def frame_of_marker(camera, center, yaw_deg):
+def frame_of_marker(camera, center, yaw_deg, plane_z=0.0):
     yaw = math.radians(yaw_deg)
     major = np.array([math.cos(yaw), math.sin(yaw)]) * 0.018
     minor = np.array([-math.sin(yaw), math.cos(yaw)]) * 0.005
     corners = np.array([center + a * major + b * minor for a, b in ((-1, -1), (-1, 1), (1, 1), (1, -1))])
-    points = (np.c_[corners, np.zeros(4)] - camera[:3, 3]) @ camera[:3, :3]
+    points = (np.c_[corners, np.full(4, plane_z)] - camera[:3, 3]) @ camera[:3, :3]
     image_points = points @ K.T
     frame = np.full((480, 640, 3), 200, dtype=np.uint8)
     cv2.fillConvexPoly(frame, np.rint(image_points[:, :2] / image_points[:, 2:]).astype(np.int32), (0, 30, 220))
@@ -153,3 +154,74 @@ def test_live_feedback_skips_frames_from_before_settle(monkeypatch, calib, settl
     assert result["ok"]
     assert result["iterations"] == 2
     assert accepted == [0, 200]
+
+
+@pytest.mark.parametrize("torque_limit", [0.6, 0.001])
+def test_live_large_yaw_uses_coarse_preflighted_roll(monkeypatch, calib, torque_limit):
+    bus = calib.hardware_config()["bus_serial"]
+    wrist_id = calib.hardware_config()["camera_wrist"]
+    bridge = LiveStationBridge(target_bus=bus, cam_wrist=wrist_id, follow_motor_rx=True)
+    mock = MockStationBridge(num_joints=8)
+    motors = list(mock._motors.values())
+    for motor, tick in zip(motors, [2108, 1933, 2046, 2155, 1868, 2962, 2139, 2864]):
+        motor.position = tick
+    bridge._torque_started = set(range(1, 8))
+    monkeypatch.setitem(calib.data, "shoulder_torque_limit_nm", torque_limit)
+    monkeypatch.setitem(calib.data, "K_wrist", K.tolist())
+    monkeypatch.setitem(calib.data, "image_size_wrist", [640, 480])
+    monkeypatch.setitem(calib.data, "dist_wrist", [0.] * 5)
+    monkeypatch.setattr(mcp_server, "_calib", calib)
+    monkeypatch.setattr(mcp_server, "_bridge", bridge)
+    monkeypatch.setattr(mcp_server, "_logger", None)
+
+    q = np.array(calib.ticks_to_rad(motors))
+    flange = calib.fk_ee_pose(q)
+    yaw = math.degrees(math.atan2(flange[1, 0], flange[0, 0])) - 45
+    rolled = q.copy()
+    rolled[-1] += math.pi / 4
+    z = calib.z_table()
+    eye = calib.T_world_cam("wrist", rolled)
+    target = pixels_on_plane([K[:2, 2]], K, None, eye, z)[0, :2] + [0.0016, 0]
+    writes = []
+
+    async def get_state():
+        now = time.monotonic()
+        bridge._last_rx_mono = now
+        bridge.rx_received_at.update({(bus, m.id): now for m in motors})
+        bridge.rx_station_ns.update({(bus, m.id): time.monotonic_ns() for m in motors})
+        return RobotState(bus, motors)
+
+    async def get_frame(_camera):
+        eye = calib.T_world_cam("wrist", calib.ticks_to_rad(motors))
+        frame = frame_of_marker(eye, target, yaw, z)
+        bridge.frame_station_ns[wrist_id] = time.monotonic_ns()
+        bridge.frame_received_at[wrist_id] = time.monotonic()
+        return cv2.imencode(".jpg", frame)[1].tobytes()
+
+    def sync_write(_bus, _address, values):
+        return {mid: int.from_bytes(raw, "little") for mid, raw in values.items()}
+
+    async def send_commands(_client, commands):
+        for targets in commands:
+            changed = {m.id: targets[m.id] - m.position for m in motors
+                       if m.id in targets and targets[m.id] != m.position}
+            writes.append(changed)
+            for mid, tick in targets.items():
+                motors[mid - 1].position = tick
+
+    monkeypatch.setattr(bridge, "get_state", get_state)
+    monkeypatch.setattr(bridge, "get_frame", get_frame)
+    monkeypatch.setattr(bridge, "_resolve_cam_key", lambda _: wrist_id)
+    monkeypatch.setattr(bridge, "_sync_write", sync_write)
+    monkeypatch.setattr(bridge, "_send_commands", send_commands)
+
+    result = asyncio.run(mcp_server.servo_align_wrist())
+    if torque_limit < 0.6:
+        assert not result["ok"] and "Shoulder torque" in result["error"]
+        assert not writes
+        return
+    assert result["ok"], result
+    assert result["error_mm"] < 1 and abs(result["yaw_error_deg"]) < 2
+    assert 0.16 <= result["prerotation_s"] and result["ibvs_s"] < 1.5
+    assert all(set(step) == {7} and 200 < abs(step[7]) < 400 for step in writes[:2])
+    assert len(writes) > 2

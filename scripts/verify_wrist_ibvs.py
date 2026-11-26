@@ -54,7 +54,7 @@ class RenderedWrist(MockStationBridge):
         return cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))[1].tobytes()
 
 
-async def main():
+async def run_case(yaw_offset=None):
     calib = mcp_server.CalibrationStore()
     calib.data.update(K_wrist=K.tolist(), image_size_wrist=[WIDTH, HEIGHT], dist_wrist=[0.] * 5)
     bridge = RenderedWrist(calib)
@@ -66,6 +66,10 @@ async def main():
     z = calib.z_table()
     target = pixels_on_plane([K[:2, 2]], K, None, initial_eye, z)[0] + [0.014, -0.008, 0]
     yaw = 52
+    if yaw_offset is not None:
+        _, flange = bridge.arm.flange_pose(q)
+        jaw_x, jaw_y = flange.as_matrix()[:2, 0]
+        yaw = math.degrees(math.atan2(jaw_y, jaw_x)) + yaw_offset - 90
     bridge.scene = mujoco.MjModel.from_xml_string(f"""
     <mujoco>
       <worldbody>
@@ -94,11 +98,19 @@ async def main():
     yaw_error = (yaw + 90 - math.degrees(math.atan2(jaw_y, jaw_x)) + 90) % 180 - 90
     error_mm = 1000 * np.linalg.norm(optical - target)
     periods = np.diff(bridge.sample_times)
+    print(f"Case: {'52° marker' if yaw_offset is None else f'{yaw_offset}° initial yaw offset'}")
     print(f"MCP result: {result}")
     print(f"Final MuJoCo ground truth: position_error_mm={error_mm:.3f} jaw_yaw_error_deg={yaw_error:.3f}")
     print(f"Nominal sim frame time: {len(periods) * PERIOD_S:.3f}s; MCP wall time: {wall_elapsed:.3f}s")
     print(f"Frame intervals (s): {np.round(periods, 3).tolist()}")
     assert result["ok"] and error_mm < 1 and abs(yaw_error) < 2 and wall_elapsed < 1.5
+    if yaw_offset is not None:
+        assert result["prerotation_s"] > 0 and result["ibvs_s"] < 1.5
+
+
+async def main():
+    await run_case()
+    await run_case(45)
 
 
 if __name__ == "__main__":
