@@ -164,6 +164,7 @@ def test_missed_live_mug_is_retired_and_blocks_mujo_co_preflight(monkeypatch):
     live.get_frame = AsyncMock(return_value=b"test camera frame")
     live.get_state = AsyncMock()
     monkeypatch.setattr(srv, "_bridge", live)
+    monkeypatch.setattr(srv, "_main_control", None)
     monkeypatch.setattr(srv, "_obstacles", {})
     monkeypatch.setattr(srv, "_unlocalized_obstacles", set())
     monkeypatch.setattr(srv, "_overlay_path", ())
@@ -178,6 +179,9 @@ def test_missed_live_mug_is_retired_and_blocks_mujo_co_preflight(monkeypatch):
         report = await srv.heading_out(execute=True)
         assert not report["executed"] and report["unlocalized_obstacles"] == ["mug"]
         assert set(srv._obstacles) == {"departure_tray"}
+        controller = await srv._get_main_control()
+        with pytest.raises(ValueError, match="Obstacle positions unknown: mug"):
+            controller._checked_path(np.zeros(7), np.zeros(7))
         plan = await srv.plan_and_move(0.20, 0.10, 0.15, 0.60)
         assert not plan["ok"] and plan["problems"] == ["Obstacle positions unknown: mug"]
         live.get_state.assert_not_awaited()

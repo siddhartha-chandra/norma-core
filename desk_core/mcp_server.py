@@ -1656,7 +1656,7 @@ async def _get_main_control() -> MainControl:
             "release": release,
             "estop": estop,
             "robo_jev_arm_watch": robo_jev_arm_watch,
-        }, _obstacles, _robo_jev)
+        }, _obstacles, _robo_jev, unlocalized_obstacles=_unlocalized_obstacles)
     return _main_control
 
 
