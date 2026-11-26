@@ -3,14 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sqlite3
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
 from desk_core import mcp_server as srv
+from desk_core import sightings as sightings_module
 from desk_core.sightings import DEFAULT_NORMFS_QUEUE, Sighting, SightingsStore
 from desk_core.station_bridge import LiveStationBridge, MockStationBridge
+from station_py import Client
+from target.gen_python.protobuf.normfs import normfs as normfs_pb2
 
 
 @dataclass
@@ -63,10 +68,7 @@ class _FakeNormFSClient:
             return _FakeQueueRead([])
         shift = int.from_bytes(offset, "little") if offset else 0
         start = max(0, len(bucket) - 1 - shift)
-        selected = bucket[start : start + limit : max(1, step)]
-        entries = [_FakeEntry(_FakeEntryId(eid), memoryview(payload)) for eid, payload in selected]
-        return _FakeQueueRead(entries)
-
+        return self.read_from_offset(queue_id, start.to_bytes(8, "little"), limit, step, buf_size)
 
 def test_normfs_primary_write_and_read(tmp_path):
     client = _FakeNormFSClient()
@@ -218,6 +220,120 @@ def test_list_sightings_merges_normfs_and_sqlite_with_filters(tmp_path):
     before = asyncio.run(store.list_sightings(label="keys", before_time=150.0))
     assert len(before) == 1
     assert before[0].time == 100.0
+
+
+@pytest.mark.parametrize("station_available", [True, False])
+def test_mcp_history_reads_normfs_and_sqlite_on_cold_start(tmp_path, monkeypatch, mock_bridge, station_available):
+    client = _FakeNormFSClient()
+    db_path = tmp_path / "sightings.db"
+    writer = SightingsStore(normfs_client=client, db_path=db_path, normfs_enabled=True)
+    mock_bridge.client = client
+
+    def create_bridge(*, follow_motor_rx):
+        if not station_available:
+            async def connect():
+                raise OSError("Station offline")
+            monkeypatch.setattr(mock_bridge, "connect", connect)
+        return mock_bridge
+
+    monkeypatch.setenv("DESK_SIGHTINGS_DB", str(db_path))
+    monkeypatch.setenv("DESK_SIGHTINGS_NORMFS", "1")
+    monkeypatch.setattr(srv, "_bridge", None)
+    monkeypatch.setattr(srv, "_connect_cooldown_until", 0.0)
+    monkeypatch.setattr(srv, "_sightings", None)
+    monkeypatch.setattr(srv, "create_bridge", create_bridge)
+
+    async def run():
+        client.connected = False
+        await writer.record("keys", 0.20, 0.01, time_s=100.0, frame_ref="mock://top#1")
+        client.connected = True
+        await writer.record("keys", 0.23, 0.04, time_s=200.0, frame_ref="normfs://cam#2")
+
+        latest = await srv.last_seen(" KEYS ")
+        assert latest["found"] is True
+        assert (latest["time"], latest["frame_ref"]) == (
+            (200.0, "normfs://cam#2") if station_available else (100.0, "mock://top#1")
+        )
+        assert await srv.where_was("keys", 150.0) == {
+            "found": True, "label": "keys", "x": 0.20, "y": 0.01, "time": 100.0, "frame_ref": "mock://top#1",
+        }
+
+    asyncio.run(run())
+
+
+def test_mcp_history_finds_matches_beyond_first_normfs_page(tmp_path, monkeypatch, mock_bridge):
+    client = _FakeNormFSClient()
+    store = SightingsStore(normfs_client=client, db_path=tmp_path / "sightings.db", normfs_enabled=True)
+    monkeypatch.setattr(srv, "_sightings", store)
+    monkeypatch.setattr(srv, "_bridge", mock_bridge)
+
+    async def run():
+        await store.record("keys", 0.2, 0.1, time_s=20.0, frame_ref="old-keys")
+        await store.record("pen", 0.3, 0.1, time_s=30.0, frame_ref="old-pen")
+        for _ in range(1000):
+            await store.record("mug", 0.2, 0.1, time_s=40.0, frame_ref="mug")
+        await store.record("pen", 0.1, 0.2, time_s=50.0, frame_ref="new-pen")
+
+        client.connected = False
+        await store.record("keys", 0.4, 0.1, time_s=10.0, frame_ref="older-sqlite-keys")
+        client.connected = True
+
+        assert (await srv.last_seen("keys"))["frame_ref"] == "old-keys"
+        assert (await srv.where_was("pen", 30.0))["frame_ref"] == "old-pen"
+        assert (await srv.last_seen("pen"))["frame_ref"] == "new-pen"
+
+    asyncio.run(run())
+
+
+def test_normfs_page_deadline_cancels_backpressured_reader(tmp_path, monkeypatch):
+    sighting = Sighting("keys", 0.2, 0.1, 20.0, "old-keys")
+    from_bytes = Sighting.from_bytes
+    now = 0.0
+
+    async def wait_for_connection(self):
+        await asyncio.Future()
+
+    def expire_after_first_entry(data):
+        nonlocal now
+        now = 5.0
+        return from_bytes(data)
+
+    monkeypatch.setattr(Client, "manage_connection", wait_for_connection)
+    monkeypatch.setattr(sightings_module, "time", SimpleNamespace(monotonic=lambda: now))
+    monkeypatch.setattr(Sighting, "from_bytes", staticmethod(expire_after_first_entry))
+
+    async def run():
+        client = Client("localhost:8888", logging.getLogger(__name__))
+        client.connected = client.setup_done = True
+        page = client.read_from_tail(DEFAULT_NORMFS_QUEUE, offset=b"\x00", limit=4, step=1, buf_size=1)
+        backpressured = asyncio.Event()
+        put = page.data.put
+
+        async def track_put(entry):
+            if page.data.full():
+                backpressured.set()
+            await put(entry)
+
+        monkeypatch.setattr(page.data, "put", track_put)
+        await asyncio.wait_for(client.c2s.get(), timeout=1.0)
+        read_id, responses = next(iter(client.pending_reads.items()))
+        response_type = normfs_pb2.ReadResponse_Result
+        def respond(result, **fields):
+            response = normfs_pb2.ServerResponse(read=normfs_pb2.ReadResponse(read_id=read_id, result=result, **fields))
+            responses.put_nowait(normfs_pb2.ServerResponseReader(response.encode()))
+
+        respond(response_type.RR_START)
+        for _ in range(3):
+            respond(response_type.RR_ENTRY, id=normfs_pb2.Id(raw=b"\x00"), data=sighting.to_bytes())
+
+        await asyncio.wait_for(backpressured.wait(), timeout=1.0)
+        monkeypatch.setattr(client, "read_from_tail", lambda *args, **kwargs: page)
+        store = SightingsStore(normfs_client=client, db_path=tmp_path / "sightings.db", normfs_enabled=True)
+        assert await asyncio.wait_for(store.read_normfs(label="keys", limit=1), timeout=1.0) == [sighting]
+        assert not client.pending_reads
+        assert page._task.cancelled()
+
+    asyncio.run(run())
 
 
 def test_sighting_validation(tmp_path):

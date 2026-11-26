@@ -2,11 +2,52 @@
 import asyncio
 import logging
 import time
+from unittest.mock import Mock
 
 import pytest
 
 from desk_core.station_bridge import EStopLatched, LiveStationBridge, MotorState, RAM_GOAL_POSITION
 from station_py import Client, new_station_client
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_initial_station_setup_failure_stops_connection_task(monkeypatch, cancelled):
+    writer = Mock()
+    wait_ready = Client.wait_ready
+
+    async def run():
+        setup_started = asyncio.Event()
+        setup_stopped = asyncio.Event()
+
+        async def open_connection(*args):
+            return asyncio.StreamReader(), writer
+
+        async def stall_setup(self):
+            setup_started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                setup_stopped.set()
+
+        async def wait_briefly(self, timeout):
+            await setup_started.wait()
+            await wait_ready(self, timeout=0.01)
+
+        monkeypatch.setattr(asyncio, "open_connection", open_connection)
+        monkeypatch.setattr(Client, "perform_initial_setup", stall_setup)
+        monkeypatch.setattr(Client, "wait_ready", wait_briefly)
+
+        connecting = asyncio.create_task(new_station_client("localhost", logging.getLogger(__name__)))
+        await setup_started.wait()
+        if cancelled:
+            connecting.cancel()
+        with pytest.raises(asyncio.CancelledError if cancelled else TimeoutError):
+            await connecting
+
+        assert setup_stopped.is_set()
+        writer.close.assert_called_once()
+
+    asyncio.run(run())
 
 
 def test_station_client_setup_timeout_stops_connection_task(monkeypatch):

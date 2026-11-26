@@ -10,6 +10,7 @@ Exposes:
      measure_graspability, estimate_grasp_pose, plan_tolerant_grasp, retract_to_hover, move_to_drop,
      master_pick_place
   6. Prompt skills (@mcp.prompt): desk_operator_skill, pick_and_place_skill
+  7. Desk memory queries: last_seen, where_was
 
 Every tool call is recorded under runs/<UTC timestamp>/ (calls.jsonl + frames/*.jpg)
 so sessions are replayable; set DESK_RUNLOG=0 to disable. See desk_core/runlog.py.
@@ -782,6 +783,40 @@ async def _record_localization(
                 res["sighting"] = write_res.to_dict()
         except Exception as exc:
             _log.warning("Failed to record sighting for %r: %s", res.get("label") or res.get("query"), exc)
+
+
+async def _find_sighting(label: str, before_time: float | None = None) -> dict:
+    label = label.strip()
+    if not label:
+        raise ValueError("Sighting label must be non-empty")
+
+    store = _get_sightings_store()
+    if store.normfs_enabled and _bridge is None:
+        try:
+            await _get_bridge()
+        except RuntimeError:
+            pass  # Station is unavailable; the local SQLite history is still readable.
+
+    sightings = await store.list_sightings(limit=1, label=label, before_time=before_time)
+    if not sightings:
+        return {"found": False, "label": label}
+    return {"found": True, **sightings[0].to_dict()}
+
+
+@mcp.tool()
+@_traced
+async def last_seen(label: str) -> dict:
+    """Get the latest stored sighting for an object label: world position in meters, Unix time in seconds, and frame_ref; found=false if absent."""
+    return await _find_sighting(label)
+
+
+@mcp.tool()
+@_traced
+async def where_was(label: str, time: float) -> dict:
+    """Get the nearest stored sighting for an object label at or before time (Unix seconds); returns world position in meters, sighting time, and frame_ref, or found=false."""
+    if not math.isfinite(time):
+        raise ValueError("Sighting cutoff time must be a finite Unix timestamp in seconds")
+    return await _find_sighting(label, before_time=time)
 
 
 @mcp.tool()
