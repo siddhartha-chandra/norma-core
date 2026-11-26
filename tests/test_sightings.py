@@ -42,13 +42,13 @@ class _FakeNormFSClient:
         self.fail_write = fail_write
         self.queues: dict[str, list[tuple[bytes, bytes]]] = {}
 
-    async def enqueue(self, queue_id: str, data: bytes) -> bytes:
+    async def enqueue(self, queue_id: str, data: bytes) -> memoryview:
         if self.fail_write is not None:
             raise self.fail_write
         bucket = self.queues.setdefault(queue_id, [])
-        entry_id = len(bucket).to_bytes(8, "big")
+        entry_id = len(bucket).to_bytes(8, "little")
         bucket.append((entry_id, bytes(data)))
-        return entry_id
+        return memoryview(entry_id)
 
     def read_from_tail(self, queue_id: str, offset: bytes, limit: int, step: int, buf_size: int) -> _FakeQueueRead:
         bucket = self.queues.get(queue_id, [])
@@ -74,8 +74,10 @@ def test_normfs_primary_write_and_read(tmp_path):
     )
 
     assert res1.backend == "normfs"
+    assert res1.record_id == (0).to_bytes(8, "little").hex()
     assert res1.fallback_reason is None
     assert res2.backend == "normfs"
+    assert res2.record_id == (1).to_bytes(8, "little").hex()
     assert not db_path.exists()
 
     raw_entries = client.queues[DEFAULT_NORMFS_QUEUE]

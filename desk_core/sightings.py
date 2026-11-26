@@ -296,7 +296,11 @@ class SightingsStore:
                 client.enqueue(self.queue_id, sighting.to_bytes()),
                 timeout=self.timeout_s,
             )
-            rec_id = entry_id.hex() if isinstance(entry_id, (bytes, bytearray)) else str(entry_id)
+            rec_id = (
+                bytes(entry_id).hex()
+                if isinstance(entry_id, (bytes, bytearray, memoryview))
+                else str(entry_id)
+            )
             return SightingWriteResult(
                 sighting=sighting,
                 backend="normfs",
