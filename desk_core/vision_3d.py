@@ -210,9 +210,9 @@ def _opencv_candidates(bgr: np.ndarray, query: str | None) -> tuple[list[tuple[f
         bg_lab = np.median(lab.reshape(-1, 3), axis=0)
         dist = np.linalg.norm(lab - bg_lab, axis=2)
         fg_mask = (dist > 22.0).astype(np.uint8) * 255
-        if query is not None:
-            # Also include high-saturation non-orange regions
-            sat_mask = (hsv[:, :, 1] > 70).astype(np.uint8) * 255
+        saturated = hsv[:, :, 1] > 70
+        if query is not None or np.count_nonzero(saturated) <= img_area / 2:
+            sat_mask = saturated.astype(np.uint8) * 255
             fg_mask = cv2.bitwise_or(fg_mask, sat_mask)
         fg_mask = cv2.bitwise_and(fg_mask, cv2.bitwise_not(orange_mask))
 

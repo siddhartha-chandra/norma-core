@@ -18,6 +18,14 @@ def test_opencv_scene_detection_on_a_saturated_mat():
     assert sorted(tuple(det["point"]) for det in detections) == [(206, 217), (706, 717)]
 
 
+def test_opencv_scene_finds_low_lab_contrast_items_on_a_neutral_mat():
+    frame = np.full((240, 320, 3), (45, 45, 45), dtype=np.uint8)
+    frame[30:70, 40:100] = (35, 37, 60)
+    frame[150:190, 200:260] = (42, 55, 38)
+    detections = vision_3d._localize_scene_opencv(frame)
+    assert sorted(tuple(det["point"]) for det in detections) == [(206, 217), (706, 717)]
+
+
 @pytest.mark.parametrize("invalid", [False, True])
 def test_scene_provider_distinguishes_empty_from_malformed(calib, mock_bridge, monkeypatch, invalid):
     monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
