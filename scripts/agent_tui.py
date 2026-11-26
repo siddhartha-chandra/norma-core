@@ -96,6 +96,9 @@ def _server_params(live: bool) -> StdioServerParameters:
         env.pop("DESK_MOCK", None)
         env.pop("DESK_NO_DOTENV", None)
     else:
+        from desk_core import DOTENV_KEYS
+        for key in DOTENV_KEYS:
+            env.pop(key, None)
         env["DESK_MOCK"] = "1"
         env["DESK_MOCK_SYNTHETIC"] = "1"
         env["DESK_NO_DOTENV"] = "1"
