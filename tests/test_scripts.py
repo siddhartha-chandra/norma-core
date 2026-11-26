@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -20,6 +21,23 @@ def load_script(name):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_mcp_tui_requires_arm_motion_for_sweep():
+    tui = load_script("mcp_tui")
+    messages = []
+    widgets = {
+        "#arm-motion": SimpleNamespace(value=False),
+        "#output-log": SimpleNamespace(write=messages.append),
+        "#args-editor": SimpleNamespace(text='{"execute": true}'),
+    }
+
+    async def no_call(*args):
+        pytest.fail("Disarmed sweep must not be sent to MCP")
+
+    app = SimpleNamespace(selected_tool="sweep_aside", query_one=lambda name, cls: widgets[name], _call_tool=no_call)
+    asyncio.run(tui.DeskCoreTUI.action_run_selected(app))
+    assert "Blocked sweep_aside" in messages[0]
 
 
 @pytest.fixture(scope="module")

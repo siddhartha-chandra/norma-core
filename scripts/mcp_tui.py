@@ -71,6 +71,7 @@ SAFETY_GROUPS: dict[str, tuple[str, str]] = {
     "pick_at": ("MOTION", "red"),
     "place_at": ("MOTION", "red"),
     "pick_pixel": ("MOTION", "red"),
+    "sweep_aside": ("MOTION", "red"),
     "execute_sequence": ("MOTION", "red"),
 }
 
