@@ -1,0 +1,27 @@
+name: desk-core PR check
+
+on:
+  pull_request:
+    branches: [main, desk-core]
+    paths:
+      - "desk_core/**"
+      - "scripts/**"
+      - "tests/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/desk-core-pr-check.yml"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      DESK_MOCK: "1"
+      DESK_NO_DOTENV: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --managed-python
+      - run: uv run --managed-python pytest -q
+      - run: uv run --managed-python python scripts/mcp_smoke.py
+      - run: uv run --managed-python python scripts/test_primitives.py
+      - run: uv run --managed-python python scripts/test_reconnect.py
