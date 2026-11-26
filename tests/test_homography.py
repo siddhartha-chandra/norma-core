@@ -563,3 +563,20 @@ def test_cli_mock_without_explicit_calib_does_not_overwrite_default_rig(tmp_path
     assert data["ok"] is True
     assert data["saved"] is False
     assert "H_table" not in json.loads(calib_file.read_text(encoding="utf-8"))
+
+
+def test_cli_make_bridge_live_enables_motor_rx_and_target_bus(tmp_path: Path):
+    """LiveStationBridge factory in scripts/reanchor_plane.py must pass target_bus and follow_motor_rx."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("reanchor_plane_cli", REPO_ROOT / "scripts" / "reanchor_plane.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    calib_file = tmp_path / "rig_calib.json"
+    calib_file.write_text(json.dumps({"hardware": {"bus_serial": "BUS123", "camera_top": "cam2"}}), encoding="utf-8")
+    cs = CalibrationStore(calib_file)
+    bridge = mod._make_bridge(live=True, calib=cs, follow_motor_rx=True)
+    assert bridge.target_bus == "BUS123"
+    assert bridge._follow_motor_rx is True

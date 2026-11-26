@@ -30,6 +30,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -73,16 +74,27 @@ def parse_points(raw: str) -> list[list[float]]:
     return pts
 
 
+def _make_bridge(live: bool, calib: CalibrationStore, *, follow_motor_rx: bool = False) -> Any:
+    if not live:
+        return MockStationBridge()
+    hw = calib.hardware_config()
+    host = os.environ.get("STATION_HOST", "").strip() or "127.0.0.1"
+    port = int(os.environ.get("STATION_PORT", "8888"))
+    bus = os.environ.get("STATION_BUS_SERIAL", "").strip() or hw.get("bus_serial") or None
+    cam_top = os.environ.get("CAMERA_TOP", "").strip() or hw.get("camera_top") or None
+    cam_wrist = os.environ.get("CAMERA_WRIST", "").strip() or hw.get("camera_wrist") or None
+    return LiveStationBridge(
+        host=host,
+        port=port,
+        target_bus=bus,
+        cam_top=cam_top,
+        cam_wrist=cam_wrist,
+        follow_motor_rx=follow_motor_rx,
+    )
+
+
 async def _grab_frame(live: bool, calib: CalibrationStore) -> tuple[np.ndarray, Any]:
-    if live:
-        hw = calib.hardware_config()
-        bridge = LiveStationBridge(
-            bus_serial=hw.get("bus_serial") or None,
-            cam_top=hw.get("camera_top") or None,
-            cam_wrist=hw.get("camera_wrist") or None,
-        )
-    else:
-        bridge = MockStationBridge()
+    bridge = _make_bridge(live=live, calib=calib, follow_motor_rx=False)
     await bridge.connect()
     try:
         jpeg = await bridge.get_frame("top")
@@ -140,17 +152,11 @@ async def _run_move_test(
     """Project pixel (u, v) -> tabletop (x, y) via H_table, solve TRAC-IK, move arm above spot, verify FK XY < 1 cm."""
     wx, wy, wz = calib.pixel_to_world(pixel_uv[0], pixel_uv[1], camera="top")
     target_z = wz + float(hover_z_m)
-    if live:
-        hw = calib.hardware_config()
-        bridge: Any = LiveStationBridge(
-            bus_serial=hw.get("bus_serial") or None,
-            cam_top=hw.get("camera_top") or None,
-            cam_wrist=hw.get("camera_wrist") or None,
-        )
-    else:
-        bridge = MockStationBridge()
+    bridge: Any = _make_bridge(live=live, calib=calib, follow_motor_rx=live)
     await bridge.connect()
     try:
+        if live:
+            await bridge.get_frame("top")
         st = await bridge.get_state()
         q_seed = calib.ticks_to_rad(st.motors)
         ik = IKAdapter()
