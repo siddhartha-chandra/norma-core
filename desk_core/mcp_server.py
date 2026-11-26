@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Any
 
 import cv2
 import numpy as np
-from dotenv import dotenv_values
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
 from PIL import Image as PILImage
@@ -53,11 +52,6 @@ from .wrist_ibvs import MAX_ROLL_STEP_RAD, MAX_START_ERROR_M, PERIOD_S, TIMEOUT_
 if TYPE_CHECKING:
     from .ik_mujoco import JointPlan, MuJoCoPlanner
     from .main_control import MainControl
-
-if os.environ.get("DESK_NO_DOTENV") != "1":
-    for _k, _v in dotenv_values(REPO_ROOT / ".env").items():
-        if _v is not None and not os.environ.get(_k, "").strip():
-            os.environ[_k] = _v
 
 _bridge: StationBridge | None = None
 _connect_lock = asyncio.Lock()
