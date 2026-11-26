@@ -68,7 +68,7 @@ class TracIKSolver:
         TRAC-IK mode; "Distance" returns the solution closest to the seed, which keeps paths smooth.
     """
 
-    def __init__(self, urdf_path: Path | str = DEFAULT_URDF, timeout: float = float(os.environ.get("DESK_IK_TIMEOUT_S", "0.02")), solve_type: str = "Distance"):
+    def __init__(self, urdf_path: Path | str = DEFAULT_URDF, timeout: float = float(os.environ.get("DESK_IK_TIMEOUT_S", "").strip() or "0.02"), solve_type: str = "Distance"):
         from trac_ik import TracIK
 
         self.urdf_path = Path(urdf_path)
