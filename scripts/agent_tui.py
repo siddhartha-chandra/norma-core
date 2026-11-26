@@ -934,7 +934,9 @@ class RobotAgentTUI(App):
             self._last_cam_sig: dict[str, tuple[bytes, str]] = {}
         try:
             r_top, r_wrist = await asyncio.gather(
-                self.session.call_tool("get_frame", {"camera": "top", "denoise": False, "save_npy": False}),
+                self.session.call_tool("get_frame", {
+                    "camera": "top", "denoise": False, "save_npy": False, "show_overlay": True,
+                }),
                 self.session.call_tool("get_frame", {"camera": "wrist", "denoise": False, "save_npy": False}),
             )
             markers = getattr(self, "_overlay_markers", {})
