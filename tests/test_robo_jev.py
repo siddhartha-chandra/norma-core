@@ -199,6 +199,24 @@ def test_operator_skill_requires_fresh_observation_before_reflex_recovery():
     assert recovery_instructions.index("`observe()`") < recovery_instructions.index("`robo_jev_guard`")
 
 
+def test_operator_skill_does_not_treat_guard_proceed_as_fresh_localization(mock_bridge, monkeypatch):
+    monkeypatch.setattr(srv, "_bridge", mock_bridge)
+    monkeypatch.setattr(srv, "_robo_jev", RoboJevGatekeeper())
+    monkeypatch.setattr(srv, "_obstacles", {})
+    monkeypatch.setattr(srv, "_logger", None)
+    mock_bridge.set_frame_override("top", _scene())
+
+    async def simulate():
+        await srv.estop()
+        await srv.observe(views=["top"], denoise=False)
+        return await srv.robo_jev_guard()
+
+    recovery = asyncio.run(simulate())
+    assert recovery["ok"] and recovery["action"] == "proceed" and recovery["target_xy"] is None
+    assert "fresh world coordinates" in srv.desk_operator_skill()
+    assert "`localize_3d` before planning" in srv.desk_operator_skill()
+
+
 @pytest.mark.parametrize("trigger_camera", ["top", "wrist"])
 def test_eight_cm_slide_halts_stream_and_allows_a_fresh_reach(mock_bridge, monkeypatch, trigger_camera):
     monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")

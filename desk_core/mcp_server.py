@@ -1463,8 +1463,9 @@ def desk_operator_skill() -> str:
         "when visible in both views, using the same query.\n"
         "6. If anything shifts or stalls, call `estop()` immediately and re-`observe()`. "
         "If Robo-Jev has already latched the emergency stop, re-`observe()` without replacing the reflex latch "
-        "with a manual stop. Then call `robo_jev_guard` to re-localize. Only on success, plan a fresh reach "
-        "from the stopped pose; never resume the interrupted trajectory."
+        "with a manual stop. Call `robo_jev_guard` and stop if it fails. "
+        "Use its `world` result if it re-localized the target; otherwise obtain fresh world coordinates via "
+        "`localize_3d` before planning. Plan from the stopped pose; never resume the interrupted trajectory."
     )
 
 
