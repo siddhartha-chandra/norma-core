@@ -40,7 +40,7 @@ from .interfaces import SceneObstacle
 from .robo_jev import RoboJevGatekeeper, check_reflex_and_abort, guarded_recover
 from .runlog import RunLogger
 from .station_bridge import (DEFAULT_MAX_STEP, MAX_ANGLE_STEP, REPO_ROOT, LiveStationBridge, MockStationBridge,
-                             RobotState, StationBridge, create_bridge)
+                             PreflightWriteUncertain, RobotState, StationBridge, create_bridge)
 from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
 from .vision_3d import localize_object_3d
@@ -940,9 +940,9 @@ async def plan_and_move(
     if current.bus_serial != st.bus_serial or current.positions() != initial_ticks or list(_obstacles.values()) != obstacles:
         return {"ok": False, "executed": False, "problems": ["Start pose or obstacles changed during preflight"]}
 
-    async def stop_motion(problem: str) -> dict:
+    async def stop_motion(problem: str, *, write_uncertain: bool = False) -> dict:
         result.update(ok=False, problems=[problem])
-        if result["executed"]:
+        if result["executed"] or write_uncertain:
             try:
                 result["hold"] = await bridge.abort(source="mujoco_preflight")
             except Exception as exc:
@@ -970,6 +970,8 @@ async def plan_and_move(
                 applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP, preflight_start=expected)
             else:
                 applied = await bridge.send_joint_targets(target, max_step=DEFAULT_MAX_STEP)
+        except PreflightWriteUncertain as exc:
+            return await stop_motion(str(exc), write_uncertain=True)
         except (PlanningError, RuntimeError) as exc:
             return await stop_motion(str(exc))
         result["executed"] = True

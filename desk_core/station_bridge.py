@@ -163,6 +163,10 @@ class EStopLatched(RuntimeError):
     """A motion command was issued while E-STOP is latched; call `rearm()` (via `observe()`) first."""
 
 
+class PreflightWriteUncertain(RuntimeError):
+    """Station did not confirm whether a preflighted target was sent."""
+
+
 @runtime_checkable
 class StationBridge(Protocol):
     async def connect(self) -> None: ...
@@ -1189,7 +1193,12 @@ class LiveStationBridge:
                 RAM_GOAL_POSITION,
                 {mid: val.to_bytes(2, "little") for mid, val in applied.items()},
             )
-            await self._send_commands(self.client, [cmd])
+            try:
+                await self._send_commands(self.client, [cmd])
+            except Exception as exc:
+                if preflight_start is None:
+                    raise
+                raise PreflightWriteUncertain(f"Station waypoint write unconfirmed: {exc}") from exc
         return applied
 
     async def wait_settle(self, targets: dict[int, int], tol_ticks: int = 25, timeout_s: float = 3.0) -> bool:

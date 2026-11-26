@@ -224,7 +224,8 @@ def test_live_bridge_refuses_pose_drift_and_clamping_before_writing(live_station
     asyncio.run(run())
 
 
-def test_live_stall_replaces_active_target_with_present_position(live_station, calib, monkeypatch):
+@pytest.mark.parametrize("write_uncertain", [False, True])
+def test_live_failure_replaces_active_target_with_present_position(live_station, calib, monkeypatch, write_uncertain):
     bridge, state, packets = live_station
     planner = mcp_server._mujoco_planner(state, [], 0.6)
     goal = np.asarray(calib.ticks_to_rad(state.motors))
@@ -236,9 +237,20 @@ def test_live_stall_replaces_active_target_with_present_position(live_station, c
         state.motors[2].position -= 1
         return None
 
-    monkeypatch.setattr(bridge, "wait_preflight_settle", stall)
+    send = bridge._send_commands
+
+    async def lose_confirmation(client, commands):
+        await send(client, commands)
+        if len(packets) == 1:
+            state.motors[2].position -= 1
+            raise ConnectionError("write acknowledgement lost")
+
+    if write_uncertain:
+        monkeypatch.setattr(bridge, "_send_commands", lose_confirmation)
+    else:
+        monkeypatch.setattr(bridge, "wait_preflight_settle", stall)
     result = asyncio.run(mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True))
-    assert not result["ok"] and result["executed"]
+    assert not result["ok"] and result["executed"] is not write_uncertain
     assert result["hold"]["mode"] == "hold"
     assert len(packets) == 2
     assert packets[1][3] == packets[0][3] - 1

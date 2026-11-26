@@ -203,6 +203,7 @@ a target from a different measured pose. The next segment is checked from the st
 which must be within the same 15-tick tolerance used by the flange-motion stream. Each live waypoint
 moves one joint at a time and commands the others to hold their measured positions, so the planned
 motion does not depend on servos moving at synchronized rates. This does not model physical overshoot.
+On a stall or an unconfirmed target write, Station attempts to hold the measured position.
 The model does not account for payload or dynamic torque. A simulation budget is not a hardware rating.
 To request just the MuJoCo IK solution, pass the same limit to `solve_ik`; without it the existing IK
 backend is unchanged. The other motion tools do not run this preflight.
