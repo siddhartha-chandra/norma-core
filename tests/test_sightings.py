@@ -207,6 +207,46 @@ def test_bridge_last_frame_ref():
     assert live.last_frame_ref("top") == "normfs://usbvideo/0123456789abcdef0123456789abcdef#002a"
 
 
+def test_live_bridge_denoised_frame_ref_tracks_selected_frame():
+    import cv2
+    import numpy as np
+
+    def _jpeg(val: int) -> bytes:
+        img = np.full((32, 32, 3), val, dtype=np.uint8)
+        ok, enc = cv2.imencode(".jpg", img)
+        assert ok
+        return enc.tobytes()
+
+    clean_a = _jpeg(120)
+    clean_b = _jpeg(121)
+    clean_c = _jpeg(120)
+    noisy_latest = _jpeg(10)
+
+    live = LiveStationBridge(follow_motor_rx=False)
+    qid = "usbvideo/0123456789abcdef0123456789abcdef"
+    live._frames["cam_top_uid"] = clean_a
+    live._frame_order.append("cam_top_uid")
+    live._key_to_qid["cam_top_uid"] = qid
+
+    async def fake_tail(_qid, count=1, timeout_s=3.0):
+        return [
+            ("cam_top_uid", clean_a, 100, memoryview(b"\x00\x01")),
+            ("cam_top_uid", clean_b, 200, memoryview(b"\x00\x02")),
+            ("cam_top_uid", clean_c, 300, memoryview(b"\x00\x03")),
+            ("cam_top_uid", noisy_latest, 400, memoryview(b"\x00\x04")),
+        ]
+
+    live._fetch_tail_frames = fake_tail  # type: ignore[method-assign]
+    chosen = asyncio.run(live.get_frame("top", denoise=True))
+    assert chosen != noisy_latest
+    # Must reference the denoised frame (0001..0003), NOT the noisy latest frame (0004).
+    assert live.last_frame_ref("top") in {
+        f"normfs://{qid}#0001",
+        f"normfs://{qid}#0002",
+        f"normfs://{qid}#0003",
+    }
+
+
 def test_mcp_localize_3d_logs_to_sqlite_in_mock_simulation(tmp_path, monkeypatch, mock_bridge):
     monkeypatch.setenv("DESK_MOCK_SYNTHETIC", "1")
     monkeypatch.setenv("DESK_SIGHTINGS_DB", str(tmp_path / "sightings.db"))
