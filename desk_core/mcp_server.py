@@ -703,7 +703,8 @@ async def localize_3d(
 ) -> dict:
     """Localize a named object, or omit the query to scan all visible objects from the overhead camera.
 
-    A scene scan returns detections and the frame reference, and skips an already scanned frame
+    A scene scan uses the newest frame without denoising, returns detections and its reference,
+    and skips an already scanned frame
     when after_frame_ref is supplied. Depth uses the table plane unless z_m is given.
     """
     if camera in ("both", "dual"):
@@ -712,20 +713,20 @@ async def localize_3d(
         raise ValueError("Scene scans require camera='top'.")
     bridge = await _get_bridge()
     if query is None and isinstance(bridge, LiveStationBridge):
-        jpeg = await bridge.get_frame(camera, denoise=denoise, strict_camera=True)
+        jpeg = await bridge.get_frame(camera, strict_camera=True)
         if after_frame_ref is None:
             baseline = bridge.last_frame_ref(camera)
             try:
                 async with asyncio.timeout(3.0):
                     while True:
                         await asyncio.sleep(0.1)
-                        jpeg = await bridge.get_frame(camera, denoise=denoise, strict_camera=True)
+                        jpeg = await bridge.get_frame(camera, strict_camera=True)
                         if (current := bridge.last_frame_ref(camera)) and current != baseline:
                             break
             except TimeoutError:
                 return {"detections": [], "frame_ref": baseline, "stale_frame": True}
     else:
-        jpeg = await bridge.get_frame(camera, denoise=denoise)
+        jpeg = await bridge.get_frame(camera, denoise=denoise and query is not None)
     seen_at = time.time()
     frame_ref = (
         bridge.last_frame_ref(camera)

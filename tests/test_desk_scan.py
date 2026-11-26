@@ -37,9 +37,11 @@ def test_live_scan_waits_for_a_new_frame_on_startup(monkeypatch, queue_advances)
     monkeypatch.setattr(mcp_server, "localize_frame_3d", localize)
 
     result = asyncio.run(mcp_server.localize_3d(provider="opencv"))
+    assert all(call.kwargs["count"] == 1 for call in tail.await_args_list)
     assert result["stale_frame"] is not queue_advances
     if queue_advances:
         assert localize.await_args.args[0] == b"live"
+        assert result["frame_ref"] == "normfs://usbvideo/overhead#32"
     else:
         localize.assert_not_awaited()
 
