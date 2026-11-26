@@ -21,6 +21,7 @@ import atexit
 import functools
 import io
 import json
+import math
 import os
 import time
 from dataclasses import asdict, replace
@@ -46,6 +47,7 @@ from .station_bridge import (DEFAULT_MAX_STEP, MAX_ANGLE_STEP, REPO_ROOT, LiveSt
 from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
 from .vision_3d import localize_object_3d
+from .wrist_ibvs import PERIOD_S, TIMEOUT_S, YAW_TOL_RAD, alignment_step
 
 if TYPE_CHECKING:
     from .main_control import MainControl
@@ -894,6 +896,11 @@ async def plan_and_move(
     execute: bool = False,
 ) -> dict:
     """Preflight a flange pose in MuJoCo. Live execution requires aligned, unloaded ElRobot hardware."""
+    return await _plan_and_move(x, y, z, shoulder_torque_limit_nm, qx, qy, qz, qw, execute)
+
+
+async def _plan_and_move(x, y, z, shoulder_torque_limit_nm, qx, qy, qz, qw, execute, *,
+                         expected_start=None, wrist_planner=None):
     from .ik_mujoco import PlanningError
     from .motion import FLANGE_SETTLE_TOL_TICKS
 
@@ -904,6 +911,8 @@ async def plan_and_move(
     if isinstance(bridge, MockStationBridge) and bridge.get_mock_scene_state()["held_object"]:
         return {"ok": False, "executed": False, "problems": ["Payloads are not modeled by the shoulder torque guard"]}
     st = await bridge.get_state()
+    if expected_start is not None and (st.bus_serial, st.positions()) != expected_start:
+        return {"ok": False, "executed": False, "problems": ["Measured pose changed since wrist feedback"]}
     if live:
         try:
             st = _live_preflight_state(bridge, st)
@@ -915,9 +924,24 @@ async def plan_and_move(
 
     def preflight():
         fraction = motors[-1].to_norm() if live else 1.0
-        planner = _mujoco_planner(replace(st, motors=motors), obstacles, shoulder_torque_limit_nm, fraction)
+        state = replace(st, motors=motors)
         start = np.asarray(_calib.ticks_to_rad(motors))
-        goal = planner.solve_ik([x, y, z], [qx, qy, qz, qw], start)
+        if wrist_planner is None:
+            planner = _mujoco_planner(state, obstacles, shoulder_torque_limit_nm, fraction)
+            goal = planner.solve_ik([x, y, z], [qx, qy, qz, qw], start)
+        else:
+            from scipy.spatial.transform import Rotation
+
+            from .ik_tracik import get_solver
+
+            planner = wrist_planner(state, obstacles, fraction)
+            solution = get_solver(_calib.urdf_path()).solve(
+                [x, y, z], Rotation.from_quat([qx, qy, qz, qw]).as_matrix(), start,
+                planner.lower, planner.upper,
+            )
+            if not solution.ok:
+                raise PlanningError(f"Wrist correction rejected by IK: {solution.reason}")
+            goal = solution.q
 
         def quantize(q):
             ticks = _calib.rad_to_ticks(q.tolist(), motors)
@@ -1482,6 +1506,117 @@ async def aim_wrist(target_base_m: list[float] | dict[str, float], execute: bool
     return await controller.aim_wrist(_target_coordinates(target_base_m), execute=execute)
 
 
+@mcp.tool()
+@_traced
+@_motion_tool
+async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
+    """Move at the current hover height to center a flat colored marker and align the jaws across its long axis.
+
+    Start with the marker isolated and already near the wrist image center, gripper open and pointing down.
+    This moves the arm but does not descend or grasp. The effective position tolerance is capped below 1 mm.
+    """
+    from .ik_tracik import TOOL_FRAME
+
+    if not math.isfinite(tol_mm) or tol_mm <= 0:
+        return {"ok": False, "error": "tol_mm must be positive and finite."}
+    data = _calib.data
+    if (not data.get("calibrated") or "T_world_cam_wrist" in data
+            or not {"K_wrist", "image_size_wrist", "T_ee_cam_wrist", "z_table"} <= data.keys()):
+        return {"ok": False, "error": "Wrist alignment requires measured eye-in-hand and table calibration."}
+    bridge = await _get_bridge()
+    live = isinstance(bridge, LiveStationBridge)
+    if not (live or isinstance(bridge, MockStationBridge)):
+        return {"ok": False, "error": "Unsupported Station bridge."}
+    wrist_id = _calib.hardware_config()["camera_wrist"]
+    limit = data.get("shoulder_torque_limit_nm") if live else 0.6
+    if live and (not wrist_id or not isinstance(limit, (int, float)) or not math.isfinite(limit) or limit <= 0):
+        return {"ok": False, "error": "Live wrist alignment requires a camera ID and calibrated shoulder_torque_limit_nm."}
+
+    K, dist = _calib._K("wrist"), _calib._dist("wrist")
+    size = tuple(data["image_size_wrist"])
+    start = time.monotonic()
+    last_frame = start - PERIOD_S
+    next_sample = start
+    measurement = None
+    iterations = 0
+    motion_in_flight = False
+    error = None
+    planner_key = planner = None
+
+    def wrist_planner(state, obstacles, fraction):
+        nonlocal planner_key, planner
+        key = (state.ranges(), obstacles, fraction)
+        if key != planner_key:
+            planner = _mujoco_planner(state, obstacles, limit, fraction)
+            planner_key = key
+        return planner
+
+    try:
+        async with asyncio.timeout(TIMEOUT_S):
+            state = await bridge.get_state()
+            if live:
+                state = _live_preflight_state(bridge, state)
+            await asyncio.to_thread(
+                wrist_planner, state, list(_obstacles.values()), state.motors[-1].to_norm() if live else 1.0,
+            )
+            while True:
+                await asyncio.sleep(max(0, next_sample - time.monotonic()))
+                next_sample = time.monotonic() + PERIOD_S
+                state = await bridge.get_state()
+                if live:
+                    state = _live_preflight_state(bridge, state)
+                expected_start = (state.bus_serial, state.positions())
+                q = _calib.ticks_to_rad(state.motors)
+                jpeg = await bridge.get_frame("wrist")
+                if live:
+                    key = bridge._resolve_cam_key("wrist")
+                    if wrist_id not in key:
+                        raise ValueError("Configured wrist camera is not streaming.")
+                    received = bridge.frame_received_at.get(key, 0)
+                    if received <= last_frame or time.monotonic() - received > PERIOD_S:
+                        continue
+                    last_frame = received
+                frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                if frame is None or frame.shape[1::-1] != size:
+                    raise ValueError("Wrist frame does not match the calibrated image size.")
+                measurement = await asyncio.to_thread(
+                    alignment_step, frame, K, dist, _calib.T_world_cam("wrist", q),
+                    _calib.fk_ee_pose(q, TOOL_FRAME), _calib.z_table(),
+                )
+                iterations += 1
+                if measurement.error_mm <= min(tol_mm, 0.99) and abs(measurement.yaw_error_rad) <= YAW_TOL_RAD:
+                    current = await bridge.get_state()
+                    if (current.bus_serial, current.positions()) == expected_start:
+                        break
+                    continue
+                motion_in_flight = True
+                move = await _plan_and_move(
+                    *measurement.position, limit, *measurement.rotation.as_quat(), True, expected_start=expected_start,
+                    wrist_planner=wrist_planner,
+                )
+                motion_in_flight = False
+                if not move["ok"]:
+                    error = "; ".join(move["problems"])
+                    break
+                last_frame = time.monotonic()
+    except TimeoutError:
+        error = "Wrist alignment timed out."
+    except (ValueError, RuntimeError, cv2.error) as exc:
+        error = str(exc)
+    finally:
+        if motion_in_flight and not _estop_lock.locked():
+            try:
+                await bridge.abort()
+            except RuntimeError as exc:
+                error = f"{error or 'Wrist alignment interrupted.'} Station hold failed: {exc}"
+    result = {"ok": error is None, "elapsed_s": time.monotonic() - start, "iterations": iterations}
+    if error is not None:
+        result["error"] = error
+    if measurement is not None:
+        result.update(error_mm=measurement.error_mm, yaw_error_deg=math.degrees(measurement.yaw_error_rad))
+    return result
+
+
 ### 4. Capture both settled wrist frames for temporal stereo
 ## added by Abhi
 @mcp.tool()
@@ -1635,6 +1770,7 @@ _SEQ_TOOLS = {
     ## added by Abhi
     "detect_requested_object": detect_requested_object,
     "aim_wrist": aim_wrist,
+    "servo_align_wrist": servo_align_wrist,
     "capture_wrist_stereo": capture_wrist_stereo,
     "estimate_wrist_depth": estimate_wrist_depth,
     "measure_graspability": measure_graspability,

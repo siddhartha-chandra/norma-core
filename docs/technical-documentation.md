@@ -181,6 +181,7 @@ Tool names are the public contract. Agents should call them by name.
 | **Kinematics and 3D** | `solve_ik(x, y, z, qx, qy, qz, qw)`, `get_metric_depth(x, y, camera, q_rad)`, `pixel_to_world(...)`, `localize_3d(...)` |
 | **Composite motion** | `plan_and_move` (MuJoCo preflight; dry run unless `execute=True`), `move_to_pose`, `move_flange` (dry run unless `execute=True`), `pick_at`, `place_at`, `pick_pixel(x, y, yaw)`, `execute_sequence(steps, stop_on_false)` |
 | **Wrist-stereo pipeline** | `detect_requested_object`, `aim_wrist`, `capture_wrist_stereo`, `estimate_wrist_depth`, `measure_graspability`, `estimate_grasp_pose` (legacy), `plan_tolerant_grasp`, `retract_to_hover`, `move_to_drop`, `master_pick_place` |
+| **Wrist final approach** | `servo_align_wrist(tol_mm=1.5)` |
 | **Safety and scene** | `update_scene_obstacle`, `robo_jev_arm_watch`, `robo_jev_check`, `robo_jev_guard`, `speak_status` |
 | **Mock helpers** | `mock_add_object`, `mock_scene_state`, `mock_reset_scene` |
 
@@ -209,7 +210,16 @@ rates of residual motion.
 On a stall or an unconfirmed target write, Station attempts to hold the measured position.
 The model does not account for payload or dynamic torque. A simulation budget is not a hardware rating.
 To request just the MuJoCo IK solution, pass the same limit to `solve_ik`; without it the existing IK
-backend is unchanged. The other motion tools do not run this preflight.
+backend is unchanged.
+
+`servo_align_wrist` moves at the current hover height without closing the jaws. Start with the open
+gripper pointing down and an isolated, elongated, saturated-color marker near the center of the wrist
+view. It projects the marker to the calibrated table plane, centers the camera's optical ray there, and
+turns the jaws perpendicular to the marker's long axis. It uses local CPU vision at a target rate of
+10 Hz, caps the centering tolerance at 0.99 mm, and requires yaw within 2° before returning success.
+It reuses the MuJoCo path preflight with a 1.5 s control deadline; live Station feedback and settling can reduce
+the update rate. For live use, configure the measured wrist calibration and camera ID, enable arm
+torque, and set an appropriate `shoulder_torque_limit_nm` model budget in the active rig JSON.
 
 ### 4.2 Motion lock and run log
 

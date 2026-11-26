@@ -1,0 +1,91 @@
+import asyncio
+import math
+
+import cv2
+import numpy as np
+import pytest
+from scipy.spatial.transform import Rotation
+
+from desk_core import mcp_server
+from desk_core.station_bridge import MockStationBridge
+from desk_core.wrist_ibvs import alignment_step
+
+
+K = np.array([[500., 0., 320.], [0., 500., 240.], [0., 0., 1.]])
+FLANGE = np.eye(4)
+FLANGE[:3, :3] = Rotation.from_euler("x", -90, degrees=True).as_matrix()
+FLANGE[:3, 3] = [0, 0, 0.15]
+MOUNT = np.eye(4)
+MOUNT[:3, :3] = Rotation.from_euler("x", -90, degrees=True).as_matrix()
+MOUNT[:3, 3] = [0.004, 0, 0.01]
+
+
+def frame_of_marker(camera, center, yaw_deg):
+    yaw = math.radians(yaw_deg)
+    major = np.array([math.cos(yaw), math.sin(yaw)]) * 0.018
+    minor = np.array([-math.sin(yaw), math.cos(yaw)]) * 0.005
+    corners = np.array([center + a * major + b * minor for a, b in ((-1, -1), (-1, 1), (1, 1), (1, -1))])
+    points = (np.c_[corners, np.zeros(4)] - camera[:3, 3]) @ camera[:3, :3]
+    image_points = points @ K.T
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    cv2.fillConvexPoly(frame, np.rint(image_points[:, :2] / image_points[:, 2:]).astype(np.int32), (0, 30, 220))
+    return frame
+
+
+def test_center_and_perpendicular_jaw_yaw_converge_with_camera_offset():
+    flange = FLANGE.copy()
+    target = np.array([0.013, -0.007])
+    first = None
+    for _ in range(10):
+        camera = flange @ MOUNT
+        frame = frame_of_marker(camera, target, 53)
+        step = alignment_step(frame, K, None, camera, flange, 0.0)
+        if first is None:
+            first = step
+        flange[:3, 3] = step.position
+        flange[:3, :3] = step.rotation.as_matrix()
+        if step.error_mm < 0.5 and abs(math.degrees(step.yaw_error_rad)) < 2:
+            break
+    assert first.error_mm == pytest.approx(math.hypot(9, 17), abs=0.3)
+    assert math.degrees(first.yaw_error_rad) == pytest.approx(-37, abs=1)
+    assert step.error_mm < 0.5
+    assert abs(math.degrees(step.yaw_error_rad)) < 2
+    np.testing.assert_allclose(flange[:3, 1], FLANGE[:3, 1], atol=1e-8)
+    assert flange[2, 3] == FLANGE[2, 3]
+
+
+@pytest.mark.parametrize("color, message", [
+    ((200, 200, 200), "No complete colored marker"),
+    ((0, 30, 220), "Marker yaw is ambiguous"),
+])
+def test_empty_and_ambiguous_frames_are_rejected(color, message):
+    frame = np.full((480, 640, 3), 200, dtype=np.uint8)
+    cv2.circle(frame, (320, 240), 25, color, cv2.FILLED)
+    with pytest.raises(ValueError, match=message):
+        alignment_step(frame, K, None, FLANGE @ MOUNT, FLANGE, 0.0)
+
+
+def test_invalid_tolerance_is_reported_before_connecting(monkeypatch):
+    async def unexpected_bridge():
+        pytest.fail("Invalid tolerance must not connect to the Station.")
+
+    monkeypatch.setattr(mcp_server, "_get_bridge", unexpected_bridge)
+    assert not asyncio.run(mcp_server.servo_align_wrist(tol_mm=float("nan")))["ok"]
+
+
+def test_unavailable_camera_times_out_without_joint_commands(monkeypatch, calib):
+    class SlowCamera(MockStationBridge):
+        async def get_frame(self, camera="top", denoise=False):
+            await asyncio.Future()
+
+        async def send_joint_targets(self, targets, max_step):
+            pytest.fail("Alignment must not move without a frame.")
+
+    monkeypatch.setattr(mcp_server, "_bridge", SlowCamera(num_joints=8))
+    monkeypatch.setattr(mcp_server, "_calib", calib)
+    monkeypatch.setattr(mcp_server, "_mujoco_planner", lambda *args: None)
+    monkeypatch.setattr(mcp_server, "TIMEOUT_S", 0.01)
+    result = asyncio.run(mcp_server.servo_align_wrist())
+    assert not result["ok"]
+    assert result["error"] == "Wrist alignment timed out."
+    assert result["iterations"] == 0
