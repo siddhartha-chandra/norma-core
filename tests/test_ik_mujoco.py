@@ -297,11 +297,19 @@ def test_live_gripper_models_open_tolerance(live_station, calib):
         snapshot = mcp_server._live_preflight_state(bridge, await bridge.get_state())
         position = np.asarray(calib.ticks_to_rad(snapshot.motors))
         open_model = mcp_server._mujoco_planner(snapshot, [], 0.6)
-        measured_model = mcp_server._mujoco_planner(snapshot, [], 0.6, snapshot.motors[-1].to_norm())
-        for model in (open_model, measured_model):
-            model.flange_pose(position)
-        jaw = "Gripper_Jaw_01_v1_1"
-        assert not np.allclose(open_model.data.body(jaw).xpos, measured_model.data.body(jaw).xpos)
+        gripper = snapshot.motors[-1]
+        measured_model = mcp_server._mujoco_planner(snapshot, [], 0.6, gripper.to_norm())
+
+        def jaw_gap(model):
+            _, rotation = model.flange_pose(position)
+            slide_axis = np.array([-0.999697, 0.0173, 0.017525])
+            axis = rotation.apply(slide_axis / np.linalg.norm(slide_axis))
+            jaw_01 = model.data.body("Gripper_Jaw_01_v1_1").xpos
+            jaw_02 = model.data.body("Gripper_Jaw_02_v1_1").xpos
+            return np.dot(jaw_02 - jaw_01, axis)
+
+        expected_gap_reduction = 2 * 0.0115 * 2.2028 * 25 / (gripper.range_max - gripper.range_min)
+        assert jaw_gap(open_model) - jaw_gap(measured_model) == pytest.approx(expected_gap_reduction, abs=1e-8)
         state.motors[-1].position -= 1
         with pytest.raises(PlanningError, match="open calibrated gripper"):
             mcp_server._live_preflight_state(bridge, await bridge.get_state())
