@@ -1103,6 +1103,8 @@ class RobotAgentTUI(App):
         log = self.query_one("#chat-log", RichLog)
         res = await self._call_mcp_tool("go_home", {"look_at_table": True})
         if isinstance(res, dict) and res.get("ok") is False:
+            if "error" not in res:
+                log.write(f"[red]Reset Home did not reach home:[/red] {res}")
             return
         log.write(f"[green]Rig reset to table-view home:[/green] {res}")
 
