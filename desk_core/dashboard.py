@@ -249,7 +249,9 @@ async def api_arm_watch() -> dict[str, Any]:
     global _armed_camera, _armed_positions, _wrist_watch_stale
     ref = _detection_positions if cam == "wrist" else None
     if ref is not None and _arm_moved_since(ref, await _arm_joint_positions(await srv._get_bridge())):
-        raise HTTPException(status_code=409, detail="The arm moved since the wrist detection; run Localize again before arming.")
+        msg = "The arm moved since the wrist detection; run Localize again before arming."
+        _log_event("ROBO-JEV", msg, ok=False)
+        raise HTTPException(status_code=409, detail=msg)
     res = await srv.robo_jev_arm_watch(*px, query=q, camera=cam, depth_m=d)
     _armed_camera = cam
     _armed_positions = ref
@@ -858,7 +860,11 @@ DASHBOARD_HTML = """<!doctype html>
       });
       refresh();
     }
-    async function armWatch() { await postJSON('/api/robo_jev/arm'); refresh(); }
+    async function armWatch() {
+      const res = await postJSON('/api/robo_jev/arm');
+      if (res && res.detail) alert(res.detail);
+      refresh();
+    }
     async function checkReflex() { await postJSON('/api/robo_jev/check'); refresh(); }
     async function guardedRecover() { await postJSON('/api/robo_jev/recover'); refresh(); }
     async function mockDisplace(mode) { await postJSON('/api/mock/displace', { mode }); refreshFrames(); refresh(); }
