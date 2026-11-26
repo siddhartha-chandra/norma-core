@@ -1220,6 +1220,13 @@ async def heading_out(execute: bool = False) -> dict:
         return {"ok": False, "executed": False, "problems": ["Need loose keys and a departure_tray in the mock scene"]}
     table = _calib.z_table()
     keys, tray = objects["keys"], objects["departure_tray"]
+    for name, obj in objects.items():
+        if name == "departure_tray":
+            continue
+        dx = max(0.0, abs(obj["x"] - tray["x"]) - tray["radius_m"])
+        dy = max(0.0, abs(obj["y"] - tray["y"]) - tray["radius_m"])
+        if np.hypot(dx, dy) < obj["radius_m"]:
+            return {"ok": False, "executed": False, "problems": [f"Departure tray is occupied by {name}"]}
     if bridge.get_mock_riders("keys"):
         return {"ok": False, "executed": False, "problems": ["Keys are blocked by another object"]}
     tray_height = bridge._obj_height("departure_tray", tray)

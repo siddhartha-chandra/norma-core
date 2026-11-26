@@ -95,6 +95,21 @@ def test_blocked_heading_out_does_not_move_or_leave_a_green_path(desk, monkeypat
     asyncio.run(run())
 
 
+def test_occupied_tray_is_rejected_before_any_mock_motion(desk, monkeypatch):
+    tray = desk.get_mock_scene_state()["objects"]["departure_tray"]
+    desk.add_mock_object("wallet", tray["x"], tray["y"], z=0.018, shape="wallet")
+    initial = desk.get_mock_scene_state()
+    send = AsyncMock()
+    monkeypatch.setattr(desk, "send_joint_targets", send)
+
+    result = asyncio.run(srv.heading_out(execute=True))
+
+    assert not result["ok"] and not result["executed"]
+    assert result["problems"] == ["Departure tray is occupied by wallet"]
+    assert desk.get_mock_scene_state() == initial
+    send.assert_not_called()
+
+
 def test_live_detections_register_primitives_without_moving(monkeypatch):
     class CameraOnly:
         get_frame = AsyncMock(return_value=b"test camera frame")
