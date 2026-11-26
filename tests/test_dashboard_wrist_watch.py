@@ -1,11 +1,18 @@
 """Dashboard wrist watch latch: arm motion makes a wrist watch stale until Localize + Arm Watch."""
-import os
+import pytest
+from fastapi.testclient import TestClient
 
-os.environ.setdefault("DESK_MOCK", "1")
+from desk_core import dashboard
+from desk_core import mcp_server as srv
 
-from fastapi.testclient import TestClient  # noqa: E402
 
-from desk_core import dashboard  # noqa: E402
+@pytest.fixture(autouse=True)
+def _mock_bridge_only(monkeypatch):
+    """Never reach a live Station: these tests drive Check Reflex, which can abort the arm."""
+    monkeypatch.setenv("DESK_MOCK", "1")
+    monkeypatch.setenv("STATION_HOST", "")
+    monkeypatch.setattr(srv, "_bridge", None)
+    yield
 
 
 def _arm_wrist_watch(client: TestClient) -> None:
