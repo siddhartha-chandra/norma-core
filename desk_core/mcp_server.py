@@ -273,6 +273,9 @@ async def grasp(close_ticks: int | None = None) -> dict:
 
 ### 7 and 8. Open the gripper before the pick and during placement
 # Existing MCP tool
+GRIPPER_OPEN_TOL_TICKS = 25
+
+
 @mcp.tool()
 @_traced
 @_motion_tool
@@ -294,7 +297,7 @@ async def release() -> dict:
         motor = next((m for m in state.motors if m.id == gripper_id), None)
         if state.bus_serial != st.bus_serial or motor is None or motor.error_status:
             return {**result, "reason": "Gripper telemetry changed while opening"}
-        if abs(motor.position - target_open) <= 25:
+        if abs(motor.position - target_open) <= GRIPPER_OPEN_TOL_TICKS:
             released = bridge.release_mock_object() if hasattr(bridge, "release_mock_object") else None
             return {**result, "ok": True, "released": True, "released_object": released}
         before = motor.position
@@ -540,7 +543,8 @@ async def get_frame(
     return [json.dumps(meta), Image(data=jpeg, format="jpeg")]
 
 
-def _mujoco_planner(st: RobotState, obstacles: list[SceneObstacle], shoulder_torque_limit_nm: float):
+def _mujoco_planner(st: RobotState, obstacles: list[SceneObstacle], shoulder_torque_limit_nm: float,
+                    gripper_open_fraction: float = 1.0):
     from .ik_mujoco import MuJoCoPlanner, PlanningError
     from .urdf_fk import DEFAULT_ARM_JOINTS
 
@@ -551,7 +555,7 @@ def _mujoco_planner(st: RobotState, obstacles: list[SceneObstacle], shoulder_tor
     if any(not m.range_min <= m.position <= m.range_max or m.range_max <= m.range_min for m in st.motors):
         raise PlanningError("Invalid calibrated motor ranges or current ticks")
     return MuJoCoPlanner(_calib.urdf_path(), _calib.z_table(), obstacles, shoulder_torque_limit_nm,
-                         _calib.bounds_rad(st.motors))
+                         _calib.bounds_rad(st.motors), gripper_open_fraction)
 
 
 ### 6. Solve the flange pose with the configured IK backend
@@ -865,8 +869,9 @@ def _live_preflight_state(bridge: LiveStationBridge, state: RobotState) -> Robot
         motors.append(replace(m, range_min=lo, range_max=hi))
     gripper = _calib.data.get("gripper") or {}
     if (not motors or gripper.get("motor_id") != 8 or motors[-1].id != 8
-            or gripper.get("open_ticks") != motors[-1].range_max or motors[-1].position != motors[-1].range_max):
-        raise PlanningError("Live execution requires a fully open calibrated gripper; payloads are not modeled")
+            or gripper.get("open_ticks") != motors[-1].range_max
+            or abs(motors[-1].position - motors[-1].range_max) > GRIPPER_OPEN_TOL_TICKS):
+        raise PlanningError("Live execution requires an open calibrated gripper; payloads are not modeled")
     bridge._require_fresh_motor_rx(state, state.positions())
     return replace(state, motors=motors)
 
@@ -906,7 +911,8 @@ async def plan_and_move(
     obstacles = list(_obstacles.values())
 
     def preflight():
-        planner = _mujoco_planner(replace(st, motors=motors), obstacles, shoulder_torque_limit_nm)
+        fraction = motors[-1].to_norm() if live and execute else 1.0
+        planner = _mujoco_planner(replace(st, motors=motors), obstacles, shoulder_torque_limit_nm, fraction)
         start = np.asarray(_calib.ticks_to_rad(motors))
         goal = planner.solve_ik([x, y, z], [qx, qy, qz, qw], start)
 

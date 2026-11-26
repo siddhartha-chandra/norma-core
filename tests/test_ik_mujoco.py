@@ -240,3 +240,24 @@ def test_live_stall_replaces_active_target_with_present_position(live_station, c
     assert len(packets) == 2
     assert packets[1][3] == packets[0][3] - 1
     assert packets[1] == state.positions()
+
+
+def test_live_gripper_models_open_tolerance(live_station, calib):
+    bridge, state, _ = live_station
+    state.motors[-1].position -= 25
+
+    async def run():
+        assert (await mcp_server.release())["ok"]
+        snapshot = mcp_server._live_preflight_state(bridge, await bridge.get_state())
+        position = np.asarray(calib.ticks_to_rad(snapshot.motors))
+        open_model = mcp_server._mujoco_planner(snapshot, [], 0.6)
+        measured_model = mcp_server._mujoco_planner(snapshot, [], 0.6, snapshot.motors[-1].to_norm())
+        for model in (open_model, measured_model):
+            model.flange_pose(position)
+        jaw = "Gripper_Jaw_01_v1_1"
+        assert not np.allclose(open_model.data.body(jaw).xpos, measured_model.data.body(jaw).xpos)
+        state.motors[-1].position -= 1
+        with pytest.raises(PlanningError, match="open calibrated gripper"):
+            mcp_server._live_preflight_state(bridge, await bridge.get_state())
+
+    asyncio.run(run())

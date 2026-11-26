@@ -34,7 +34,8 @@ class JointPlan:
 
 class MuJoCoPlanner:
     def __init__(self, urdf_path: Path, table_z: float, obstacles: list[SceneObstacle],
-                 shoulder_torque_limit_nm: float, joint_bounds_rad: list[tuple[float, float]]):
+                 shoulder_torque_limit_nm: float, joint_bounds_rad: list[tuple[float, float]],
+                 gripper_open_fraction: float = 1.0):
         if not np.isfinite(table_z):
             raise PlanningError("Table height must be finite")
         if not math.isfinite(shoulder_torque_limit_nm) or shoulder_torque_limit_nm <= 0:
@@ -42,6 +43,8 @@ class MuJoCoPlanner:
         self.torque_limit = shoulder_torque_limit_nm
 
         root = ET.parse(urdf_path).getroot()
+        if gripper_open_fraction != 1.0:
+            self._pose_gripper(root, gripper_open_fraction)
         ET.SubElement(ET.SubElement(root, "mujoco"), "compiler",
                       strippath="false", fusestatic="false", discardvisual="true")
         for mesh in root.iter("mesh"):
@@ -79,6 +82,34 @@ class MuJoCoPlanner:
         self.upper = np.minimum(bounds[:, 1], limits[:, 1])
         if np.any(self.lower >= self.upper):
             raise PlanningError("Calibrated motor ranges do not overlap the MuJoCo joint limits")
+
+    @staticmethod
+    def _pose_gripper(root: ET.Element, open_fraction: float) -> None:
+        gear = root.find("./joint[@name='rev_motor_08']")
+        if gear is None or not 0 <= open_fraction <= 1:
+            raise PlanningError("Cannot model the measured gripper opening")
+        angle_limits = gear.find("limit").attrib
+        lo, hi = float(angle_limits["lower"]), float(angle_limits["upper"])
+        gear_angle = hi - open_fraction * (hi - lo)
+        for joint in root.findall("joint"):
+            mimic = joint.find("mimic")
+            if joint is gear:
+                q = gear_angle
+            elif mimic is not None and mimic.get("joint") == gear.get("name"):
+                q = gear_angle * float(mimic.get("multiplier", "1")) + float(mimic.get("offset", "0"))
+            else:
+                continue
+            origin = joint.find("origin")
+            xyz = np.fromstring(origin.get("xyz"), sep=" ")
+            rotation = Rotation.from_euler("xyz", np.fromstring(origin.get("rpy"), sep=" "))
+            axis = np.fromstring(joint.find("axis").get("xyz"), sep=" ")
+            axis /= np.linalg.norm(axis)
+            if joint.get("type") == "prismatic":
+                xyz += rotation.apply(axis * q)
+            else:
+                rotation *= Rotation.from_rotvec(axis * q)
+            origin.set("xyz", " ".join(map(str, xyz)))
+            origin.set("rpy", " ".join(map(str, rotation.as_euler("xyz"))))
 
     @staticmethod
     def _add_obstacle(spec: mujoco.MjSpec, obstacle: SceneObstacle, index: int) -> None:
