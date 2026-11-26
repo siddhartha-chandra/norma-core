@@ -23,21 +23,31 @@ def load_script(name):
     return module
 
 
-def test_mcp_tui_requires_arm_motion_for_sweep():
+@pytest.mark.parametrize(("armed", "args", "blocked"), [
+    (False, {}, False),
+    (False, {"execute": False}, False),
+    (False, {"execute": True}, True),
+    (True, {"execute": True}, False),
+])
+def test_mcp_tui_requires_arm_motion_for_sweep_execution_only(armed, args, blocked):
     tui = load_script("mcp_tui")
     messages = []
+    calls = []
     widgets = {
-        "#arm-motion": SimpleNamespace(value=False),
+        "#arm-motion": SimpleNamespace(value=armed),
         "#output-log": SimpleNamespace(write=messages.append),
-        "#args-editor": SimpleNamespace(text='{"execute": true}'),
+        "#args-editor": SimpleNamespace(text=json.dumps(args)),
     }
 
-    async def no_call(*args):
-        pytest.fail("Disarmed sweep must not be sent to MCP")
+    async def call_tool(name, args):
+        calls.append((name, args))
 
-    app = SimpleNamespace(selected_tool="sweep_aside", query_one=lambda name, cls: widgets[name], _call_tool=no_call)
+    app = SimpleNamespace(selected_tool="sweep_aside", query_one=lambda name, cls: widgets[name], _call_tool=call_tool)
     asyncio.run(tui.DeskCoreTUI.action_run_selected(app))
-    assert "Blocked sweep_aside" in messages[0]
+    if blocked:
+        assert not calls and "Blocked sweep_aside" in messages[0]
+    else:
+        assert calls == [("sweep_aside", args)] and not messages
 
 
 @pytest.fixture(scope="module")
