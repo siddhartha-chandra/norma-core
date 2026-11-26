@@ -371,7 +371,11 @@ class CalibrationStore:
     ) -> tuple[float, float, float]:
         """Project 2D pixel (x, y) into metric robot base-frame (X, Y, Z) in meters."""
         H = self.data.get("H_table")
-        if H is not None and camera == "top" and (z_m is None or self.T_world_cam("top") is None):
+        if H is not None and camera == "top" and (
+            z_m is None
+            or abs(float(z_m) - self.z_table()) <= 1e-4
+            or self.T_world_cam("top") is None
+        ):
             H_mat = np.asarray(H, dtype=float).reshape(3, 3)
             pt = H_mat @ np.array([float(x), float(y), 1.0])
             if abs(pt[2]) > 1e-8:

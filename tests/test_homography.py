@@ -455,3 +455,24 @@ def test_cli_reanchor_plane_mock_and_move_test(tmp_path: Path):
     assert data["move_test"]["ok"] is True
     assert data["move_test"]["xy_error_mm"] < 10.0
     assert overlay_file.exists() and overlay_file.stat().st_size > 1000
+
+
+def test_pixel_to_world_uses_homography_for_explicit_z_table(tmp_path: Path):
+    """Explicit z_m == z_table() must still use re-anchored H_table over stale T_world_cam_top."""
+    real_raw = json.loads((REPO_ROOT / "calib" / "rig_calib.json").read_text(encoding="utf-8"))
+    calib_file = tmp_path / "rig_calib.json"
+    calib_file.write_text(json.dumps(real_raw), encoding="utf-8")
+
+    # Fit a shifted H_table while keeping stale T_world_cam_top in rig_calib.json
+    H_w2i = _make_tilted_camera_homography()
+    world_corners = [[-0.15, 0.14], [0.15, 0.14], [0.15, 0.34], [-0.15, 0.34]]
+    px_corners = _proj_pts(H_w2i, np.array(world_corners)).tolist()
+    reanchor_plane(px_corners, world_corners, z_table=real_raw["z_table"], calib_path=calib_file)
+
+    cs = CalibrationStore(calib_file)
+    assert cs.T_world_cam("top") is not None
+    u, v = apply_homography(H_w2i, 0.03, 0.22)
+    wx_none, wy_none, wz_none = cs.pixel_to_world(u, v, camera="top")
+    wx_exp, wy_exp, wz_exp = cs.pixel_to_world(u, v, z_m=cs.z_table(), camera="top")
+    assert math.hypot(wx_none - 0.03, wy_none - 0.22) < 0.001
+    assert (wx_exp, wy_exp, wz_exp) == (wx_none, wy_none, wz_none)
