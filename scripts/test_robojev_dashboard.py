@@ -77,6 +77,10 @@ async def test_robo_jev() -> None:
 
     # Guarded recover 1: transient obstacle -> pause, then resume as soon as obstacle clears
     calib = CalibrationStore()
+    calib.data.pop("T_world_cam_top", None)
+    calib.data.pop("H_table", None)
+    calib.data["K_top"] = [[620, 0, 640], [0, 620, 360], [0, 0, 1]]
+    calib.data["dist_top"] = [0] * 5
     gk.clear_watch()
     obs_state = [SceneObstacle("hand", x=0.20, y=0.0, radius_m=0.05)]
     poll_count = 0

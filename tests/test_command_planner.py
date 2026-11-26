@@ -79,6 +79,17 @@ def test_pick_and_place_uses_destination_point(monkeypatch):
     assert plan["steps"][1]["args"] == {"x": 0.34, "y": 0.09, "z": 0.05}
 
 
+def test_grounded_pick_arms_the_target_crop_before_moving(monkeypatch):
+    async def localize(query):
+        return {"found": True, "pixel": [320.0, 240.0], "world": {"x": 0.3, "y": 0.1, "z": 0.05}}
+
+    plan = _run("place keys next to the red box", _answers(0.95, "place_next_to"), localize, monkeypatch)
+    assert plan["steps"][0] == {
+        "tool": "robo_jev_arm_watch", "args": {"x": 320.0, "y": 240.0, "query": "keys"},
+    }
+    assert plan["steps"][1]["tool"] == "pick_at"
+
+
 def test_go_home_needs_no_grounding(monkeypatch):
     loc = _localizer({})
     plan = _run("go home", _answers(0.97, "go_home"), loc, monkeypatch)

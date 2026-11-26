@@ -23,6 +23,7 @@ from .motion import MotionLimits, calibrated_range, lowest_point_m, stream_joint
 from .object_measurement import fit_cuboid, segment
 from .pose_estimation import estimate_grasp_pose as grasp_pose_from_stereo
 from .pose_estimation import estimate_top_surface, pixels_on_plane
+from .robo_jev import ReflexMonitor, RoboJevGatekeeper
 from .station_bridge import DEFAULT_MAX_STEP, GRIPPER_SLACK_STEPS, REPO_ROOT
 from .stereo_sweep import aim_wrist as plan_wrist_aim
 from .stereo_sweep import capture_wrist_stereo as run_wrist_sweep
@@ -110,11 +111,12 @@ def _jaw_bounds(urdf: Path) -> np.ndarray:
 class MainControl:
     """Runs each stage with the same bridge, calibration and registered obstacles."""
 
-    def __init__(self, bridge, calib, tools, obstacles):
+    def __init__(self, bridge, calib, tools, obstacles, gatekeeper: RoboJevGatekeeper | None = None):
         self.bridge = bridge
         self.calib = calib
         self.tools = tools
         self.obstacles = obstacles
+        self.gatekeeper = gatekeeper
         self.captures: dict[str, WristMeasurement] = {}
         self.pick_plan: dict | None = None
 
@@ -197,6 +199,10 @@ class MainControl:
         pad = 80
         if not (x - pad <= cx <= x + w + pad and y - pad <= cy <= y + h + pad):
             raise ValueError("Wrist detection disagrees with the scene target projection.")
+        if self.gatekeeper is not None:
+            world = tuple(detection["world"][axis] for axis in "xyz")
+            self.gatekeeper.arm_watch(jpeg.tobytes(), tuple(detection["pixel"]), query=query,
+                                      depth_m=detection["depth_m"], camera="wrist", world=world)
         # Leave a background band for GrabCut around the detected box.
         x0, x1 = max(0, x0 - 5), min(width, x1 + 5)
         y0, y1 = max(0, y0 - 5), min(height, y1 + 5)
@@ -207,12 +213,12 @@ class MainControl:
     ### 3. Aim the wrist with the measured coarse scene target.
     async def aim_wrist(self, target_base_m, execute=False) -> dict:
         return await plan_wrist_aim(self.bridge, self.calib, target_base_m, execute=execute,
-                                    obstacles=tuple(self.obstacles.values()))
+                                    obstacles=tuple(self.obstacles.values()), reflex=self._reach_reflex())
 
     ### 4. Capture an identified pair and estimate sparse wrist depth.
     async def capture_wrist_stereo(self, target_base_m, execute=False) -> dict:
         capture = await run_wrist_sweep(self.bridge, self.calib, target_base_m, execute=execute,
-                                       obstacles=tuple(self.obstacles.values()))
+                                       obstacles=tuple(self.obstacles.values()), reflex=self._reach_reflex())
         if not capture.get("ok") or not execute:
             return capture
         pair = capture.pop("pair")
@@ -444,7 +450,10 @@ class MainControl:
         expected_start = self.calib.rad_to_ticks(start, state.motors)
         if any(abs(actual_start[mid] - tick) > 6 for mid, tick in expected_start.items()):
             raise ValueError("The follower moved while this path was being checked.")
-        _require(await stream_joint_path(self.bridge, self.calib, path, duration, operator_limits, gravity_ff=False))
+        run = await stream_joint_path(self.bridge, self.calib, path, duration, operator_limits, gravity_ff=False,
+                                      reflex=self._reach_reflex())
+        if not run["ok"]:
+            raise ValueError(run.get("aborted", "Checked motion failed."))
         targets = self.calib.rad_to_ticks(list(goal), state.motors)
         for _ in range(15):
             final = (await self._motor_state()).positions()
@@ -456,6 +465,12 @@ class MainControl:
             raise ValueError(f"Follower did not settle at the checked waypoint (ticks off: {off}).")
 
     ### 7. Pick, then lift and recheck the gripper.
+    def _reach_reflex(self):
+        if self.gatekeeper is None or self.gatekeeper.watch is None:
+            return None
+        target = self.calib.pixel_to_world(*self.gatekeeper.watch.ref_pixel, camera="top")
+        return ReflexMonitor(self.gatekeeper, self.bridge, self.calib, lambda: list(self.obstacles.values()), target[:2])
+
     async def _require_held(self):
         state = await self._motor_state()
         gripper = state.motors[-1]
@@ -476,6 +491,8 @@ class MainControl:
         await self._move_checked(hover, limits)
         await self._move_checked(contact, limits)
         grip = _require(await self.tools["grasp"]())
+        if self.gatekeeper is not None:
+            self.gatekeeper.clear_watch()
         if not grip.get("holding"):
             raise ValueError("Gripper did not verify contact.")
         await self.retract_to_hover(limits, carried)
@@ -566,6 +583,9 @@ class MainControl:
                 await self._motor_state()
             for obstacle in obstacles or ():
                 await self.tools["update_scene_obstacle"](**obstacle)
+            if execute and self.gatekeeper is not None:
+                found = detection["detection"]
+                await self.tools["robo_jev_arm_watch"](*found["pixel"], query=query, depth_m=found["depth_m"])
             complete(stage)
 
             stage = "aim_wrist"
@@ -644,7 +664,9 @@ class MainControl:
         except Exception as exc:
             complete(stage)
             recovery = {}
-            if moved:
+            if self.gatekeeper is not None and self.bridge.abort_source == "reflex":
+                recovery = {"tool": "robo_jev_guard", "reflex": self.gatekeeper.interruption}
+            elif moved:
                 try:
                     recovery["estop"] = await self.tools["estop"]()
                     await self.observe()
@@ -652,6 +674,9 @@ class MainControl:
                     recovery["error"] = str(recovery_error)
             return {"ok": False, "executed": moved, "failed_step": stage, "error": str(exc),
                     "trace": trace, "recovery": recovery}
+        finally:
+            if execute and self.gatekeeper is not None and self.bridge.abort_source != "reflex":
+                self.gatekeeper.clear_watch()
 
 
 ## added by Abhi

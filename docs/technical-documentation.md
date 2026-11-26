@@ -324,7 +324,9 @@ Recorded results: the wrist mount was refit on 19 poses, and a 4-pose held-out v
 | `will_tip` | Proximity to fragile obstacles (for example a mug) or a high-aspect target | Margin-based |
 | `path_clear` | 2D segment from end effector to target intersects a registered obstacle | Geometric |
 
-On a trigger, the gatekeeper calls `bridge.abort()`. Workspace bounds are `x ∈ [0.08, 0.44]` m, `y ≤ 0.26` m, and `z ≤ 0.35` m. `guarded_recover` is the recovery path after a trigger; the dashboard exposes guarded recover controls for it.
+Arm a localized target with `robo_jev_arm_watch` before starting a reach. Use separate top and wrist pixels and the same query when the object is visible in both views. `master_pick_place` arms the top view at scene localization and adds the wrist crop once stereo confirms the target. A wrist watch uses the current joint pose to account for camera translation in the image.
+
+Armed crops are checked while streaming, independently of the agent. A hazard calls `bridge.abort(source="reflex")` and ends the interrupted trajectory. The agent calls `robo_jev_guard` (also available from the dashboard) to re-localize within the workspace bounds, then plans a new reach from the stopped pose. Observing the cameras does not clear a reflex stop, and guarded recovery cannot clear a manual E-stop.
 
 ### 5.9 Replay and observability
 

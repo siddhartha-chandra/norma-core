@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from dataclasses import dataclass
 from functools import lru_cache
 import json
@@ -15,7 +16,8 @@ from scipy.spatial.transform import Rotation
 
 from .calib_store import TICKS_PER_RAD, CalibrationStore
 from .ik_tracik import TOOL_FRAME, get_solver
-from .station_bridge import ELROBOT_MOTOR_RANGES, MAX_ANGLE_STEP, MotorState, StationBridge
+from .robo_jev import ReflexMonitor
+from .station_bridge import ELROBOT_MOTOR_RANGES, MAX_ANGLE_STEP, EStopLatched, MotorState, StationBridge
 from .urdf_fk import load_urdf
 
 log = logging.getLogger(__name__)
@@ -213,7 +215,7 @@ def plan_flange_move(calib: CalibrationStore, motors: list[MotorState], shift_m,
 
 async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path: np.ndarray, duration: float,
                             limits: MotionLimits | None = None, gravity_ff: bool = True,
-                            trace: list | None = None) -> dict:
+                            trace: list | None = None, reflex: ReflexMonitor | None = None) -> dict:
     """Stream a joint path along a minimum-jerk profile; hold position on excessive tracking lag or error.
 
     Parameters
@@ -233,6 +235,8 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
         measured against the uncompensated path.
     trace : list, optional
         If given, receives ``(t_s, measured_rad, expected_rad)`` for every streamed cycle.
+    reflex : ReflexMonitor, optional
+        Watch the target and hold on hazards while streaming.
 
     Returns
     -------
@@ -241,7 +245,8 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
     """
     limits = limits or MotionLimits()
     period = 1.0 / limits.rate_hz
-    motors = (await bridge.get_state()).motors
+    initial_state = await bridge.get_state()
+    motors = initial_state.motors
     n_arm = calib.num_arm_joints(len(motors))
     arm_ids = [m.id for m in motors[:n_arm]]
     urdf = str(calib.urdf_path())
@@ -254,33 +259,49 @@ async def stream_joint_path(bridge: StationBridge, calib: CalibrationStore, path
 
     start, cycles, worst_lag = time.monotonic(), 0, 0
     try:
-        while (t := time.monotonic() - start) <= duration + period:
-            await bridge.send_joint_targets(ticks_at(min_jerk((t + period) / duration), commanded),
-                                            max_step=limits.max_step_ticks)
-            state = await bridge.get_state()
-            present = state.positions()
-            expected = ticks_at(min_jerk(t / duration))
-            if trace is not None:
-                trace.append((t, calib.ticks_to_rad(state.motors), _sample(path, min_jerk(t / duration)).tolist()))
-            lag = {mid: present[mid] - expected[mid] for mid in arm_ids}
-            worst_lag = max(worst_lag, max(abs(v) for v in lag.values()))
-            if max(abs(v) for v in lag.values()) > limits.lag_limit_ticks:
-                hold = await bridge.abort()
-                return {"ok": False, "aborted": f"lag {lag} at t={t:.2f}s", "hold": hold, "cycles": cycles}
-            cycles += 1
-            await asyncio.sleep(max(0.0, start + cycles * period - time.monotonic()))
-        await bridge.send_joint_targets(ticks_at(1.0, commanded), max_step=limits.max_step_ticks)
-        await bridge.wait_settle(ticks_at(1.0), tol_ticks=15, timeout_s=1.0)
+        if reflex is not None:
+            reflex.state = initial_state
+        async with (reflex if reflex is not None else contextlib.nullcontext()):
+            while (t := time.monotonic() - start) <= duration + period:
+                if reflex is not None and reflex.report is not None:
+                    break
+                await bridge.send_joint_targets(ticks_at(min_jerk((t + period) / duration), commanded),
+                                                max_step=limits.max_step_ticks)
+                state = await bridge.get_state()
+                if reflex is not None:
+                    reflex.state = state
+                    if reflex.report is not None:
+                        break
+                present = state.positions()
+                expected = ticks_at(min_jerk(t / duration))
+                if trace is not None:
+                    trace.append((t, calib.ticks_to_rad(state.motors), _sample(path, min_jerk(t / duration)).tolist()))
+                lag = {mid: present[mid] - expected[mid] for mid in arm_ids}
+                worst_lag = max(worst_lag, max(abs(v) for v in lag.values()))
+                if max(abs(v) for v in lag.values()) > limits.lag_limit_ticks:
+                    hold = await bridge.abort()
+                    return {"ok": False, "aborted": f"lag {lag} at t={t:.2f}s", "hold": hold, "cycles": cycles}
+                cycles += 1
+                await asyncio.sleep(max(0.0, start + cycles * period - time.monotonic()))
+            if reflex is None or reflex.report is None:
+                await bridge.send_joint_targets(ticks_at(1.0, commanded), max_step=limits.max_step_ticks)
+                await bridge.wait_settle(ticks_at(1.0), tol_ticks=15, timeout_s=1.0)
+    except EStopLatched:
+        if reflex is None or reflex.report is None:
+            raise
     except BaseException as exc:
         log.warning("flange stream aborted: %r", exc)
         await bridge.abort()
         raise
+    if reflex is not None and reflex.report is not None:
+        return {"ok": False, "aborted": reflex.report["reason"], "reflex": reflex.report, "cycles": cycles}
     final = (await bridge.get_state()).positions()
     return {"ok": True, "cycles": cycles, "elapsed_s": round(time.monotonic() - start, 2), "worst_lag_ticks": worst_lag,
             "final_ticks": [final[mid] for mid in arm_ids]}
 
 
-async def move_joints_smooth(bridge: StationBridge, calib: CalibrationStore, q_goal, limits: MotionLimits | None = None) -> dict:
+async def move_joints_smooth(bridge: StationBridge, calib: CalibrationStore, q_goal, limits: MotionLimits | None = None,
+                             reflex: ReflexMonitor | None = None) -> dict:
     """Move the arm in joint space to ``q_goal`` (radians) as one continuous minimum-jerk stream.
 
     The peak joint speed is ``limits.joint_speed_deg_s`` (or ``limits.min_duration_s`` for short moves); the
@@ -293,7 +314,7 @@ async def move_joints_smooth(bridge: StationBridge, calib: CalibrationStore, q_g
     path = np.vstack([q0, goal])
     travel = float(np.max(np.abs(goal - q0)))
     duration = max(limits.min_duration_s, 1.875 * travel / math.radians(limits.joint_speed_deg_s))
-    run = await stream_joint_path(bridge, calib, path, duration, limits)
+    run = await stream_joint_path(bridge, calib, path, duration, limits, reflex=reflex)
     if run["ok"]:
         corr = await correct_final_pose(bridge, calib, path, limits)
         run["correction"] = corr

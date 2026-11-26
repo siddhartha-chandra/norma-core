@@ -734,13 +734,13 @@ def _target_roi(T_cam, K, dist, target, size):
     return (int(x) - 80, int(y) - 80, 160, 160), pixel.tolist(), depth
 
 
-async def _execute_wrist_path(bridge, calib, path, duration, limits):
+async def _execute_wrist_path(bridge, calib, path, duration, limits, reflex=None):
     state = await _wrist_state(bridge, calib)
     start = calib.rad_to_ticks(path[0].tolist(), state.motors)
     if any(abs(state.positions()[mid] - tick) > 6 for mid, tick in start.items()):
         return {"ok": False, "reason": "The arm moved while the wrist path was planned."}
     # Validate and stream the same path without feed-forward offsets changing its geometry.
-    run = await stream_joint_path(bridge, calib, path, duration, limits, gravity_ff=False)
+    run = await stream_joint_path(bridge, calib, path, duration, limits, gravity_ff=False, reflex=reflex)
     if not run["ok"]:
         return {"ok": False, "reason": run.get("aborted", "Wrist motion failed."), "motion_started": True}
     actual = await _wrist_state(bridge, calib)
@@ -751,7 +751,7 @@ async def _execute_wrist_path(bridge, calib, path, duration, limits):
 
 
 ### 3. Aim the wrist camera.
-async def aim_wrist(bridge, calib, target_base_m, *, execute=False, obstacles=()):
+async def aim_wrist(bridge, calib, target_base_m, *, execute=False, obstacles=(), reflex=None):
     """Find a usable view of a metric target and optionally make one checked move."""
     K, dist, size = _wrist_calibration(calib)
     target = np.asarray(target_base_m, dtype=float).reshape(3)
@@ -782,7 +782,7 @@ async def aim_wrist(bridge, calib, target_base_m, *, execute=False, obstacles=()
               "plan": selected.describe(), "duration_s": duration}
     if not execute:
         return result
-    motion = await _execute_wrist_path(bridge, calib, selected.path, duration, limits)
+    motion = await _execute_wrist_path(bridge, calib, selected.path, duration, limits, reflex=reflex)
     if not motion["ok"]:
         return motion
     final = await _wrist_state(bridge, calib)
@@ -814,7 +814,7 @@ async def _capture_settled_wrist(bridge, calib, camera, size, *, after_stamp=Non
 
 
 ### 4. Capture one epipolar stereo pair.
-async def capture_wrist_stereo(bridge, calib, target_base_m, *, execute=False, query=None, obstacles=()):
+async def capture_wrist_stereo(bridge, calib, target_base_m, *, execute=False, query=None, obstacles=(), reflex=None):
     """Plan one clear lateral move and optionally capture both encoder-paired frames."""
     K, dist, size = _wrist_calibration(calib)
     target = np.asarray(target_base_m, dtype=float).reshape(3)
@@ -853,7 +853,7 @@ async def capture_wrist_stereo(bridge, calib, target_base_m, *, execute=False, q
               "plan": slide.plan["summary"], "camera_key": camera, "bus_serial": state.bus_serial}
     if not execute:
         return result
-    motion = await _execute_wrist_path(bridge, calib, slide.plan["path"], slide.plan["duration_s"], limits)
+    motion = await _execute_wrist_path(bridge, calib, slide.plan["path"], slide.plan["duration_s"], limits, reflex=reflex)
     if not motion["ok"]:
         return motion
     frame_b, final, ticks_b, _ = await _capture_settled_wrist(bridge, calib, camera, size, after_stamp=stamp_a)

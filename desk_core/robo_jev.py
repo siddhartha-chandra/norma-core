@@ -10,6 +10,7 @@ registered obstacles, and ST3215 jaw telemetry:
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import time
 from collections import deque
@@ -57,6 +58,7 @@ class ReflexWatchTarget:
     ref_crop_gray: np.ndarray
     box_px: tuple[int, int, int, int]  # x1, y1, x2, y2
     depth_m: float = 0.62
+    world: tuple[float, float, float] | None = None
     created_at: float = field(default_factory=time.monotonic)
 
 
@@ -72,7 +74,8 @@ class RoboJevGatekeeper:
         self.shift_px_threshold = float(shift_px_threshold)
         self.shift_mm_threshold = float(shift_mm_threshold)
         self.safe_bounds = safe_bounds or WorkspaceBounds()
-        self.watch: ReflexWatchTarget | None = None
+        self.watches: dict[str, ReflexWatchTarget] = {}
+        self.interruption: dict[str, Any] | None = None
         self.last_report: dict[str, Any] = {
             "ok": True,
             "target_shifted": False,
@@ -86,6 +89,10 @@ class RoboJevGatekeeper:
         }
         self.events: deque[dict[str, Any]] = deque(maxlen=50)
 
+    @property
+    def watch(self) -> ReflexWatchTarget | None:
+        return self.watches.get("top")
+
     def arm_watch(
         self,
         jpeg_bytes: bytes,
@@ -93,6 +100,8 @@ class RoboJevGatekeeper:
         query: str = "target",
         depth_m: float = 0.62,
         half_crop: int = 36,
+        camera: str = "top",
+        world: tuple[float, float, float] | None = None,
     ) -> dict[str, Any]:
         """Capture a reference grayscale crop around `pixel` for `<150 ms` shift tracking."""
         bgr = _decode_bgr(jpeg_bytes)
@@ -103,12 +112,13 @@ class RoboJevGatekeeper:
         x2, y2 = min(w, cx + half_crop), min(h, cy + half_crop)
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         crop = gray[y1:y2, x1:x2].copy()
-        self.watch = ReflexWatchTarget(
+        self.watches[camera] = ReflexWatchTarget(
             query=query,
             ref_pixel=(float(pixel[0]), float(pixel[1])),
             ref_crop_gray=crop,
             box_px=(x1, y1, x2, y2),
             depth_m=float(depth_m),
+            world=world,
         )
         return {
             "armed": True,
@@ -118,7 +128,7 @@ class RoboJevGatekeeper:
         }
 
     def clear_watch(self) -> None:
-        self.watch = None
+        self.watches.clear()
 
     def check_target_shifted(
         self,
@@ -126,18 +136,29 @@ class RoboJevGatekeeper:
         calib: CalibrationStore | None = None,
         camera: str = "top",
         search_pad: int = 110,
+        expected_pixel: tuple[float, float] | None = None,
     ) -> dict[str, Any]:
         """Measure target displacement against armed reference crop in <150 ms CPU time."""
         t0 = time.perf_counter()
-        if self.watch is None:
+        watch = self.watches.get(camera)
+        if watch is None:
             return {"shifted": False, "shift_px": 0.0, "shift_mm": 0.0, "latency_ms": 0.0, "armed": False}
 
         bgr = _decode_bgr(curr_jpeg)
         h, w = bgr.shape[:2]
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        x1, y1, x2, y2 = self.watch.box_px
-        crop = self.watch.ref_crop_gray
+        x1, y1, x2, y2 = watch.box_px
+        crop = watch.ref_crop_gray
         ch, cw = crop.shape[:2]
+        fx = float(calib._K(camera)[0, 0]) if calib is not None else 560.0
+        if camera == "wrist" and watch.depth_m > 0:
+            search_pad = max(search_pad, min(240, math.ceil(0.09 * fx / watch.depth_m)))
+        ref_x, ref_y = watch.ref_pixel
+        ex, ey = expected_pixel if expected_pixel is not None else watch.ref_pixel
+        offset_x, offset_y = round(ex - ref_x), round(ey - ref_y)
+        x1, x2, y1, y2 = x1 + offset_x, x2 + offset_x, y1 + offset_y, y2 + offset_y
+        if not (0 <= x1 < x2 <= w and 0 <= y1 < y2 <= h):
+            return {"shifted": False, "shift_px": 0.0, "shift_mm": 0.0, "armed": True}
 
         # Original ROI absolute delta
         roi_curr = gray[y1:y2, x1:x2]
@@ -152,7 +173,7 @@ class RoboJevGatekeeper:
 
         shift_px = 0.0
         match_score = 1.0
-        new_px = [self.watch.ref_pixel[0], self.watch.ref_pixel[1]]
+        new_px = None
 
         if search.shape[0] > ch + 2 and search.shape[1] > cw + 2 and float(np.std(crop)) > 2.0:
             res = cv2.matchTemplate(search, crop, cv2.TM_CCOEFF_NORMED)
@@ -163,14 +184,14 @@ class RoboJevGatekeeper:
             dx = matched_cx - (x1 + 0.5 * cw)
             dy = matched_cy - (y1 + 0.5 * ch)
             shift_px = float(math.hypot(dx, dy))
-            new_px = [round(self.watch.ref_pixel[0] + dx, 1), round(self.watch.ref_pixel[1] + dy, 1)]
+            new_px = [round(ref_x + offset_x + dx, 1), round(ref_y + offset_y + dy, 1)]
 
-        fx = float(calib._K(camera)[0, 0]) if calib is not None else 560.0
-        shift_mm = (shift_px / max(1.0, fx)) * self.watch.depth_m * 1000.0
+        shift_mm = (shift_px / max(1.0, fx)) * watch.depth_m * 1000.0
 
         # Trigger if object slid noticeably OR vanished from the ROI (low correlation + high pixel change)
-        vanished = mad_roi > 24.0 and match_score < 0.45
-        shifted = (shift_px >= self.shift_px_threshold) or (shift_mm >= self.shift_mm_threshold) or vanished
+        vanished = expected_pixel is None and mad_roi > 24.0 and match_score < 0.45
+        shifted = vanished or (new_px is not None and match_score >= 0.45 and
+                               (shift_px >= self.shift_px_threshold or shift_mm >= self.shift_mm_threshold))
         latency_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         return {
@@ -181,7 +202,7 @@ class RoboJevGatekeeper:
             "shift_mm": round(shift_mm, 2),
             "match_score": round(match_score, 3),
             "mad_roi": round(mad_roi, 2),
-            "new_pixel": new_px,
+            "new_pixel": new_px if not vanished else None,
             "latency_ms": latency_ms,
         }
 
@@ -227,12 +248,13 @@ class RoboJevGatekeeper:
         gripper_current_ma: int = 0,
         gripper_holding: bool | None = None,
         camera: str = "top",
+        expected_pixel: tuple[float, float] | None = None,
     ) -> dict[str, Any]:
         """Run all 4 Robo-Jev checks (`target_shifted`, `path_clear`, `will_tip`, `grasp_secure`)."""
         t0 = time.perf_counter()
         shift_info = (
-            self.check_target_shifted(curr_jpeg, calib=calib, camera=camera)
-            if (curr_jpeg is not None and self.watch is not None)
+            self.check_target_shifted(curr_jpeg, calib=calib, camera=camera, expected_pixel=expected_pixel)
+            if curr_jpeg is not None
             else {"shifted": False, "shift_px": 0.0, "shift_mm": 0.0, "latency_ms": 0.0, "armed": False}
         )
 
@@ -267,6 +289,7 @@ class RoboJevGatekeeper:
         report = {
             "ok": ok,
             "reason": reason,
+            "camera": camera,
             "target_shifted": bool(shift_info["shifted"]),
             "shift_px": shift_info["shift_px"],
             "shift_mm": shift_info["shift_mm"],
@@ -282,6 +305,84 @@ class RoboJevGatekeeper:
         if not ok:
             self.events.append({"ts": time.time(), **report})
         return report
+
+
+class ReflexMonitor:
+    """Poll armed cameras alongside a reach and latch Station before returning a failed motion."""
+
+    def __init__(self, gatekeeper, bridge, calib, obstacles_fn, target_xy=None):
+        self.gatekeeper = gatekeeper
+        self.bridge = bridge
+        self.calib = calib
+        self.obstacles_fn = obstacles_fn
+        self.target_xy = target_xy
+        self.report = None
+        self.state = None
+        self.task = None
+
+    async def __aenter__(self):
+        if self.gatekeeper.watches:
+            self.task = asyncio.create_task(self._poll())
+        return self
+
+    async def __aexit__(self, *_):
+        if self.task is not None:
+            if self.report is None:
+                self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=self.report is None)
+
+    async def _poll(self):
+        async def check_camera(camera, watch, state):
+            expected = None
+            if camera == "wrist" and watch.world is not None:
+                if state is None:
+                    return None
+                q_rad = self.calib.ticks_to_rad(state.motors)
+                expected = self.calib.project_world_to_pixel(watch.world, camera, q_rad)
+                if expected is None:
+                    return None
+            jpeg = await self.bridge.get_reflex_frame(camera)
+            obstacles = self.obstacles_fn()
+            start_xy = (0.15, 0.0)
+            if state and self.target_xy is not None and obstacles:
+                q_rad = self.calib.ticks_to_rad(state.motors)
+                start_xy = tuple(self.calib.fk_ee_pose(q_rad)[:2, 3])
+            return self.gatekeeper.evaluate(
+                curr_jpeg=jpeg, calib=self.calib, obstacles=obstacles, target_xy=self.target_xy, start_xy=start_xy,
+                gripper_current_ma=state.motors[-1].current_ma if state and state.motors else 0,
+                camera=camera, expected_pixel=expected,
+            )
+
+        while True:
+            started = time.perf_counter()
+            watches = tuple(self.gatekeeper.watches.items())
+            if not watches:
+                return
+            tasks = {asyncio.create_task(check_camera(camera, watch, self.state)) for camera, watch in watches}
+            try:
+                try:
+                    async with asyncio.timeout(0.1):
+                        for task in asyncio.as_completed(tasks):
+                            report = await task
+                            if report is not None and not report["ok"]:
+                                break
+                        else:
+                            report = None
+                except Exception:
+                    report = {"ok": False, "reason": "reflex_camera_unavailable", "target_shifted": False}
+                if report is not None:
+                    self.report = self.gatekeeper.interruption = report
+                    report["abort_result"] = await self.bridge.abort(source="reflex")
+                    report["total_roundtrip_ms"] = round((time.perf_counter() - started) * 1000.0, 2)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if report is not None:
+                self.gatekeeper.last_report = report
+                return
+            await asyncio.sleep(max(0.0, 0.025 - (time.perf_counter() - started)))
 
 
 async def check_reflex_and_abort(
@@ -334,12 +435,17 @@ async def guarded_recover(
       - `ok=True, action="proceed"|"resumed_after_obstacle"|"recalibrated"` when safe to continue
       - `ok=False, action="halted", reason="obstacle_timeout"|"target_out_of_bounds"` otherwise
     """
-    import asyncio
     from .vision_3d import localize_object_3d
 
     def _get_obs() -> list[SceneObstacle]:
         return list(obstacles_fn()) if callable(obstacles_fn) else list(obstacles_fn or [])
 
+    pending = gatekeeper.interruption
+    if pending and pending["target_shifted"]:
+        camera = "top" if gatekeeper.watch is not None else pending["camera"]
+        if watch := gatekeeper.watches.get(camera):
+            query = watch.query
+    q_rad = calib.ticks_to_rad((await bridge.get_state()).motors) if camera == "wrist" else None
     jpeg = await bridge.get_frame(camera, denoise=False)
     report = gatekeeper.evaluate(
         curr_jpeg=jpeg,
@@ -350,11 +456,15 @@ async def guarded_recover(
     )
 
     def _can_rearm() -> bool:
-        return getattr(bridge, "_abort_source", "manual") != "manual" and hasattr(bridge, "rearm")
+        return bridge.abort_source == "reflex"
 
-    if report["ok"]:
-        if getattr(bridge, "_aborted", False) and _can_rearm() and (target_xy is not None or not _get_obs()):
+    if bridge.abort_source == "manual":
+        return {"ok": False, "action": "halted", "reason": "manual_estop", "report": report}
+
+    if report["ok"] and not (pending and pending["target_shifted"]):
+        if _can_rearm() and (target_xy is not None or not _get_obs()):
             bridge.rearm()
+            gatekeeper.interruption = None
         return {"ok": True, "action": "proceed", "target_xy": list(target_xy) if target_xy else None, "report": report}
 
     # Immediate safe pause; preserve any pre-existing or mid-recovery manual E-STOP latch
@@ -379,6 +489,7 @@ async def guarded_recover(
             if rep_retry["ok"]:
                 if _can_rearm():
                     bridge.rearm()
+                    gatekeeper.interruption = None
                 return {
                     "ok": True,
                     "action": "resumed_after_obstacle",
@@ -393,22 +504,23 @@ async def guarded_recover(
         }
 
     # Case 2: Target shifted -> recalibrate & verify inside safe boundary bounding box
-    if report.get("target_shifted"):
+    if report.get("target_shifted") or (pending and pending["target_shifted"]):
         det = await localize_object_3d(
             jpeg_bytes=jpeg,
             query=query,
             calib=calib,
             camera=camera,
+            q_rad=q_rad,
             use_gemini=use_gemini,
         )
         if det.get("found"):
             new_px = (float(det["pixel"][0]), float(det["pixel"][1]))
             wx, wy, wz = float(det["world"]["x"]), float(det["world"]["y"]), float(det["world"]["z"])
             depth_m = float(det["depth_m"])
-        elif report.get("new_pixel"):
+        elif report.get("target_shifted") and report.get("new_pixel"):
             new_px = (float(report["new_pixel"][0]), float(report["new_pixel"][1]))
-            wx, wy, wz = calib.pixel_to_world(new_px[0], new_px[1], camera=camera)
-            depth_m = calib.get_metric_depth(new_px[0], new_px[1], camera=camera)
+            wx, wy, wz = calib.pixel_to_world(new_px[0], new_px[1], camera=camera, q_rad=q_rad)
+            depth_m = calib.get_metric_depth(new_px[0], new_px[1], camera=camera, q_rad=q_rad)
         else:
             return {"ok": False, "action": "halted", "reason": "target_lost", "report": report}
 
@@ -422,9 +534,14 @@ async def guarded_recover(
                 "report": report,
             }
 
-        gatekeeper.arm_watch(jpeg_bytes=jpeg, pixel=new_px, query=query, depth_m=depth_m)
+        if bridge.abort_source == "manual":
+            return {"ok": False, "action": "halted", "reason": "manual_estop", "report": report}
+        gatekeeper.clear_watch()
+        gatekeeper.arm_watch(jpeg_bytes=jpeg, pixel=new_px, query=query, depth_m=depth_m,
+                             camera=camera, world=(wx, wy, wz) if camera == "wrist" else None)
         if _can_rearm():
             bridge.rearm()
+        gatekeeper.interruption = None
         return {
             "ok": True,
             "action": "recalibrated",
