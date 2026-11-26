@@ -105,7 +105,7 @@ async def main(args):
             continue
         duration = max(2.0, 1.875 * float(np.abs(q - q_prev).max()) / np.radians(15.0))
         run = await stream_joint_path(bridge, calib, path, duration, limits, gravity_ff=False)
-        if not run["ok"]:
+        if not run["ok"] and run.get("settled") is not False:  # an unsettled endpoint is the sag being fitted
             print("aborted:", run)
             return
         await asyncio.sleep(HOLD_S)
