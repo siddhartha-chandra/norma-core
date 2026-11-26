@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
 from collections import deque
 from pathlib import Path
@@ -24,8 +25,8 @@ from typing import Any
 import cv2
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from . import mcp_server as srv
@@ -40,6 +41,37 @@ from .vision_3d import (
 )
 
 app = FastAPI(title="DESK-CORE Mission Control")
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_armed_camera = "top"
+_armed_positions: dict[int, int] | None = None
+_detection_positions: dict[int, int] | None = None
+_wrist_watch_stale = False
+WRIST_WATCH_MOVE_TICKS = 15
+
+
+async def _arm_joint_positions(bridge) -> dict[int, int]:
+    """Arm joint ticks without the gripper: the wrist camera only moves when these do."""
+    st = await bridge.get_state()
+    n = srv._calib.num_arm_joints(len(st.motors))
+    return {m.id: m.position for m in st.motors if m.id <= n}
+
+
+def _arm_moved_since(ref: dict[int, int], now: dict[int, int]) -> bool:
+    return any(abs(now.get(mid, pos) - pos) > WRIST_WATCH_MOVE_TICKS for mid, pos in ref.items())
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    token = os.environ.get("DASHBOARD_TOKEN", "").strip()
+    if not token:
+        return await call_next(request)
+    given = request.query_params.get("token") or request.headers.get("x-dashboard-token") or request.cookies.get("dashboard_token")
+    if not given or not secrets.compare_digest(given.encode(), token.encode()):
+        return PlainTextResponse("Dashboard token required (open /?token=...)", status_code=401)
+    response = await call_next(request)
+    if request.query_params.get("token"):
+        response.set_cookie("dashboard_token", token, httponly=True, samesite="strict")
+    return response
 
 _action_log: deque[dict[str, Any]] = deque(maxlen=40)
 _last_detection: dict[str, Any] | None = None
@@ -179,7 +211,7 @@ async def api_estop() -> dict[str, Any]:
 
 @app.post("/api/localize")
 async def api_localize(req: LocalizeReq) -> dict[str, Any]:
-    global _last_detection
+    global _last_detection, _detection_positions
     if req.camera in ("both", "dual"):
         raise HTTPException(status_code=400, detail="camera='both' is disabled: dual-camera localization is pending the epipolar step")
     bridge = await srv._get_bridge()
@@ -196,6 +228,7 @@ async def api_localize(req: LocalizeReq) -> dict[str, Any]:
         provider=req.provider,
     )
     _last_detection = det
+    _detection_positions = await _arm_joint_positions(bridge) if req.camera == "wrist" else None
     fb = f" ({det['fallback_reason']})" if det.get("fallback_reason") else ""
     _log_event("LOCALIZE", f"{req.query} via {det['backend']}{fb} -> {det['world']}", ok=det["found"])
     return det
@@ -207,11 +240,22 @@ async def api_arm_watch() -> dict[str, Any]:
         px = tuple(_last_detection["pixel"])
         q = _last_detection["query"]
         d = float(_last_detection["depth_m"])
+        cam = _last_detection.get("camera") or "top"
     else:
         px = (320.0, 240.0)
         q = "center-roi"
         d = 0.62
-    res = await srv.robo_jev_arm_watch(*px, query=q, depth_m=d)
+        cam = "top"
+    global _armed_camera, _armed_positions, _wrist_watch_stale
+    ref = _detection_positions if cam == "wrist" else None
+    if ref is not None and _arm_moved_since(ref, await _arm_joint_positions(await srv._get_bridge())):
+        msg = "The arm moved since the wrist detection; run Localize again before arming."
+        _log_event("ROBO-JEV", msg, ok=False)
+        raise HTTPException(status_code=409, detail=msg)
+    res = await srv.robo_jev_arm_watch(*px, query=q, camera=cam, depth_m=d)
+    _armed_camera = cam
+    _armed_positions = ref
+    _wrist_watch_stale = False
     _log_event("ROBO-JEV", f"Armed watch on {q} @ {res['ref_pixel']}")
     return res
 
@@ -219,12 +263,23 @@ async def api_arm_watch() -> dict[str, Any]:
 @app.post("/api/robo_jev/check")
 async def api_check_reflex() -> dict[str, Any]:
     bridge = await srv._get_bridge()
+    global _wrist_watch_stale
+    if _armed_camera == "wrist" and _armed_positions is not None:
+        if _wrist_watch_stale or _arm_moved_since(_armed_positions, await _arm_joint_positions(bridge)):
+            _wrist_watch_stale = True
+            # The wrist camera moved with the arm, so the armed reference pixel no longer applies.
+            srv._robo_jev.watches.pop("wrist", None)
+            res = {**srv._robo_jev.last_report, "ok": False, "aborted": False, "target_shifted": False,
+                   "reason": "wrist_moved_relocalize", "latency_ms": 0.0}
+            srv._robo_jev.last_report = res
+            _log_event("ROBO-JEV", "wrist watch stale after arm motion; run Localize and re-arm", ok=False)
+            return res
     res = await check_reflex_and_abort(
         gatekeeper=srv._robo_jev,
         bridge=bridge,
         calib=srv._calib,
         obstacles=list(srv._obstacles.values()),
-        camera="top",
+        camera=_armed_camera,
     )
     if res.get("aborted"):
         srv._tts.speak(f"Reflex abort: {res['reason'].replace('_', ' ')}.")
@@ -493,7 +548,7 @@ async def api_tts(req: TTSReq) -> dict[str, Any]:
 @app.post("/api/first_light")
 async def api_first_light() -> dict[str, Any]:
     """Run the Act 1 07:30 First-Light check-in routine (non-destructive if uncalibrated)."""
-    global _first_light_running, _last_detection
+    global _first_light_running, _last_detection, _armed_camera
     if _first_light_running:
         return {"ok": False, "error": "First-Light routine already running"}
     _first_light_running = True
@@ -514,6 +569,7 @@ async def api_first_light() -> dict[str, Any]:
 
         if det["found"]:
             await srv.robo_jev_arm_watch(*det["pixel"], query="keys", depth_m=det["depth_m"])
+            _armed_camera = "top"
             reflex = await check_reflex_and_abort(srv._robo_jev, bridge, calib=srv._calib, obstacles=list(srv._obstacles.values()))
             steps.append({"step": "robo_jev", "ok": reflex["ok"], "latency_ms": reflex["latency_ms"]})
             srv._tts.speak(f"Keys spotted. Reflex check nominal in {int(round(reflex['latency_ms']))} milliseconds.")
@@ -804,7 +860,11 @@ DASHBOARD_HTML = """<!doctype html>
       });
       refresh();
     }
-    async function armWatch() { await postJSON('/api/robo_jev/arm'); refresh(); }
+    async function armWatch() {
+      const res = await postJSON('/api/robo_jev/arm');
+      if (res && res.detail) alert(res.detail);
+      refresh();
+    }
     async function checkReflex() { await postJSON('/api/robo_jev/check'); refresh(); }
     async function guardedRecover() { await postJSON('/api/robo_jev/recover'); refresh(); }
     async function mockDisplace(mode) { await postJSON('/api/mock/displace', { mode }); refreshFrames(); refresh(); }
@@ -840,8 +900,9 @@ DASHBOARD_HTML = """<!doctype html>
           `<tr><td>M${m.id}</td><td>${m.position}</td><td>${m.norm}</td><td>${m.current_ma}</td><td>${m.err}</td></tr>`
         ).join('');
 
-        const evs = (logs.dashboard_events || []).map(e => `<div>[${e.ts}] <b>${e.kind}</b>: ${e.detail}</div>`).join('');
-        const calls = (logs.mcp_calls || []).map(c => `<div style="color:var(--muted)">[${c.ts}] MCP ${c.tool} (${c.duration_ms}ms)</div>`).join('');
+        const esc = v => String(v ?? '').replace(/[&<>"']/g, ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'})[ch]);
+        const evs = (logs.dashboard_events || []).map(e => `<div>[${esc(e.ts)}] <b>${esc(e.kind)}</b>: ${esc(e.detail)}</div>`).join('');
+        const calls = (logs.mcp_calls || []).map(c => `<div style="color:var(--muted)">[${esc(c.ts)}] MCP ${esc(c.tool)} (${esc(c.duration_ms)}ms)</div>`).join('');
         document.getElementById('log-box').innerHTML = evs + calls;
       } catch (e) {}
     }
@@ -862,7 +923,16 @@ async def index() -> str:
 def main() -> None:
     host = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
     port = int(os.environ.get("DASHBOARD_PORT", "8765"))
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    if host not in _LOOPBACK_HOSTS and not os.environ.get("DASHBOARD_TOKEN", "").strip():
+        raise SystemExit(f"Refusing to serve the dashboard on {host} without DASHBOARD_TOKEN; set one or bind 127.0.0.1.")
+    certfile = os.environ.get("DASHBOARD_SSL_CERTFILE", "").strip() or None
+    keyfile = os.environ.get("DASHBOARD_SSL_KEYFILE", "").strip() or None
+    if host not in _LOOPBACK_HOSTS and not certfile and os.environ.get("DASHBOARD_ALLOW_HTTP") != "1":
+        raise SystemExit(f"Refusing plain HTTP on {host}: set DASHBOARD_SSL_CERTFILE/KEYFILE, use an SSH tunnel, "
+                         "or set DASHBOARD_ALLOW_HTTP=1 on a trusted network.")
+    # Access logs would record the ?token= sign-in URL.
+    uvicorn.run(app, host=host, port=port, log_level="info", ssl_certfile=certfile, ssl_keyfile=keyfile,
+                access_log=not os.environ.get("DASHBOARD_TOKEN", "").strip())
 
 
 if __name__ == "__main__":

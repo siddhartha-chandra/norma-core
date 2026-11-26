@@ -92,10 +92,10 @@ def test_live_scan_waits_for_a_new_frame_on_startup(monkeypatch, queue_advances)
     bridge._frame_order.append("overhead-id")
     monkeypatch.setattr(mcp_server, "_bridge", bridge)
     monkeypatch.setattr(mcp_server, "_logger", None)
-    archived = [("overhead-id", b"archived", 1, b"1")]
+    archived = [("overhead-id", b"archived", 1, memoryview(b"1"))]
     tail = AsyncMock(return_value=archived)
     if queue_advances:
-        tail.side_effect = [archived, [("overhead-id", b"live", 2, b"2")]]
+        tail.side_effect = [archived, [("overhead-id", b"live", 2, memoryview(b"2"))]]
     monkeypatch.setattr(bridge, "_fetch_tail_frames", tail)
     localize = AsyncMock(return_value=[])
     monkeypatch.setattr(mcp_server, "localize_frame_3d", localize)
@@ -135,6 +135,10 @@ def test_default_ten_minute_scan_in_mock_simulation(tmp_path, monkeypatch, mock_
         assert len(sightings) == len(initial_scene["objects"])
         assert len(rows) == len(frames) * len(sightings)
         assert len({(row.x, row.y) for row in sightings}) == len(sightings)
+        for obj in initial_scene["objects"].values():
+            assert any(
+                abs(row.x - obj["x"]) < 0.01 and abs(row.y - obj["y"]) < 0.01 for row in sightings
+            )
         assert len({row.time for row in sightings}) == 1
         assert {row.camera for row in sightings} == {"top"}
         if now == 600:
