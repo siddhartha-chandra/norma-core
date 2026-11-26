@@ -116,6 +116,7 @@ async def plan_command(command: str, localize: Localize, timeout_s: float = 8.0)
         return {"route": "unsupported", "reason": f"could not read object names for {template!r}"}
 
     grounded: dict[str, dict[str, float]] = {}
+    watch_step = []
     for role, name in slots.items():
         found = await localize(name)
         if not found.get("found"):
@@ -123,11 +124,14 @@ async def plan_command(command: str, localize: Localize, timeout_s: float = 8.0)
         if found.get("backend") == "opencv-fallback":
             return {"route": "not_found", "reason": f"could not semantically confirm {name!r} (opencv-fallback)"}
         grounded[role] = _point(found)
+        if role == "target" and found.get("pixel") is not None:
+            x, y = found["pixel"]
+            watch_step = [{"tool": "robo_jev_arm_watch", "args": {"x": float(x), "y": float(y), "query": name}}]
 
     return {
         "route": "motion",
         "template": template,
         "slots": slots,
         "grounding": grounded,
-        "steps": _steps(template, grounded),
+        "steps": watch_step + _steps(template, grounded),
     }

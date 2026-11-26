@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from . import mcp_server as srv
-from .robo_jev import check_reflex_and_abort, guarded_recover
+from .robo_jev import check_reflex_and_abort
 from .vision_3d import (
     DEFAULT_PROVIDER_MODELS,
     MODEL_RATINGS,
@@ -203,8 +203,6 @@ async def api_localize(req: LocalizeReq) -> dict[str, Any]:
 
 @app.post("/api/robo_jev/arm")
 async def api_arm_watch() -> dict[str, Any]:
-    bridge = await srv._get_bridge()
-    jpeg = await bridge.get_frame("top", denoise=False)
     if _last_detection and _last_detection.get("found"):
         px = tuple(_last_detection["pixel"])
         q = _last_detection["query"]
@@ -213,7 +211,7 @@ async def api_arm_watch() -> dict[str, Any]:
         px = (320.0, 240.0)
         q = "center-roi"
         d = 0.62
-    res = srv._robo_jev.arm_watch(jpeg_bytes=jpeg, pixel=px, query=q, depth_m=d)
+    res = await srv.robo_jev_arm_watch(*px, query=q, depth_m=d)
     _log_event("ROBO-JEV", f"Armed watch on {q} @ {res['ref_pixel']}")
     return res
 
@@ -237,15 +235,9 @@ async def api_check_reflex() -> dict[str, Any]:
 @app.post("/api/robo_jev/recover")
 async def api_guarded_recover() -> dict[str, Any]:
     global _last_detection
-    bridge = await srv._get_bridge()
     q = (_last_detection or {}).get("query") or (srv._robo_jev.watch.query if srv._robo_jev.watch else "keys")
-    res = await guarded_recover(
-        gatekeeper=srv._robo_jev,
-        bridge=bridge,
-        calib=srv._calib,
+    res = await srv.robo_jev_guard(
         query=q,
-        obstacles_fn=lambda: list(srv._obstacles.values()),
-        camera="top",
         use_gemini=bool(os.environ.get("GEMINI_API_KEY")),
     )
     if res.get("ok") and res.get("action") == "recalibrated" and res.get("world"):
@@ -521,7 +513,7 @@ async def api_first_light() -> dict[str, Any]:
         _log_event("FIRST-LIGHT", f"Localized keys via {det['backend']} -> {det['world']}", ok=det["found"])
 
         if det["found"]:
-            srv._robo_jev.arm_watch(jpeg_bytes=jpeg, pixel=tuple(det["pixel"]), query="keys", depth_m=det["depth_m"])
+            await srv.robo_jev_arm_watch(*det["pixel"], query="keys", depth_m=det["depth_m"])
             reflex = await check_reflex_and_abort(srv._robo_jev, bridge, calib=srv._calib, obstacles=list(srv._obstacles.values()))
             steps.append({"step": "robo_jev", "ok": reflex["ok"], "latency_ms": reflex["latency_ms"]})
             srv._tts.speak(f"Keys spotted. Reflex check nominal in {int(round(reflex['latency_ms']))} milliseconds.")
