@@ -88,6 +88,20 @@ def test_go_home_needs_no_grounding(monkeypatch):
     assert loc.calls == []
 
 
+def test_sort_hive_command_needs_no_api_or_grounding(monkeypatch):
+    loc = _localizer({})
+
+    def unexpected_api_call(*args):
+        pytest.fail("the canonical Hive command should not call Jev")
+
+    monkeypatch.setattr(cp, "system_one", unexpected_api_call)
+    plan = asyncio.run(cp.plan_command("Please sort the Hive tiles.", localize=loc))
+    assert plan["template"] == "sort_hive"
+    assert plan["route"] == "motion"
+    assert plan["steps"] == [{"tool": "hive_sort", "args": {"execute": True}}]
+    assert loc.calls == []
+
+
 def test_non_motion_command_skips_grounding(monkeypatch):
     loc = _localizer({})
     plan = _run("what do you see on the desk?", _answers(0.05, "none"), loc, monkeypatch)
