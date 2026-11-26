@@ -1017,6 +1017,9 @@ async def _plan_and_move(x, y, z, shoulder_torque_limit_nm, qx, qy, qz, qw, exec
                     or positions[8] != initial_ticks[8]):
                 return await stop_motion("Station bus, motor inventory or gripper changed during execution")
             expected = replace(expected, motors=[replace(m, position=positions[m.id]) for m in expected.motors])
+            if wrist_planner is not None:
+                stamps = [bridge.rx_station_ns.get((settled.bus_serial, mid), 0) for mid in planned_target]
+                result["settled_station_ns"] = max(stamps) if all(stamps) else 0
             measured = np.asarray(_calib.ticks_to_rad(expected.motors))
             try:
                 torque = planner.validate_segment(measured, measured)
@@ -1536,6 +1539,8 @@ async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
     size = tuple(data["image_size_wrist"])
     start = time.monotonic()
     last_frame = start - PERIOD_S
+    last_capture_ns = settled_station_ns = 0
+    unstamped_frame_after = start - PERIOD_S
     next_sample = start
     measurement = None
     iterations = 0
@@ -1576,6 +1581,12 @@ async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
                     if received <= last_frame or time.monotonic() - received > PERIOD_S:
                         continue
                     last_frame = received
+                    captured = bridge.frame_station_ns.get(key, 0)
+                    if captured and captured <= max(last_capture_ns, settled_station_ns):
+                        continue
+                    if (not captured or not settled_station_ns) and received < unstamped_frame_after:
+                        continue
+                    last_capture_ns = max(last_capture_ns, captured)
                 frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
                 if frame is None or frame.shape[1::-1] != size:
                     raise ValueError("Wrist frame does not match the calibrated image size.")
@@ -1598,7 +1609,9 @@ async def servo_align_wrist(tol_mm: float = 1.5) -> dict:
                 if not move["ok"]:
                     error = "; ".join(move["problems"])
                     break
-                last_frame = time.monotonic()
+                if live and move["executed"]:
+                    settled_station_ns = move["settled_station_ns"]
+                    unstamped_frame_after = time.monotonic() + PERIOD_S
     except TimeoutError:
         error = "Wrist alignment timed out."
     except (ValueError, RuntimeError, cv2.error) as exc:

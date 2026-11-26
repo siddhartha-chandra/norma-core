@@ -1,5 +1,6 @@
 import asyncio
 import math
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -8,7 +9,7 @@ from scipy.spatial.transform import Rotation
 
 from desk_core import mcp_server
 from desk_core.pose_estimation import pixels_on_plane
-from desk_core.station_bridge import MockStationBridge
+from desk_core.station_bridge import LiveStationBridge, MockStationBridge
 from desk_core.stereo_sweep import _blob_mask
 from desk_core.wrist_ibvs import alignment_step
 
@@ -105,3 +106,50 @@ def test_unavailable_camera_times_out_without_joint_commands(monkeypatch, calib)
     assert not result["ok"]
     assert result["error"] == "Wrist alignment timed out."
     assert result["iterations"] == 0
+
+
+@pytest.mark.parametrize("settled_ns, captures", [(200, [100, 199, 201]), (0, [0, 0, 0])])
+def test_live_feedback_skips_frames_from_before_settle(monkeypatch, calib, settled_ns, captures):
+    monkeypatch.setitem(calib.data, "shoulder_torque_limit_nm", 0.6)
+    monkeypatch.setitem(calib.data, "image_size_wrist", [640, 480])
+    monkeypatch.setattr(mcp_server, "_calib", calib)
+    monkeypatch.setattr(mcp_server, "_logger", None)
+    wrist_id = calib.hardware_config()["camera_wrist"]
+    bridge = LiveStationBridge(cam_wrist=wrist_id, follow_motor_rx=True)
+    monkeypatch.setattr(mcp_server, "_bridge", bridge)
+    monkeypatch.setattr(bridge, "_resolve_cam_key", lambda _: wrist_id)
+    mock = MockStationBridge(num_joints=8)
+    monkeypatch.setattr(bridge, "get_state", mock.get_state)
+    monkeypatch.setattr(mcp_server, "_mujoco_planner", lambda *args: None)
+    monkeypatch.setattr(mcp_server, "_live_preflight_state", lambda _, state: state)
+    clock = SimpleNamespace(now=10.0)
+    monkeypatch.setattr(mcp_server, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    period = 0.01
+    monkeypatch.setattr(mcp_server, "PERIOD_S", period)
+    frames = iter(zip([0, period / 2, period], captures, [0, 100, 200]))
+
+    async def get_frame(_):
+        elapsed, captured, pixel = next(frames)
+        clock.now += elapsed
+        bridge.frame_received_at[wrist_id] = clock.now
+        bridge.frame_station_ns[wrist_id] = captured
+        return cv2.imencode(".jpg", np.full((480, 640, 3), pixel, np.uint8))[1].tobytes()
+
+    async def move(*args, **kwargs):
+        return {"ok": True, "executed": True, "settled_station_ns": settled_ns}
+
+    accepted = []
+
+    def align(frame, *args):
+        accepted.append(frame[0, 0, 0])
+        return SimpleNamespace(error_mm=2 if len(accepted) == 1 else 0, yaw_error_rad=0,
+                               position=np.zeros(3), rotation=Rotation.identity())
+
+    monkeypatch.setattr(bridge, "get_frame", get_frame)
+    monkeypatch.setattr(mcp_server, "_plan_and_move", move)
+    monkeypatch.setattr(mcp_server, "alignment_step", align)
+
+    result = asyncio.run(mcp_server.servo_align_wrist())
+    assert result["ok"]
+    assert result["iterations"] == 2
+    assert accepted == [0, 200]

@@ -582,7 +582,9 @@ class LiveStationBridge:
         self._station_ranges: dict[str, dict[int, tuple[int, int]]] = {}
         self._ranges_polled_mono: float | None = None
         self.rx_received_at: dict[tuple[str, int], float] = {}
+        self.rx_station_ns: dict[tuple[str, int], int] = {}
         self.frame_received_at: dict[str, float] = {}
+        self.frame_station_ns: dict[str, int] = {}
         self._video_entry_ids: dict[str, bytes] = {}
         self._frames: dict[str, bytes] = {}
         self._frame_buf: dict[str, deque[bytes]] = {}
@@ -939,6 +941,8 @@ class LiveStationBridge:
                 slot = self._motor_state.setdefault(serial, {})
                 pos = _norm_pos(_u16(sb, RAM_PRESENT_POSITION))
                 self.rx_received_at[serial, mid] = time.monotonic()
+                if self._follow_motor_rx:
+                    self.rx_station_ns[serial, mid] = r.get_monotonic_stamp_ns()
                 cur = _u16(sb, RAM_PRESENT_CURRENT)
                 err = sb[RAM_STATUS]
                 if mid in slot:
@@ -951,41 +955,43 @@ class LiveStationBridge:
             except Exception as exc:
                 log.debug("rx parse skip: %s", exc)
 
-    def _extract_jpeg(self, entry) -> tuple[str, bytes] | None:
+    def _extract_jpeg(self, entry) -> tuple[str, bytes, int] | None:
         env = self._usbvideo.RxEnvelopeReader(memoryview(bytes(entry.Data)))
         if env.get_type() != self.ET_FRAMES:
             return None
         cam = env.get_camera()
         key = cam.get_unique_id() or cam.get_serial_number() or cam.get_product() or "cam0"
-        frames = env.get_frames().get_frames_data()
-        if not frames:
-            return None
-        jpeg = next(
-            (bytes(b) for b in reversed(frames) if len(bytes(b)) > 4 and bytes(b)[:2] == b"\xff\xd8" and bytes(b)[-2:] == b"\xff\xd9"),
-            None,
-        )
-        return (key, jpeg) if jpeg is not None else None
+        pack = env.get_frames()
+        frames = pack.get_frames_data()
+        stamps = pack.get_stamps()
+        for index in range(len(frames) - 1, -1, -1):
+            jpeg = bytes(frames[index])
+            if len(jpeg) > 4 and jpeg.startswith(b"\xff\xd8") and jpeg.endswith(b"\xff\xd9"):
+                stamp = stamps[index].get_monotonic_stamp_ns() if len(stamps) == len(frames) else 0
+                return key, jpeg, stamp
+        return None
 
-    def _record_frame_receipt(self, key: str, jpeg: bytes, entry_id: bytes | None) -> None:
+    def _record_frame_receipt(self, key: str, jpeg: bytes, capture_ns: int, entry_id: bytes | None) -> None:
         if self._follow_motor_rx:
             # Re-reading the queue tail must not make a stalled camera look fresh.
             if entry_id is None:
-                if self._frames.get(key) == jpeg:
+                if self._frames.get(key) == jpeg and self.frame_station_ns.get(key) == capture_ns:
                     return
             else:
                 if self._video_entry_ids.get(key) == entry_id:
                     return
                 self._video_entry_ids[key] = entry_id
         self.frame_received_at[key] = time.monotonic()
+        self.frame_station_ns[key] = capture_ns
 
     async def _fetch_tail_frames(
         self, qid: str, count: int = 1, timeout_s: float = 3.0,
-    ) -> list[tuple[str, bytes, bytes | None]]:
+    ) -> list[tuple[str, bytes, int, bytes | None]]:
         if self.client is None or not hasattr(self.client, "read_from_tail"):
             return []
         offset = (count - 1).to_bytes(8, "little") if count > 1 else b"\x00"
         qr = self.client.read_from_tail(qid, offset=offset, limit=count, step=1, buf_size=max(4, count + 2))
-        out: list[tuple[str, bytes, bytes | None]] = []
+        out: list[tuple[str, bytes, int, bytes | None]] = []
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             rem = max(0.05, deadline - time.monotonic())
@@ -1008,9 +1014,9 @@ class LiveStationBridge:
             items = await self._fetch_tail_frames(qid, count=1, timeout_s=3.0)
             if not items:
                 return
-            key, jpeg, entry_id = items[-1]
+            key, jpeg, capture_ns, entry_id = items[-1]
             self._key_to_qid[key] = qid
-            self._record_frame_receipt(key, jpeg, entry_id)
+            self._record_frame_receipt(key, jpeg, capture_ns, entry_id)
             self._frames[key] = jpeg
             self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
             if key not in self._frame_order:
@@ -1030,8 +1036,8 @@ class LiveStationBridge:
                 parsed = self._extract_jpeg(entry)
                 if parsed is None:
                     continue
-                key, jpeg = parsed
-                self._record_frame_receipt(key, jpeg, getattr(getattr(entry, "ID", None), "ID", None))
+                key, jpeg, capture_ns = parsed
+                self._record_frame_receipt(key, jpeg, capture_ns, getattr(getattr(entry, "ID", None), "ID", None))
                 self._frames[key] = jpeg
                 self._frame_buf.setdefault(key, deque(maxlen=7)).append(jpeg)
                 if key not in self._frame_order:
@@ -1110,9 +1116,10 @@ class LiveStationBridge:
         if qid:
             try:
                 items = await self._fetch_tail_frames(qid, count=4 if denoise else 1, timeout_s=3.0)
-                jpegs = [jb for _key, jb, _entry_id in items]
+                jpegs = [jb for _key, jb, _capture_ns, _entry_id in items]
                 if jpegs:
-                    self._record_frame_receipt(key, jpegs[-1], items[-1][2])
+                    _, jpeg, capture_ns, entry_id = items[-1]
+                    self._record_frame_receipt(key, jpeg, capture_ns, entry_id)
                     self._frames[key] = jpegs[-1]
                     buf = self._frame_buf.setdefault(key, deque(maxlen=7))
                     buf.extend(jpegs)
