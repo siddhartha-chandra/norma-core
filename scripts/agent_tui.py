@@ -943,7 +943,7 @@ class RobotAgentTUI(App):
                 self.session.call_tool("get_frame", {
                     "camera": "top", "denoise": False, "save_npy": False, "show_overlay": True, "log_frame": False,
                 }),
-                self.session.call_tool("get_frame", {"camera": "wrist", "denoise": False, "save_npy": False}),
+                self.session.call_tool("get_frame", {"camera": "wrist", "denoise": False, "save_npy": False, "log_frame": False}),
             )
             markers = getattr(self, "_overlay_markers", {})
             marker_sig = json.dumps(
