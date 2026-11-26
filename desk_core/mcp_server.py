@@ -10,6 +10,7 @@ Exposes:
      measure_graspability, estimate_grasp_pose, plan_tolerant_grasp, retract_to_hover, move_to_drop,
      master_pick_place
   6. Prompt skills (@mcp.prompt): desk_operator_skill, pick_and_place_skill
+  7. Desk memory queries: last_seen, where_was
 
 Every tool call is recorded under runs/<UTC timestamp>/ (calls.jsonl + frames/*.jpg)
 so sessions are replayable; set DESK_RUNLOG=0 to disable. See desk_core/runlog.py.
@@ -48,7 +49,7 @@ from .station_bridge import (DEFAULT_MAX_STEP, MAX_ANGLE_STEP, REPO_ROOT, LiveSt
                              PreflightWriteUncertain, RobotState, StationBridge, create_bridge)
 from .tts import SpeakerTTS
 from .command_planner import plan_command as _plan_command
-from .vision_3d import localize_object_3d
+from .vision_3d import localize_frame_3d, localize_object_3d
 from .wrist_ibvs import MAX_ROLL_STEP_RAD, MAX_START_ERROR_M, PERIOD_S, TIMEOUT_S, YAW_TOL_RAD, alignment_step
 
 if TYPE_CHECKING:
@@ -692,7 +693,7 @@ async def pixel_to_world(
 @mcp.tool()
 @_traced
 async def localize_3d(
-    query: str,
+    query: str | None = None,
     camera: str = "top",
     z_m: float | None = None,
     use_gemini: bool = True,
@@ -700,19 +701,51 @@ async def localize_3d(
     timeout_s: float = 6.0,
     provider: str = "auto",
     model: str | None = None,
+    after_frame_ref: str | None = None,
 ) -> dict:
-    """Zero-shot 2D object localization (Gemini/Anthropic/OpenAI/Qwen/DeepSeek with OpenCV fallback) on one camera. The 3D point uses a placeholder depth: the table plane (z_table) unless z_m is given; epipolar 2D->3D is not wired yet."""
+    """Localize a named object, or omit the query to scan all visible objects from the overhead camera.
+
+    A scene scan uses the newest frame without denoising, returns detections and its reference,
+    and skips an already scanned frame
+    when after_frame_ref is supplied. Depth uses the table plane unless z_m is given.
+    """
     if camera in ("both", "dual"):
         raise ValueError("camera='both' is disabled: dual-camera 3D localization is pending the epipolar step; use 'top' or 'wrist'.")
+    if query is None and camera != "top":
+        raise ValueError("Scene scans require camera='top'.")
     bridge = await _get_bridge()
-    jpeg = await bridge.get_frame(camera, denoise=denoise)
+    if query is None and isinstance(bridge, LiveStationBridge):
+        jpeg = await bridge.get_frame(camera, strict_camera=True)
+        if after_frame_ref is None:
+            baseline = bridge.last_frame_ref(camera)
+            try:
+                async with asyncio.timeout(3.0):
+                    while True:
+                        await asyncio.sleep(0.1)
+                        jpeg = await bridge.get_frame(camera, strict_camera=True)
+                        if (current := bridge.last_frame_ref(camera)) and current != baseline:
+                            break
+            except TimeoutError:
+                return {"detections": [], "frame_ref": baseline, "stale_frame": True}
+    else:
+        jpeg = await bridge.get_frame(camera, denoise=denoise and query is not None)
     seen_at = time.time()
     frame_ref = (
         bridge.last_frame_ref(camera)
         if hasattr(bridge, "last_frame_ref")
         else None
     ) or f"{camera}@{int(seen_at * 1000)}"
+    if query is None and frame_ref == after_frame_ref and not frame_ref.startswith("camera://"):
+        return {"detections": [], "frame_ref": frame_ref, "stale_frame": True}
     q = await _live_arm_q(None, camera)
+    if query is None:
+        detections = await localize_frame_3d(
+            jpeg, None, _calib, camera=camera, q_rad=q, z_m=z_m,
+            use_gemini=use_gemini, timeout_s=float(timeout_s), model=model, provider=provider,
+        )
+        for detection in detections:
+            await _record_localization(detection, bridge, camera, frame_ref, seen_at)
+        return {"detections": detections, "frame_ref": frame_ref, "stale_frame": False}
     res = await localize_object_3d(
         jpeg_bytes=jpeg,
         query=query,
@@ -725,6 +758,13 @@ async def localize_3d(
         model=model,
         provider=provider,
     )
+    await _record_localization(res, bridge, camera, frame_ref, seen_at)
+    return res
+
+
+async def _record_localization(
+    res: dict, bridge: StationBridge, camera: str, frame_ref: str, seen_at: float,
+) -> None:
     if res.get("found") and camera == "top" and isinstance(bridge, MockStationBridge) and res.get("pixel"):
         world = res.get("world") or {}
         xy = bridge.synthetic_top_unproject(*res["pixel"][:2], float(world.get("z", 0.0)))
@@ -742,8 +782,41 @@ async def localize_3d(
             if write_res is not None:
                 res["sighting"] = write_res.to_dict()
         except Exception as exc:
-            _log.warning("Failed to record sighting for %r: %s", res.get("label") or query, exc)
-    return res
+            _log.warning("Failed to record sighting for %r: %s", res.get("label") or res.get("query"), exc)
+
+
+async def _find_sighting(label: str, before_time: float | None = None) -> dict:
+    label = label.strip()
+    if not label:
+        raise ValueError("Sighting label must be non-empty")
+
+    store = _get_sightings_store()
+    if store.normfs_enabled and _bridge is None:
+        try:
+            await _get_bridge()
+        except RuntimeError:
+            pass  # Station is unavailable; the local SQLite history is still readable.
+
+    sightings = await store.list_sightings(limit=1, label=label, before_time=before_time)
+    if not sightings:
+        return {"found": False, "label": label}
+    return {"found": True, **sightings[0].to_dict()}
+
+
+@mcp.tool()
+@_traced
+async def last_seen(label: str) -> dict:
+    """Get the latest stored sighting for an object label: world position in meters, Unix time in seconds, and frame_ref; found=false if absent."""
+    return await _find_sighting(label)
+
+
+@mcp.tool()
+@_traced
+async def where_was(label: str, time: float) -> dict:
+    """Get the nearest stored sighting for an object label at or before time (Unix seconds); returns world position in meters, sighting time, and frame_ref, or found=false."""
+    if not math.isfinite(time):
+        raise ValueError("Sighting cutoff time must be a finite Unix timestamp in seconds")
+    return await _find_sighting(label, before_time=time)
 
 
 @mcp.tool()

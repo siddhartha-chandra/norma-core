@@ -1178,8 +1178,13 @@ class LiveStationBridge:
     async def list_cameras(self) -> list[str]:
         return list(self._frame_order)
 
-    def _resolve_cam_key(self, camera: str) -> str:
+    def _resolve_cam_key(self, camera: str, *, strict: bool = False) -> str:
         want = self._cam_map.get(camera, "")
+        if strict:
+            matches = [key for key in self._frames if want and want in key]
+            if len(matches) == 1:
+                return matches[0]
+            raise RuntimeError(f"No uniquely configured {camera} camera has frames.")
         if want:
             for key in (*self._frames, *self._key_to_qid, *self._frame_order):
                 if want in key:
@@ -1225,14 +1230,14 @@ class LiveStationBridge:
             raise RuntimeError(f"Stale {camera} reflex camera")
         return jpeg
 
-    async def get_frame(self, camera: str = "top", denoise: bool = False) -> bytes:
+    async def get_frame(self, camera: str = "top", denoise: bool = False, *, strict_camera: bool = False) -> bytes:
         for _ in range(50):
             if self._frames:
                 break
             await asyncio.sleep(0.1)
         if not self._frames:
             raise RuntimeError("No USB video frames received from Station yet.")
-        key = self._resolve_cam_key(camera)
+        key = self._resolve_cam_key(camera, strict=strict_camera)
         qid = self._key_to_qid.get(key)
         if qid:
             try:
