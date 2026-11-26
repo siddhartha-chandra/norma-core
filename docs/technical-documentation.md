@@ -194,10 +194,11 @@ including the quantized tick targets. Lifts involving j2 first move j3 and j4 to
 It rejects paths that do not clear these checks without issuing a joint target.
 
 `execute=True` can send the checked targets to the mock bridge or the live ElRobot bus named in the
-rig calibration. Live execution requires fresh, fault-free telemetry, explicit calibrated joint signs
-and zeros, effective motor ranges, arm torque already enabled, and an unloaded gripper within 25 ticks
+rig calibration. Both live preview and execution require fresh, fault-free telemetry, explicit calibrated joint signs
+and zeros, the same effective motor ranges, and an unloaded gripper within 25 ticks
 of its calibrated open limit. MuJoCo uses the measured jaw opening and holds it fixed for the move.
-The planner uses the same tick↔radian conversion as Desk Core FK; Station refuses to clamp or send
+Live execution also requires arm torque to be already enabled. The planner uses the same tick↔radian
+conversion as Desk Core FK; Station refuses to clamp or send
 a target from a different measured pose. The next segment is checked from the stable measured pose,
 which must be within the same 15-tick tolerance used by the flange-motion stream.
 The model does not account for payload or dynamic torque. A simulation budget is not a hardware rating.

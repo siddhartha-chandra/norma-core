@@ -10,7 +10,7 @@ from desk_core import mcp_server
 from desk_core.ik_mujoco import MAX_WAYPOINT_STEP_RAD, MuJoCoPlanner, PlanningError
 from desk_core.ik_tracik import TOOL_FRAME
 from desk_core.interfaces import SceneObstacle
-from desk_core.station_bridge import LiveStationBridge, MockStationBridge, RobotState
+from desk_core.station_bridge import MAX_ANGLE_STEP, LiveStationBridge, MockStationBridge, RobotState
 
 
 @pytest.fixture
@@ -259,5 +259,26 @@ def test_live_gripper_models_open_tolerance(live_station, calib):
         state.motors[-1].position -= 1
         with pytest.raises(PlanningError, match="open calibrated gripper"):
             mcp_server._live_preflight_state(bridge, await bridge.get_state())
+
+    asyncio.run(run())
+
+
+def test_live_preview_uses_same_fallback_ranges_as_execution(live_station, calib):
+    bridge, state, packets = live_station
+    bridge._elrobot_range_bus = state.bus_serial
+    goal = np.asarray(calib.ticks_to_rad(state.motors))
+    goal[1] -= 0.2
+    xyz, rotation = mcp_server._mujoco_planner(state, [], 0.6).flange_pose(goal)
+    args = dict(zip(("x", "y", "z", "qx", "qy", "qz", "qw"), [*xyz, *rotation.as_quat()]))
+    for motor in state.motors:
+        motor.range_min, motor.range_max = 0, MAX_ANGLE_STEP
+
+    async def run():
+        preview = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6)
+        assert preview["ok"] and not preview["executed"] and not packets
+        result = await mcp_server.plan_and_move(**args, shoulder_torque_limit_nm=0.6, execute=True)
+        assert result["ok"] and result["executed"]
+        assert preview["joints_rad"] == result["joints_rad"]
+        assert preview["waypoints"] == result["waypoints"]
 
     asyncio.run(run())

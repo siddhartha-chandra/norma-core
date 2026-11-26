@@ -847,9 +847,9 @@ def _live_preflight_state(bridge: LiveStationBridge, state: RobotState) -> Robot
     bus = hardware.get("bus_serial")
     if not (_calib.data.get("calibrated") and _calib.data.get("arm_type") == "elrobot"
             and bus and bus == bridge.target_bus == state.bus_serial):
-        raise PlanningError("Live execution requires the bus named in the calibrated ElRobot rig")
+        raise PlanningError("Live preflight requires the bus named in the calibrated ElRobot rig")
     if not bridge._follow_motor_rx:
-        raise PlanningError("Live execution requires fresh raw motor telemetry")
+        raise PlanningError("Live preflight requires fresh raw motor telemetry")
     for name, low, high in (("joint_signs", -1, 1), ("joint_zero_ticks", 0, MAX_ANGLE_STEP)):
         values = _calib.data.get(name)
         if isinstance(values, dict):
@@ -860,7 +860,7 @@ def _live_preflight_state(bridge: LiveStationBridge, state: RobotState) -> Robot
         ):
             raise PlanningError(f"Explicit calibrated {name} required for all arm joints")
     if "z_table" not in _calib.data:
-        raise PlanningError("Live execution requires a calibrated table height")
+        raise PlanningError("Live preflight requires a calibrated table height")
     motors = []
     for m in state.motors:
         lo, hi = bridge._effective_motor_range(state.bus_serial, m)
@@ -871,7 +871,7 @@ def _live_preflight_state(bridge: LiveStationBridge, state: RobotState) -> Robot
     if (not motors or gripper.get("motor_id") != 8 or motors[-1].id != 8
             or gripper.get("open_ticks") != motors[-1].range_max
             or abs(motors[-1].position - motors[-1].range_max) > GRIPPER_OPEN_TOL_TICKS):
-        raise PlanningError("Live execution requires an open calibrated gripper; payloads are not modeled")
+        raise PlanningError("Live preflight requires an open calibrated gripper; payloads are not modeled")
     bridge._require_fresh_motor_rx(state, state.positions())
     return replace(state, motors=motors)
 
@@ -901,7 +901,7 @@ async def plan_and_move(
     if isinstance(bridge, MockStationBridge) and bridge.get_mock_scene_state()["held_object"]:
         return {"ok": False, "executed": False, "problems": ["Payloads are not modeled by the shoulder torque guard"]}
     st = await bridge.get_state()
-    if live and execute:
+    if live:
         try:
             st = _live_preflight_state(bridge, st)
         except (PlanningError, RuntimeError) as exc:
@@ -911,7 +911,7 @@ async def plan_and_move(
     obstacles = list(_obstacles.values())
 
     def preflight():
-        fraction = motors[-1].to_norm() if live and execute else 1.0
+        fraction = motors[-1].to_norm() if live else 1.0
         planner = _mujoco_planner(replace(st, motors=motors), obstacles, shoulder_torque_limit_nm, fraction)
         start = np.asarray(_calib.ticks_to_rad(motors))
         goal = planner.solve_ik([x, y, z], [qx, qy, qz, qw], start)
