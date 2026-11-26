@@ -880,6 +880,8 @@ async def reload_config() -> dict:
     cal_status = _calib.reload()
     _main_control = None  # Captured poses use the calibration active when their images were taken.
     _ik.reload()
+    from .motion import gravity_gains
+    gravity_gains.cache_clear()
     if _bridge is not None and hasattr(_bridge, "apply_hardware_config"):
         hw = _calib.hardware_config()
         _bridge.apply_hardware_config(
