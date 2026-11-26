@@ -79,6 +79,7 @@ MOTION_TOOLS = {
 
 # Tools that only move the arm when called with execute=True (dry-run planning is read-only)
 EXECUTE_GATED_TOOLS = {
+    "plan_and_move",
     "move_flange",
     "aim_wrist",
     "capture_wrist_stereo",

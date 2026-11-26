@@ -473,7 +473,7 @@ class DeskCoreTUI(App):
             log.write(f"[bold red]Invalid JSON arguments:[/bold red] {exc}")
             return
 
-        requires_arm = badge == "MOTION" and (name != "sweep_aside" or args.get("execute") is True)
+        requires_arm = (badge == "MOTION" and name != "sweep_aside") or bool(args.get("execute"))
         if requires_arm and not armed:
             log.write(
                 f"[bold yellow]Blocked {name}:[/bold yellow] check [b]Arm Motion[/b] first "
