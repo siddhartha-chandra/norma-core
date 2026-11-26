@@ -944,7 +944,7 @@ async def plan_and_move(
         result.update(ok=False, problems=[problem])
         if result["executed"] or write_uncertain:
             try:
-                result["hold"] = await bridge.abort(source="mujoco_preflight")
+                result["hold"] = await bridge.abort()
             except Exception as exc:
                 result["problems"].append(f"Station hold failed: {exc}")
         return result

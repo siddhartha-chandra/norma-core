@@ -10,7 +10,7 @@ from desk_core import mcp_server
 from desk_core.ik_mujoco import MAX_WAYPOINT_STEP_RAD, MuJoCoPlanner, PlanningError
 from desk_core.ik_tracik import TOOL_FRAME
 from desk_core.interfaces import SceneObstacle
-from desk_core.station_bridge import MAX_ANGLE_STEP, LiveStationBridge, MockStationBridge, RobotState
+from desk_core.station_bridge import EStopLatched, MAX_ANGLE_STEP, LiveStationBridge, MockStationBridge, RobotState
 
 
 @pytest.fixture
@@ -255,6 +255,20 @@ def test_live_failure_replaces_active_target_with_present_position(live_station,
     assert len(packets) == 2
     assert packets[1][3] == packets[0][3] - 1
     assert packets[1] == state.positions()
+
+    async def frame(camera, denoise):
+        return b""
+
+    monkeypatch.setattr(bridge, "get_frame", frame)
+    monkeypatch.setattr(mcp_server._robo_jev, "evaluate", lambda **kwargs: {"ok": True})
+
+    async def check_latch():
+        assert (await mcp_server.robo_jev_guard())["ok"]
+        with pytest.raises(EStopLatched):
+            await bridge.send_joint_targets({1: state.positions()[1]})
+        assert len(packets) == 2
+
+    asyncio.run(check_latch())
 
 
 def test_live_gripper_models_open_tolerance(live_station, calib):
